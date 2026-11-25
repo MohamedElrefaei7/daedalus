@@ -118,3 +118,12 @@ def test_backlink_through_ambiguous_link_is_flagged(world) -> None:
     write_note(world.alpha, "inbox/usgs-fetcher.md", None, "draft\n")
     hits = backlinks(world.session, "alpha:components/usgs-fetcher.md")
     assert hits and all(h.ambiguous for h in hits)
+
+
+def test_note_named_goal_not_ambiguous_with_template(world) -> None:
+    # templates/goal.md is a template, not a note, so it must not compete for [[goal]].
+    write_note(world.alpha, "goals/goal.md", "goal", "# Goal\n")
+    write_note(world.alpha, "plans/p.md", "plan", "Serves [[goal]].\n")
+    assert read_note(world.session, "goal").path == world.alpha / "goals" / "goal.md"
+    hits = backlinks(world.session, "alpha:goals/goal.md")
+    assert [(h.rel_path, h.ambiguous) for h in hits] == [("plans/p.md", False)]

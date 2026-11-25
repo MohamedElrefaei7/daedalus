@@ -147,3 +147,11 @@ def test_query_syntax_never_errors(world, query) -> None:
 def test_to_fts_query() -> None:
     assert to_fts_query('one-commit "red test" fails') == '"one commit" "red test" "fails"'
     assert to_fts_query('" -- *') == ""
+
+
+def test_search_never_returns_templates(world) -> None:
+    # templates/ holds note templates, not notes; list_notes skips it and so must search.
+    hits = search(world.session, "Decision")
+    assert hits, "the fixture's decisions/storage-engine.md should match"
+    leaked = [f"{h.vault}:{h.rel_path}" for h in hits if h.rel_path.startswith("templates/")]
+    assert not leaked, f"search returned templates: {leaked}"

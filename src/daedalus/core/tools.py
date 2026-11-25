@@ -60,12 +60,12 @@ def _catalogs(session: Session) -> dict[str, Catalog]:
 def list_notes(
     session: Session, folder: str | None = None, type: str | None = None, status: str | None = None
 ) -> list[NoteEntry]:
-    """Notes in scope, optionally filtered. templates/ holds templates, not notes, so it is skipped."""
+    """Notes in scope, optionally filtered. templates/ is skipped by index.walk_markdown."""
     prefix = folder.strip("/") + "/" if folder else None
     entries = []
     for vault, root in session.scope:
         for rel, _ in sorted(index.walk_markdown(root), key=lambda item: item[0]):
-            if rel.startswith("templates/") or (prefix and not rel.startswith(prefix)):
+            if prefix and not rel.startswith(prefix):
                 continue
             try:
                 note, errors = notes.read_note(root / rel, session, strict=False)

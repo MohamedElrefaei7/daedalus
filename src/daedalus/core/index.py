@@ -7,7 +7,8 @@ the shared vault stays untouched and every vault's git status stays clean.
 Freshness: each file's (rel_path, mtime_ns, size) is stored. Before every
 query the vault is walked with os.scandir; new and changed files are
 re-indexed and deleted ones dropped. Dot-folders (.obsidian/, .git/,
-.daedalus/, .trash/, ...) and symlinks are skipped, and only *.md is indexed.
+.daedalus/, .trash/, ...), the vault's top-level templates/, and symlinks are
+skipped, and only *.md is indexed.
 """
 
 from __future__ import annotations
@@ -54,14 +55,21 @@ def require_fts5() -> None:
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 
+# Top-level vault folders that hold no notes. templates/ holds one template
+# per note type (templates/goal.md, ...): they are not notes, so they must not
+# show up in listings or search, or compete with real notes for a wikilink.
+NON_NOTE_DIRS = frozenset({"templates"})
+
 
 def walk_markdown(
     root: str | os.PathLike[str], stat: bool = False
 ) -> Iterator[tuple[str, tuple[int, int] | None]]:
-    """Yield ("/"-separated rel path, (mtime_ns, size) or None) for every *.md under ``root``.
+    """Yield ("/"-separated rel path, (mtime_ns, size) or None) for every note under ``root``.
 
-    Skips dot-entries (so .obsidian/, .git/, .daedalus/ never appear) and
-    symlinks (so nothing outside the vault leaks in). Directories are opened
+    A note is a *.md file. Skips dot-entries (so .obsidian/, .git/, .daedalus/
+    never appear), the top-level NON_NOTE_DIRS (templates/), and symlinks (so
+    nothing outside the vault leaks in). This one walk feeds list_notes, link
+    resolution, backlinks, and the search index. Directories are opened
     by fd and files stat'ed relative to them, which avoids re-resolving the
     full path for every file.
     """
@@ -83,7 +91,8 @@ def _walk(fd: int, prefix: str, stat: bool) -> Iterator[tuple[str, tuple[int, in
             if name.startswith(".") or entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
-                subdirs.append(name)
+                if not (prefix == "" and name in NON_NOTE_DIRS):
+                    subdirs.append(name)
             elif name[-3:].lower() == ".md" and entry.is_file(follow_symlinks=False):
                 if not stat:
                     yield prefix + name, None
