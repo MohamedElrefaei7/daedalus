@@ -1,0 +1,4 @@
+shared = "~/daedalus/shared"
+
+[projects]
+scratch = "~/code/daedalus-scratch/vault"
