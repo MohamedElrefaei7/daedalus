@@ -176,6 +176,18 @@ def test_note_template_exists(vault: str, type_: str) -> None:
     assert path.is_file(), f"templates/{vault}/templates: missing note template '{type_}.md'"
 
 
+def test_repo_root_is_not_a_vault() -> None:
+    # Vaults are copies of the templates made elsewhere; this repo is never
+    # one. A .obsidian/ here means Obsidian opened the repo itself, and those
+    # settings must not land in a commit.
+    stray = REPO / ".obsidian"
+    assert not stray.exists(), (
+        f"{stray}: the daedalus repo was opened as an Obsidian vault by mistake. "
+        "Remove it from Obsidian's vault list, delete this .obsidian/ folder, "
+        "and open the intended vault folder instead."
+    )
+
+
 def test_project_context_has_sections() -> None:
     path = TEMPLATES / "project-vault" / "CONTEXT.md"
     lines = path.read_text(encoding="utf-8").splitlines()
