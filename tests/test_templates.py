@@ -15,26 +15,13 @@ from pathlib import Path
 import pytest
 import yaml
 
+# The frontmatter schema, defined once in daedalus.core.schema. The schema
+# blocks in both AGENTS.md files and in CLAUDE.md must say exactly this
+# (test_schema_block_matches_docs).
+from daedalus.core.schema import SCHEMA
+
 REPO = Path(__file__).resolve().parent.parent
 TEMPLATES = REPO / "templates"
-
-# The frontmatter schema, defined once. The schema blocks in both AGENTS.md
-# files and in CLAUDE.md must say exactly this (test_schema_block_matches_docs).
-SCHEMA = {
-    "base": ["type", "status", "created", "related", "shared_refs", "project_refs", "source"],
-    "extra": {
-        "component": ["code"],
-        "goal": ["done_when", "max_iterations", "budget_usd", "checkin_every"],
-        "question": ["options", "answered"],
-        "plan": ["spec", "decisions", "tasks"],
-        "practice": ["applies_to"],
-        "lesson": ["applies_to"],
-    },
-    "enums": {
-        "status": ["draft", "proposed", "accepted", "superseded"],
-        "source": ["human", "deepseek", "claude"],
-    },
-}
 
 # What each vault template must contain.
 VAULTS = {

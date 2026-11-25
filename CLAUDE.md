@@ -21,22 +21,57 @@ Every commit uses these names. Don't invent alternatives.
 daedalus/
 ├── CLAUDE.md                 # this file
 ├── CONTEXT.md                # running log, key decisions, Up Next
-├── pyproject.toml            # uv project; runtime dep pyyaml, dev dep pytest
+├── pyproject.toml            # hatchling build, src/ layout; runtime dep pyyaml, dev dep pytest
 ├── uv.lock
 ├── config/
 │   └── vaults.example.toml   # shape of ~/.config/daedalus/vaults.toml
+├── scripts/
+│   └── smoke_read.py         # live read-layer smoke test against the real registry
+├── src/daedalus/
+│   └── core/                 # the safety core
+│       ├── schema.py         # SCHEMA: single source of truth for frontmatter
+│       ├── registry.py       # vaults.toml loading + validation (RegistryError)
+│       ├── session.py        # Session dataclass, Area enum
+│       ├── policy.py         # Op enum, authorize(), authorize_command(): the seven rules
+│       ├── notes.py          # frontmatter parsing + schema validation (NoteSchemaError)
+│       ├── links.py          # wikilink extraction + Obsidian-style resolution
+│       ├── index.py          # SQLite FTS5 search index
+│       └── tools.py          # list_notes, read_note, backlinks, search
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
 │   └── shared-vault/         # copied to create ~/daedalus/shared/
 └── tests/
-    └── test_templates.py     # template contract test
+    ├── test_templates.py     # template contract test
+    └── core/                 # one file per core part, plus test_bench.py
 ```
 
 Run the tests with `uv run pytest`.
 
 ## Templates are the source of truth
 
-`templates/project-vault/` and `templates/shared-vault/` are the source of truth for vault structure: folders, `AGENTS.md`, `.gitignore`, and one note template per type. Change vault structure there and nowhere else. `tests/test_templates.py` guards them, and its `SCHEMA` dict must agree with the block below.
+`templates/project-vault/` and `templates/shared-vault/` are the source of truth for vault structure: folders, `AGENTS.md`, `.gitignore`, and one note template per type. Change vault structure there and nowhere else. `tests/test_templates.py` guards them. The `SCHEMA` dict in `daedalus.core.schema` validates both the templates and live notes, and must agree with the block below.
+
+## Path policy
+
+Every read and write goes through `daedalus.core.policy.authorize(path, op, session)`, which resolves the path with `os.path.realpath`, classifies it into exactly one area, and raises `PolicyError(rule, path, reason)` on refusal.
+
+**Deny by default.** Every op has an explicit list of allowed areas and folders, and anything not listed is refused. Never write "allow unless it's X".
+
+`Op`: `READ`, `PROPOSE`, `CREATE_LOG`, `WRITE_PLAN`, `USER_ACTION`, `WRITE_CODE`.
+
+1. **Location.** Inside a registered vault, the active repo, or the worktree. The repo is read-only; its only write is `WRITE_CODE` in the worktree.
+2. **Shared vault.** `READ`; `PROPOSE` into `inbox/`; `USER_ACTION` into `practices/` and `lessons/`.
+3. **Pulled vaults.** `READ` only.
+4. **Off limits for every op.** Any `.obsidian` or `.git` component (case-folded), and anything in `<worktree>/vault/`.
+5. **Active vault writes.** `PROPOSE`: `inbox/`, `questions/`, `CONTEXT.md`. `CREATE_LOG`: new files in `logs/`. `WRITE_PLAN`: `plans/`. `USER_ACTION`: `goals/`, `sources/`, `decisions/`, `components/`, `experiments/`, `concepts/`, `CONTEXT.md`. Never `AGENTS.md` or `templates/`.
+6. **Code.** `WRITE_CODE` only in the worktree, never in your own checkout.
+7. **Commands.** `authorize_command(argv, allowlist)`: `argv[0]`'s basename must be allowlisted.
+
+The `Session` is passed in explicitly; core never reads `state.json`.
+
+## Search index
+
+One SQLite FTS5 database per vault at `~/.cache/daedalus/index/<sha1 of vault realpath>.sqlite`, never inside a vault. It's refreshed before each query by walking the vault and comparing each file's `(mtime_ns, size)`.
 
 ## Frontmatter schema
 
