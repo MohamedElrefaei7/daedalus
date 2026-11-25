@@ -50,6 +50,19 @@ def split_frontmatter(text: str) -> tuple[str | None, str]:
     return m.group(1), text[m.end():]
 
 
+def load_frontmatter(raw: str) -> tuple[dict[str, Any], str | None]:
+    """(mapping, None) for a raw frontmatter block, or ({}, error) if it isn't a YAML mapping."""
+    try:
+        loaded = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        return {}, "frontmatter is not valid YAML: " + " ".join(str(e).split())
+    if loaded is None:
+        return {}, None
+    if not isinstance(loaded, dict):
+        return {}, f"frontmatter must be a YAML mapping, got {type(loaded).__name__}"
+    return loaded, None
+
+
 def expected_type(auth: Authorized) -> tuple[str, str] | None:
     """(folder, type) if ``auth`` is a markdown note in a typed folder, else None."""
     if auth.area in (Area.ACTIVE_VAULT, Area.PULLED_VAULT):
@@ -118,17 +131,9 @@ def read_note(path: str | Path, session: Session, strict: bool = True) -> Note |
         if typed:
             errors.append("no '---'-delimited frontmatter block at the top of the file")
     else:
-        try:
-            loaded = yaml.safe_load(raw)
-        except yaml.YAMLError as e:
-            loaded = None
-            if typed:
-                errors.append("frontmatter is not valid YAML: " + " ".join(str(e).split()))
-        else:
-            if isinstance(loaded, dict):
-                frontmatter = loaded
-            elif loaded is not None and typed:
-                errors.append(f"frontmatter must be a YAML mapping, got {type(loaded).__name__}")
+        frontmatter, error = load_frontmatter(raw)
+        if error and typed:
+            errors.append(error)
         if typed and not errors:
             folder, note_type = typed
             errors += validate(frontmatter, note_type, folder)
@@ -139,3 +144,66 @@ def read_note(path: str | Path, session: Session, strict: bool = True) -> Note |
             raise NoteSchemaError(auth.path, errors)
         return note
     return note, errors
+
+
+# Every note type the schema knows, from the typed folders of both vault kinds.
+KNOWN_TYPES = frozenset(PROJECT_TYPED_FOLDERS.values()) | frozenset(SHARED_TYPED_FOLDERS.values())
+
+
+def draft_errors(content: str, auth: Authorized) -> list[str]:
+    """Why a proposed draft would be an invalid note; [] if it's fine.
+
+    A draft headed for a typed folder (questions/, decisions/, ...) is validated
+    against that folder's type. Anywhere else (inbox/, CONTEXT.md, ...) it is
+    validated only if its frontmatter declares a type. A frontmatter block
+    that doesn't parse is refused everywhere: it is never what the author meant.
+    """
+    raw, _ = split_frontmatter(content)
+    typed = expected_type(auth)
+    if raw is None:
+        return ["no '---'-delimited frontmatter block at the top of the file"] if typed else []
+    frontmatter, error = load_frontmatter(raw)
+    if error:
+        return [error]
+    if typed:
+        folder, note_type = typed
+        return validate(frontmatter, note_type, folder)
+    if "type" not in frontmatter:
+        return []
+    declared = frontmatter["type"]
+    if declared not in KNOWN_TYPES:
+        return [f"key 'type' is {declared!r}, expected one of {sorted(KNOWN_TYPES)}"]
+    return validate(frontmatter, declared)
+
+
+_NO_SOURCE = object()
+
+
+def _source_of(text: str) -> object:
+    raw, _ = split_frontmatter(text)
+    if raw is None:
+        return _NO_SOURCE
+    frontmatter, _error = load_frontmatter(raw)
+    return frontmatter.get("source", _NO_SOURCE)
+
+
+def source_errors(content: str, proposal_source: str, base_content: str | None = None) -> list[str]:
+    """Provenance checks on a draft's frontmatter ``source``.
+
+    A create: if the draft declares a source, it must be the proposal's source;
+    an agent can't file its work as a human's. An edit: only a human proposal
+    may change the source (including adding or removing it), so an agent may
+    edit a human's draft but the note stays attributed to the human.
+    """
+    new = _source_of(content)
+    show = lambda v: "no source" if v is _NO_SOURCE else repr(v)  # noqa: E731
+    if base_content is None:
+        if new is not _NO_SOURCE and new != proposal_source:
+            return [f"key 'source' is {show(new)}, but this proposal comes from {proposal_source!r}; "
+                    "a new note's source must be the proposal's source"]
+        return []
+    old = _source_of(base_content)
+    if new != old and proposal_source != "human":
+        return [f"key 'source' changes from {show(old)} to {show(new)}; only a human proposal may change "
+                "a note's source"]
+    return []

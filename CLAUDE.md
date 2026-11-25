@@ -28,6 +28,7 @@ daedalus/
 ├── scripts/
 │   └── smoke_read.py         # live read-layer smoke test against the real registry
 ├── src/daedalus/
+│   ├── queue_cli.py          # stopgap approval CLI (list/diff/apply/reject) until commit 5's REPL
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
 │       ├── registry.py       # vaults.toml loading + validation (RegistryError)
@@ -36,13 +37,17 @@ daedalus/
 │       ├── notes.py          # frontmatter parsing + schema validation (NoteSchemaError)
 │       ├── links.py          # wikilink extraction + Obsidian-style resolution
 │       ├── index.py          # SQLite FTS5 search index
-│       └── tools.py          # list_notes, read_note, backlinks, search
+│       ├── errors.py         # ProposalError and its subclasses
+│       ├── vaultio.py        # write lock, fd-relative file ops, path-limited git commits
+│       ├── queue.py          # proposal queue (SQLite, WAL) + crash reconciliation
+│       ├── apply.py          # apply, reject, pending, recent_rejections, diff
+│       └── tools.py          # read tools; propose_note/edit/lesson; write_log
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
 │   └── shared-vault/         # copied to create ~/daedalus/shared/
 └── tests/
     ├── test_templates.py     # template contract test
-    └── core/                 # one file per core part, plus test_bench.py
+    └── core/                 # one file per core part, test_bench.py, test_write_integrity.py
 ```
 
 Run the tests with `uv run pytest`.
@@ -97,3 +102,23 @@ lesson:     applies_to
 ## Rule
 
 Every invariant gets a test that fails when the invariant is broken.
+
+## Writes: proposals, the queue, apply
+
+Agents never write a vault directly. `propose_note`, `propose_edit`, and `propose_lesson` validate the draft against `SCHEMA` and write only to the queue. **Source is provenance.** A create's frontmatter `source` must equal the proposal's source. An edit may change it only when the proposal's source is `human`, so an agent may edit a human's draft but can't re-attribute it. The queue is SQLite at `~/.local/state/daedalus/queue.sqlite`, outside every vault, in WAL mode with short transactions. Content is capped at 256 KB.
+
+**A write that isn't committed shouldn't exist.** `daedalus.core.apply.apply(session, change_id)`, in order:
+
+1. Load the record; refuse unless it is `pending`, so a second apply is refused.
+2. Re-authorize against the session passed in now, not the propose-time check.
+3. Stale check. An edit's target must still hash to `base_sha256`; a create's target must still not exist. Otherwise mark it `stale` and refuse.
+4. Mark the proposal `applying`, recording the target, its repo, and HEAD. Then write atomically, relative to a directory fd opened with `O_NOFOLLOW`: temp file, `fsync`, `os.replace`. Confirm `realpath(target)` is still the authorized path, or restore and refuse.
+5. Commit exactly that path with `git commit --only -- <path>`. Never `-a`, never `git add .`.
+6. If the commit fails, restore the previous content (or remove a create) and mark it `failed` with git's output.
+7. Mark it `applied` and store `commit_sha`.
+
+The commit message is `agent(<source>): <summary>`, a blank line, then the trailer `Daedalus-Change: <id>`. `write_log` creates `logs/<run_id>.md` with an exclusive create (`open(..., "x")`) and commits it at once as `log(<source>): <run_id>`; no approval is needed. Every vault write, whether apply, reject, or `write_log`, holds one write lock. It's an OS lock (`fcntl.flock`) on `~/.local/state/daedalus/write.lock`: the kernel releases it when the holder exits, crashes included, and the file's existence means nothing.
+
+**Crash recovery.** Every queue open reconciles `applying` records whose apply isn't running; "not running" means the write lock is free. If a commit with the proposal's `Daedalus-Change` trailer exists, the record is marked `applied` with that sha. Otherwise the old content is restored (or a create removed), the path unstaged, and the record marked `failed` with reason `interrupted`. A file changed after the crash is left alone.
+
+A refused write leaves every vault's digest, every repo's HEAD, and the queue unchanged; `tests/core/test_write_integrity.py` checks this for every refusal path.
