@@ -70,7 +70,7 @@ Test helpers live in plain modules (`tests/terminal/fakes.py`, `tests/mcp/mcp_he
 pytest binds `conftest` to whichever folder's it imported last. Every conftest re-exports the core helpers.
 ```
 
-Run the tests with `uv run pytest`.
+Run the tests with `uv run pytest`; `--durations=10` is in the default addopts, so the ten slowest tests always print.
 
 ## Templates are the source of truth
 
@@ -228,7 +228,7 @@ Any failure rolls back in reverse. Each undo is armed before its step and tolera
 3. the active project's `AGENTS.md`;
 4. accepted shared practices (`status: accepted`), by path, at most 12,000 characters, packing whole practices and naming any left out;
 5. each pulled project, sorted by name: only the "Decisions index" and "Where things live" sections of its `CONTEXT.md`, at most 6,000 characters each;
-6. the active project's `CONTEXT.md`, last, because it changes most.
+6. the active project's `CONTEXT.md`, last, because it changes most: every section whole except Log, which keeps its 8 newest entries (by heading date when every entry is dated, else the last in the file) and a one-line note counting the older ones.
 
 It's byte-identical for identical files: fixed order, sorted paths, no timestamps, no set iteration. A test compares all six blocks across processes with different hash seeds. Anything dated, such as `/end`'s date, goes in the user message, never the system prompt.
 

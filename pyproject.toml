@@ -29,3 +29,4 @@ packages = ["src/daedalus"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--durations=10"  # the ten slowest tests always print

@@ -132,3 +132,64 @@ def test_identical_across_processes_with_different_hash_seeds(rich) -> None:
                              capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": str(seed)})
         digests.add(out.stdout.strip())
     assert digests == {hashlib.sha256(system_prompt(rich.session).encode()).hexdigest()}
+
+
+# Block 6 keeps only the newest Log entries -------------------------------------------------
+
+def context_with(n: int) -> str:
+    entries = "".join(f"### 2026-11-{i:02d} — session {i}\n\nWhat happened in session {i}.\n\n" for i in range(1, n + 1))
+    return ("# CONTEXT\n\n## Log\n\n" + entries + "## Decisions index\n\n- [[storage-engine]]: SQLite\n\n"
+            "## Where things live\n\n- fetcher: src/fetch.py\n\n## Up Next\n\nCommit 7.\n")
+
+
+def test_block_6_keeps_the_newest_8_log_entries_plus_a_note(rich) -> None:
+    write_raw(rich.alpha, "CONTEXT.md", context_with(20))
+    block = blocks(rich.session)[-1]
+    shown = [i for i in range(1, 21) if f"— session {i}\n" in block]
+    assert shown == list(range(13, 21))
+    notes = [line for line in block.splitlines() if "older Log entries" in line]
+    assert notes == ["[12 older Log entries are in CONTEXT.md and not shown here; read_note alpha:CONTEXT.md "
+                     "for the full log.]"]
+    for section in ("## Decisions index", "- [[storage-engine]]: SQLite", "## Where things live",
+                    "- fetcher: src/fetch.py", "## Up Next", "Commit 7."):
+        assert section in block  # every non-Log section, whole
+
+
+def test_short_log_is_whole_and_has_no_note(rich) -> None:
+    write_raw(rich.alpha, "CONTEXT.md", context_with(8))
+    block = blocks(rich.session)[-1]
+    assert all(f"— session {i}\n" in block for i in range(1, 9))
+    assert "older Log entries" not in block
+
+
+def test_a_21st_entry_changes_only_block_6(rich) -> None:
+    write_raw(rich.alpha, "CONTEXT.md", context_with(20))
+    before = blocks(rich.session)
+    write_raw(rich.alpha, "CONTEXT.md", context_with(21))
+    after = blocks(rich.session)
+    assert after[:-1] == before[:-1]
+    assert after[-1] != before[-1]
+    assert "— session 21\n" in after[-1] and "— session 13\n" not in after[-1]
+    assert "[13 older Log entries" in after[-1]
+
+
+def test_capped_context_is_identical_across_processes(rich) -> None:
+    write_raw(rich.alpha, "CONTEXT.md", context_with(20))
+    digests = set()
+    for seed in (0, 1, 2, 3):
+        out = subprocess.run([sys.executable, "-c", SCRIPT, str(rich.registry_path)], check=True,
+                             capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": str(seed)})
+        digests.add(out.stdout.strip())
+    assert digests == {hashlib.sha256(system_prompt(rich.session).encode()).hexdigest()}
+
+
+def test_newest_by_date_even_when_the_log_runs_newest_first(rich) -> None:
+    text = context_with(20)
+    head, rest = text.split("## Log\n\n", 1)
+    entries_part, tail = rest.split("## Decisions index", 1)
+    entries = ["### " + e for e in entries_part.split("### ") if e]
+    write_raw(rich.alpha, "CONTEXT.md", head + "## Log\n\n" + "".join(reversed(entries)) + "## Decisions index" + tail)
+    block = blocks(rich.session)[-1]
+    shown = [i for i in range(1, 21) if f"— session {i}\n" in block]
+    assert shown == list(range(13, 21))
+    assert block.index("— session 20\n") < block.index("— session 13\n")  # kept in file order

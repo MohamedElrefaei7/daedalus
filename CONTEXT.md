@@ -153,6 +153,19 @@
   - A new Claude desktop chat ("use daedalus to show my scope") showed scratch2 active and scratch pulled. That server process had started at 23:22, before the switch, and it followed `state.json` with no restart.
 - **REPL rendering fix:** the live check showed streamed text, and the reasoning tail, left behind above the settled answer. A transient `rich` `Live` can't erase rows that scrolled off the top. The streaming view now shows only the wrapped tail that fits the terminal, and a test checks its height (376 rows on a 24-row terminal before the fix).
 
+### 2026-11-26 — Fix: cap CONTEXT.md log in session context
+
+- Prompt block 6 now holds the active `CONTEXT.md`'s non-Log sections whole, plus only the 8 newest Log entries, with a one-line note: "[N older Log entries are in CONTEXT.md and not shown here; read_note <vault>:CONTEXT.md for the full log.]". Uncapped, the log grows with every `/end`, and every session re-bills all of it as input.
+- "Newest" means the latest heading date when every entry starts `### YYYY-MM-DD`, with same-day entries in file order; otherwise the last 8 in the file, where `/end` appends. Kept entries stay in file order.
+- Tests:
+  - 20 entries yield exactly entries 13–20 plus the note; it failed first with `[1, 2, 3, ...] == [13, 14, 15, ...]`;
+  - a 21st entry changes only block 6;
+  - the capped prompt is identical across four hash seeds;
+  - a log of 8 or fewer stays whole with no note;
+  - a log written newest-first still keeps the 8 latest by date.
+- `--durations=10` added to pytest's default addopts, so the slowest tests always print.
+- Suite: 645 tests.
+
 ## Key decisions
 
 - ★ **One schema, in `daedalus.core.schema`.** `SCHEMA` moved out of `tests/test_templates.py`, which now imports it, so one dict guards both the templates and live notes.
@@ -197,6 +210,7 @@
 - ★ **`/end` goes through `propose_edit` with the current `base_sha256`,** never a direct write. A `CONTEXT.md` edited before approval makes the approval refuse as stale.
 - **Practices are packed whole, in path order, until the 12,000-character cap.** The rest are named in the truncation note, for `read_note`. A single practice over the cap is cut.
 - **`/end` reviews every proposal this conversation made that's still pending,** not only the ones from `/end`.
+- **Block 6 keeps the 8 newest Log entries; the rest stay one `read_note` away.** Decisions index, Where things live, and Up Next stay whole, since they're bounded and the agent needs them every session.
 - **`/new` doesn't switch to the new project;** it prints `/vault <name>` as the next step. `/vault` to the already-active project is a no-op.
 - ★ **queue_cli is a stopgap.** Every command is one call into `daedalus.core`. Since commit 5 the REPL's `/pending`, `/diff`, `/approve`, and `/reject` call the same functions, and `queue_cli` stays as a debug tool.
 - **templates/ is not notes.** One walk skips the vault's top-level `templates/` for every read tool, so the tools can't disagree about what a note is. An explicit `vault:templates/x.md` read still works.

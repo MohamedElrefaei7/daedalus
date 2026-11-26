@@ -7,7 +7,9 @@
      at most 12,000 characters in all, with a note naming any left out
   5. each pulled project, by name: its CONTEXT.md "Decisions index" and
      "Where things live" sections only, at most 6,000 characters each
-  6. the active project's CONTEXT.md, last, because it changes most often
+  6. the active project's CONTEXT.md, last, because it changes most often: every
+     section whole except Log, which keeps only its 8 newest entries, with a
+     one-line note counting the older ones
 
 DeepSeek's context cache matches on identical prefixes, so the order puts what
 changes least first, and the assembly is byte-identical for identical files:
@@ -28,6 +30,9 @@ SEPARATOR = "\n\n---\n\n"
 MAX_PRACTICES_CHARS = 12_000
 MAX_PULLED_CHARS = 6_000
 PULLED_SECTIONS = ("Decisions index", "Where things live")
+LOG_ENTRIES = 8
+_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_DATED = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 PREAMBLE = """\
 You are the Daedalus terminal agent, working for the user in their project knowledge vaults.
@@ -67,6 +72,44 @@ def _cap(text: str, limit: int, what: str) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + f"\n\n[truncated: {what} is {len(text):,} characters; the first {limit:,} are shown]"
+
+
+def recent_log(text: str, vault: str, keep: int = LOG_ENTRIES) -> str:
+    """``text`` with its "## Log" section cut to the ``keep`` newest "### " entries, plus a note counting the rest.
+
+    Every other section, and any text in Log before its first entry, stays
+    whole. Newest means the latest dated heading ("### 2026-11-26 — ...") when
+    every entry is dated, else the last in the file, which is where /end
+    appends. Kept entries stay in file order.
+    """
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, line in enumerate(lines)
+                  if (m := _HEADING.match(line.rstrip("\n"))) and len(m.group(1)) == 2
+                  and m.group(2).casefold() == "log"), None)
+    if start is None:
+        return text
+    end = next((j for j in range(start + 1, len(lines))
+                if (m := _HEADING.match(lines[j].rstrip("\n"))) and len(m.group(1)) <= 2), len(lines))
+    entry_starts = [j for j in range(start + 1, end)
+                    if (m := _HEADING.match(lines[j].rstrip("\n"))) and len(m.group(1)) == 3]
+    if len(entry_starts) <= keep:
+        return text
+    bounds = list(zip(entry_starts, entry_starts[1:] + [end]))
+    entries = ["".join(lines[a:b]) for a, b in bounds]
+    titles = [_HEADING.match(lines[a].rstrip("\n")).group(2) for a, _ in bounds]
+    dates = [m.group(1) if (m := _DATED.match(t)) else None for t in titles]
+    order = list(range(len(entries)))
+    if all(dates):
+        order.sort(key=lambda i: (dates[i], i))  # stable: same-day entries keep file order
+    newest = sorted(order[-keep:])
+    older = len(entries) - keep
+    what = "older Log entry is" if older == 1 else "older Log entries are"
+    note = f"[{older} {what} in CONTEXT.md and not shown here; read_note {vault}:CONTEXT.md for the full log.]\n\n"
+    head = "".join(lines[: entry_starts[0]])
+    kept = "".join(entries[i] for i in newest)
+    if not kept.endswith("\n\n") and end < len(lines):
+        kept += "\n"
+    return head + note + kept + "".join(lines[end:])
 
 
 def practices_block(session: Session) -> str:
@@ -115,8 +158,8 @@ def blocks(session: Session) -> list[str]:
         practices_block(session),
     ]
     out += [pulled_block(session, name) for name in sorted(session.pulled)]
-    out.append(f"# Active project ({session.active}): CONTEXT.md\n\n"
-               f"{_read(session, session.active_vault / 'CONTEXT.md').strip()}")
+    context = recent_log(_read(session, session.active_vault / "CONTEXT.md"), session.active)
+    out.append(f"# Active project ({session.active}): CONTEXT.md\n\n{context.strip()}")
     return out
 
 
