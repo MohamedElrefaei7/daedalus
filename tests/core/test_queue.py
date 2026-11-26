@@ -106,7 +106,7 @@ def test_propose_edit_that_changes_nothing_refused(gworld) -> None:
 
 @pytest.mark.parametrize("rel", ["lesson.md", "inbox/lesson.md"])
 def test_propose_lesson_into_shared_inbox(gworld, rel) -> None:
-    p = propose_lesson(gworld.session, rel, note_text("lesson", "# Lesson\n", applies_to=["git"], source="claude"),
+    p = propose_lesson(gworld.session, rel, note_text("lesson", "# Lesson\n", applies_to=["git"], related=["[[red-test-first]]"], source="claude"),
                        "claude", "s")
     assert (p.vault, p.rel_path) == ("shared", "inbox/lesson.md")
 
@@ -129,7 +129,10 @@ def test_draft_missing_related_refused_naming_related(gworld) -> None:
     draft = note_text("decision", "# Use SQLite\n", related=DROP, source="deepseek")
     with pytest.raises(DraftInvalid) as exc:
         propose_note(gworld.session, "alpha", "inbox/use-sqlite.md", draft, "deepseek", "use sqlite")
-    assert exc.value.errors == ["missing base key 'related'"]
+    assert exc.value.errors[0] == "missing base key 'related'"
+    assert exc.value.errors[1:] == [  # and with no related, it links nothing
+        "no links: a note must link at least one other note, in related, shared_refs, or project_refs, or in "
+        "the body (AGENTS.md and CONTEXT.md don't count)"]
     assert "related" in str(exc.value)
     assert queue.statuses() == {}
 
@@ -138,7 +141,8 @@ def test_draft_lists_every_error(gworld) -> None:
     draft = note_text("goal", "# G\n", status="done", budget_usd=DROP, related=[["unquoted"]], source="claude")
     with pytest.raises(DraftInvalid) as exc:
         propose_note(gworld.session, "alpha", "inbox/g.md", draft, "claude", "s")
-    assert len(exc.value.errors) == 3
+    assert len(exc.value.errors) == 4  # the three schema errors, and no links (the unquoted one was lost)
+    assert "no links" in exc.value.errors[-1]
     for key in ("budget_usd", "status", "related"):
         assert f"'{key}'" in str(exc.value)
 
@@ -149,7 +153,8 @@ def test_draft_in_typed_folder_validated_against_folder(gworld) -> None:
     with pytest.raises(DraftInvalid, match="must have type 'question'"):
         propose_note(gworld.session, "alpha", "questions/q.md", note_text("question", type="decision", source="claude"),
                      "claude", "s")
-    ok = note_text("question", "# Which DB?\n", options=["sqlite", "postgres"], source="claude")
+    ok = note_text("question", "# Which DB?\n", options=["sqlite", "postgres"], related=["[[storage-engine]]"],
+                   source="claude")
     assert propose_note(gworld.session, "alpha", "questions/q.md", ok, "claude", "s").status == "pending"
 
 
@@ -248,13 +253,13 @@ def test_diff(gworld) -> None:
 # Source enforcement --------------------------------------------------------------------
 
 def test_create_source_must_match_proposal(gworld) -> None:
-    draft = note_text("decision", "# Use SQLite\n", source="human")
+    draft = note_text("decision", "# Use SQLite\n", source="human", shared_refs=["[[red-test-first]]"])
     with pytest.raises(DraftInvalid) as exc:
         propose_note(gworld.session, "alpha", "inbox/use-sqlite.md", draft, "deepseek", "s")
     assert exc.value.errors == ["key 'source' is 'human', but this proposal comes from 'deepseek'; "
                                 "a new note's source must be the proposal's source"]
     assert queue.statuses() == {}
-    ok = note_text("decision", "# Use SQLite\n", source="deepseek")
+    ok = note_text("decision", "# Use SQLite\n", source="deepseek", shared_refs=["[[red-test-first]]"])
     assert propose_note(gworld.session, "alpha", "inbox/use-sqlite.md", ok, "deepseek", "s").status == "pending"
 
 
@@ -273,7 +278,7 @@ def test_agent_edit_may_not_change_source(gworld, new_source) -> None:
 
 def test_human_edit_may_change_source(gworld) -> None:
     write_raw(gworld.alpha, "inbox/draft.md", note_text("concept", "# Draft\n", source="deepseek"))
-    edited = note_text("concept", "# Draft, rewritten by me\n", source="human")
+    edited = note_text("concept", "# Draft, rewritten by me\n", source="human", shared_refs=["[[red-test-first]]"])
     assert propose_edit(gworld.session, "alpha", "inbox/draft.md", edited, "human", "take over").status == "pending"
 
 
@@ -281,7 +286,8 @@ def test_agent_may_edit_human_draft_keeping_source(gworld) -> None:
     from daedalus.core.apply import apply
 
     write_raw(gworld.alpha, "inbox/draft.md", note_text("concept", "# Draft\n", source="human"))
-    edited = note_text("concept", "# Draft, with an example\n\nExample: magnitude 6.1.\n", source="human")
+    edited = note_text("concept", "# Draft, with an example\n\nExample: magnitude 6.1.\n", source="human",
+                       shared_refs=["[[red-test-first]]"])
     p = propose_edit(gworld.session, "alpha", "inbox/draft.md", edited, "claude", "add an example")
     assert apply(gworld.session, p.id).status == "applied"
     assert (gworld.alpha / "inbox" / "draft.md").read_text() == edited

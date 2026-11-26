@@ -17,7 +17,7 @@ from daedalus.core import queue, tools
 
 
 def concept(body: str = "# Hello\n", **fm) -> str:
-    return note_text("concept", body, **{"source": "claude", **fm})
+    return note_text("concept", body, **{"source": "claude", "shared_refs": ["[[red-test-first]]"], **fm})
 
 
 # 1. Exact tool set -----------------------------------------------------------------------
@@ -308,7 +308,8 @@ def test_propose_into_shared_inbox(mcp) -> None:
     async def go():
         async with mcp:
             return await mcp.ok("propose_note", {"vault": "shared", "rel_path": "inbox/lesson.md",
-                                                 "content": note_text("lesson", source="claude"), "summary": "s"})
+                                                 "content": note_text("lesson", source="claude", related=["[[red-test-first]]"]),
+                                                 "summary": "s"})
 
     r = run(go())
     assert (r["vault"], r["rel_path"], r["source"]) == ("shared", "inbox/lesson.md", "claude")

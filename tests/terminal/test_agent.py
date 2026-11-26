@@ -112,7 +112,7 @@ def mcp_schemas(gworld, tmp_path):
 
 
 def test_source_is_deepseek_and_model_cannot_set_it(agent, fake, gworld) -> None:
-    draft = note_text("concept", "# Hi\n", source="deepseek")
+    draft = note_text("concept", "# Hi\n", source="deepseek", shared_refs=["[[red-test-first]]"])
     fake.responses += [
         tool_reply("propose_note", {"rel_path": "inbox/hi.md", "content": draft, "summary": "hi", "source": "human"}),
         tool_reply("propose_note", {"rel_path": "inbox/hi.md", "content": draft, "summary": "hi"}, call_id="c2"),

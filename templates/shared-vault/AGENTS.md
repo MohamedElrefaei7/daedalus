@@ -18,6 +18,10 @@ Only the human promotes a note: they move it from `inbox/` to `practices/` or `l
 
 `applies_to` is a list of lowercase topic tags, such as `[testing]` or `[workflow]`. Agents use these tags to find the notes that bear on the task at hand. An accepted practice or lesson has at least one tag.
 
+## 5. Linking
+
+Every note links to at least one other note, as in the project vaults. Any link counts: one in `related`, `shared_refs`, or `project_refs`, or a wikilink in the body. A practice or lesson usually links a related practice in `related`. `AGENTS.md` is never a valid link target: it describes the vault rather than being a note in it, so a draft that links `[[AGENTS]]` (or a project's `[[CONTEXT]]`) is refused.
+
 ## Frontmatter schema
 
 Same contract as the project vaults. Wikilinks inside YAML must be quoted: `related: ["[[red-test-first]]"]`.

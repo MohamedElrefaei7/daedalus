@@ -121,7 +121,7 @@ Every invariant gets a test that fails when the invariant is broken.
 
 ## Writes: proposals, the queue, apply
 
-Agents never write a vault directly. `propose_note`, `propose_edit`, and `propose_lesson` validate the draft against `SCHEMA` and write only to the queue. **Source is provenance.** A create's frontmatter `source` must equal the proposal's source. An edit may change it only when the proposal's source is `human`, so an agent may edit a human's draft but can't re-attribute it. The queue is SQLite at `~/.local/state/daedalus/queue.sqlite`, outside every vault, in WAL mode with short transactions. Content is capped at 256 KB.
+Agents never write a vault directly. `propose_note`, `propose_edit`, and `propose_lesson` validate the draft against `SCHEMA` and write only to the queue. **The link rule.** A typed draft must link at least one other note. A typed draft is one for a typed folder, or one that declares a type elsewhere, such as an `inbox/` draft. Any of `related`, `shared_refs`, `project_refs`, or a body link counts, dangling links included. A link to `AGENTS.md` or `CONTEXT.md` is refused, whether it resolves to one or just names one. **Source is provenance.** A create's frontmatter `source` must equal the proposal's source. An edit may change it only when the proposal's source is `human`, so an agent may edit a human's draft but can't re-attribute it. The queue is SQLite at `~/.local/state/daedalus/queue.sqlite`, outside every vault, in WAL mode with short transactions. Content is capped at 256 KB.
 
 **A write that isn't committed shouldn't exist.** `daedalus.core.apply.apply(session, change_id)`, in order:
 

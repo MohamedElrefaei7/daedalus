@@ -176,6 +176,28 @@ def draft_errors(content: str, auth: Authorized) -> list[str]:
     return validate(frontmatter, declared)
 
 
+def draft_type(content: str, auth: Authorized) -> str | None:
+    """The type a draft is validated against: its typed folder's, else a known type it declares; else None."""
+    typed = expected_type(auth)
+    if typed:
+        return typed[1]
+    raw, _ = split_frontmatter(content)
+    if raw is None:
+        return None
+    frontmatter, error = load_frontmatter(raw)
+    declared = frontmatter.get("type") if not error else None
+    return declared if isinstance(declared, str) and declared in KNOWN_TYPES else None
+
+
+def draft_links(content: str) -> tuple[Link, ...]:
+    """Every link in a draft: body wikilinks and the frontmatter link keys."""
+    raw, body = split_frontmatter(content)
+    frontmatter: dict[str, Any] = {}
+    if raw is not None:
+        frontmatter, _ = load_frontmatter(raw)
+    return extract_links(frontmatter, body)
+
+
 _NO_SOURCE = object()
 
 

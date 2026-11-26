@@ -90,6 +90,20 @@
   - Six calls cost $0.001744 in the ledger. DeepSeek reported 10.00 USD both before and after, because the balance has two decimals and the spend was under a cent.
   - The key appears in none of the 473 files under the state and config dirs, the repo (minus `.venv`), and both vault repos.
 
+### 2026-11-25 — Fix: link rule counts any link field; root files aren't link targets
+
+- In the commit-5 live check, DeepSeek linked its draft to `[[CONTEXT]]`. It read `AGENTS.md` §5 ("every note links to at least one other note") as needing a `related` link, and the scratch vault had nothing else to link.
+- Both `AGENTS.md` templates, and the live scratch and shared copies, now say that any of `related`, `shared_refs`, `project_refs`, or a body link satisfies the rule, and that `AGENTS.md` and `CONTEXT.md` are never valid link targets. The shared vault's `AGENTS.md` gained a section 5, Linking. The vault changes are committed in their own repos.
+- `tools.link_errors`, run at propose time: a typed draft needs at least one link, and none may resolve to, or be named, `AGENTS` or `CONTEXT`. The `propose_note` tool description says so too.
+- `tests/core/test_draft_links.py`, 17 tests:
+  - a draft linking only to `[[CONTEXT]]` is refused; it failed first with `DID NOT RAISE DraftInvalid`;
+  - a draft whose only link is in `shared_refs` is accepted;
+  - quoted and unquoted `created` both validate;
+  - every link field counts, and so does a dangling link;
+  - root-file links are refused in any field or the body.
+- The integrity table gained `link_only_to_context` (36 rows). Twelve older tests proposed typed drafts with no links and now give them one. Two tests that listed every error now also expect the "no links" error, since every error goes back to the agent at once.
+- Suite: 605 tests.
+
 ## Key decisions
 
 - ★ **One schema, in `daedalus.core.schema`.** `SCHEMA` moved out of `tests/test_templates.py`, which now imports it, so one dict guards both the templates and live notes.
@@ -126,6 +140,7 @@
 - **The agent tools are daedalus-mcp's tools** (`daedalus.toolset`), with `source="deepseek"` set in code. The schemas refuse extra arguments, so a `source` the model invents is refused. Results are capped at 60,000 characters, with at most 12 tool rounds per turn. Refusals go back to the model; `read_note` schema errors are also shown to the user.
 - **A failed turn is rolled back out of history** (a cap, an API error, Ctrl-C), so the next turn never sends a half-finished tool exchange.
 - **Unknown keys in `config.toml` are errors,** so a misspelled cap can't silently fall back to the default.
+- **The link rule covers every typed draft, not only typed folders.** That includes an `inbox/` draft that declares a type, because that's where agents propose, and it's how `[[CONTEXT]]` got in. An untyped jotting in `inbox/` has no link rule. A root file is caught by name as well as by resolution, so `[[CONTEXT]]` is refused even in the shared vault, which has no `CONTEXT.md`.
 - ★ **queue_cli is a stopgap.** Every command is one call into `daedalus.core`. Since commit 5 the REPL's `/pending`, `/diff`, `/approve`, and `/reject` call the same functions, and `queue_cli` stays as a debug tool.
 - **templates/ is not notes.** One walk skips the vault's top-level `templates/` for every read tool, so the tools can't disagree about what a note is. An explicit `vault:templates/x.md` read still works.
 - ★ **FTS5 is required.** `require_fts5()` fails with a clear message, and a test asserts FTS5 is present.

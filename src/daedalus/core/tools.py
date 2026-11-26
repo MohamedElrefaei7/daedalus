@@ -354,7 +354,8 @@ def _propose(session: Session, vault: str, rel_path: str, content: str, source: 
             raise ProposalError(f"{auth.vault}:{auth.rel} is not UTF-8 text, so it can't be edited") from None
         base_sha256 = hashlib.sha256(base).hexdigest()
 
-    errors = notes.draft_errors(content, auth) + notes.source_errors(content, source, base_content)
+    errors = (notes.draft_errors(content, auth) + notes.source_errors(content, source, base_content)
+              + link_errors(session, auth, content))
     if errors:
         raise DraftInvalid(f"{auth.vault}:{auth.rel}", errors)
 
@@ -362,6 +363,43 @@ def _propose(session: Session, vault: str, rel_path: str, content: str, source: 
         vault=auth.vault, rel_path=auth.rel, kind=kind, content=content, source=source, summary=summary,
         base_sha256=base_sha256, base_content=base_content,
     )
+
+
+# Root files describe a vault; they aren't notes, so nothing links to them.
+ROOT_FILES = ("AGENTS.md", "CONTEXT.md")
+_ROOT_STEMS = frozenset(name[:-3].casefold() for name in ROOT_FILES)
+
+
+def link_errors(session: Session, auth, content: str) -> list[str]:
+    """The link rule for typed drafts: at least one link, and none to AGENTS.md or CONTEXT.md.
+
+    Any of related, shared_refs, project_refs, or a body link satisfies the
+    rule; a dangling link counts, as it does in Obsidian. A link is refused
+    if it resolves to a root file in the vault it points into, or if its
+    target's name is AGENTS or CONTEXT whether or not it resolves.
+    """
+    if notes.draft_type(content, auth) is None:
+        return []
+    links = notes.draft_links(content)
+    errors: list[str] = []
+    catalogs = _catalogs(session)
+    projects = [session.active, *session.pulled]
+    for link in links:
+        where = "the body" if link.key == "body" else f"'{link.key}'"
+        name = link.target.rsplit("/", 1)[-1]
+        stem = name[:-3] if name.casefold().endswith(".md") else name
+        scope = [v for v in link_scope(link.key, auth.vault, projects, SHARED_NAME) if v in catalogs]
+        roots = [m for m in resolve(link.target, (catalogs[v] for v in scope)).matches if m.rel_path in ROOT_FILES]
+        if roots or stem.casefold() in _ROOT_STEMS:
+            target = f" (resolves to {roots[0].vault}:{roots[0].rel_path})" if roots else ""
+            errors.append(f"[[{link.target}]] in {where}{target}: AGENTS.md and CONTEXT.md are never link "
+                          "targets; link a note instead")
+    if not links:
+        errors.append("no links: a note must link at least one other note, in related, shared_refs, or "
+                      "project_refs, or in the body (AGENTS.md and CONTEXT.md don't count)")
+    elif len(errors) == len(links):
+        errors.append("every link here is to a root file, so the note links no other note")
+    return errors
 
 
 def propose_note(session: Session, vault: str, rel_path: str, content: str, source: str, summary: str) -> Proposal:

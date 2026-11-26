@@ -50,4 +50,6 @@ These categories require an accepted decision or practice to cite: schemas, new 
 
 ## 5. Linking
 
-Every note links to at least one other note. Wikilinks inside YAML must be quoted: `related: ["[[storage-engine]]"]`. Unquoted, `related: [[storage-engine]]` raises no error but parses as a nested list, and the link is lost.
+Every note links to at least one other note. Any link counts: one in `related`, `shared_refs`, or `project_refs`, or a wikilink in the body. `AGENTS.md` and `CONTEXT.md` are never valid link targets. They describe the vault rather than being notes in it, so `[[CONTEXT]]` and `[[AGENTS]]` don't count, and a draft that links either one is refused.
+
+Wikilinks inside YAML must be quoted: `related: ["[[storage-engine]]"]`. Unquoted, `related: [[storage-engine]]` raises no error but parses as a nested list, and the link is lost.

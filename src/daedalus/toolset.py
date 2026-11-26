@@ -158,7 +158,8 @@ DESCRIPTIONS = {
         "to propose into the shared vault's inbox/. rel_path is relative to the vault root, e.g. "
         "'inbox/idea.md'. content is the whole note; if it has frontmatter, it must follow the schema in the "
         "vault's AGENTS.md, and its source must be '{source}' (proposals from this tool are always recorded "
-        "as source {source}). summary is one line, at most 200 characters, and becomes the commit subject. "
+        "as source {source}). A typed note must link at least one other note, in related, shared_refs, or "
+        "project_refs, or in the body; AGENTS.md and CONTEXT.md are never link targets. summary is one line, at most 200 characters, and becomes the commit subject. "
         "Refused: any other folder (practices/, decisions/, ...), editing an existing note, paths outside "
         "the vault, and drafts that break the schema; the error says which rule and why."
     ),

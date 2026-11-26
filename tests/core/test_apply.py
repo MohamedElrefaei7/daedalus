@@ -72,7 +72,7 @@ def test_apply_edit_keeps_file_mode(gworld) -> None:
 
 def test_apply_into_shared_commits_in_shared_repo(gworld) -> None:
     shared_base, alpha_base = head(gworld.shared), head(gworld.alpha_repo)
-    p = propose_lesson(gworld.session, "git-hooks.md", note_text("lesson", "# Hooks\n", applies_to=["git"], source="claude"),
+    p = propose_lesson(gworld.session, "git-hooks.md", note_text("lesson", "# Hooks\n", applies_to=["git"], related=["[[red-test-first]]"], source="claude"),
                        "claude", "lesson about hooks")
     apply(gworld.session, p.id)
     assert commits_since(gworld.shared, shared_base) == 1
