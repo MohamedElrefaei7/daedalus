@@ -41,6 +41,7 @@ daedalus/
 │   │   ├── ledger.py         # spend ledger (SQLite, WAL): reservations, spent(), caps
 │   │   ├── pricing.py        # the price table, peak windows (UTC), cost(), worst_case()
 │   │   ├── prompts.py        # the byte-stable system prompt
+│   │   ├── obsidian.py       # the Obsidian bridge: /open by path, /here via `obsidian eval`
 │   │   └── config.py         # ~/.config/daedalus/config.toml: model, effort, max_tokens, caps
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
@@ -170,6 +171,7 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 
 `daedalus [project]` sets the active project (like `python -m daedalus.state set-active`), then starts a plain REPL: `prompt_toolkit` input with history, `rich` `Live` output. A DeepSeek agent answers with the daedalus tools. Commands:
 - `/new <name> --repo <path>`, `/vaults`, `/vault <name>`, `/pull <name>`, `/drop <name>`, `/end`;
+- `/open <note>`, `/here`;
 - `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
 
 `queue_cli` stays as a debug tool. The REPL changes the session only through its own commands, which write `state.json` through `daedalus.core.state`; `daedalus-mcp` follows on its next call.
@@ -238,3 +240,42 @@ It's byte-identical for identical files: fixed order, sorted paths, no timestamp
 - The agent may also propose lessons into the shared `inbox/`. A lesson records what failed, why, and the fix; nothing else qualifies.
 - The REPL then walks this session's pending proposals one at a time (diff, then approve, reject with a reason, or skip), and exits.
 - Nothing is written until you approve. A `CONTEXT.md` edited meanwhile makes the approval refuse as stale.
+
+## The Obsidian bridge: `/open`, `/here`
+
+`daedalus.terminal.obsidian`. **Obsidian is asked where, never what.** It reports which vault folder and which file are focused; every byte of content is read through `daedalus.core` (`tools.read_note`, so the path policy and schema reporting apply). The CLI's own `read`, or any CLI command that changes a vault, is never used.
+
+**Trap 1: every project vault is named `vault`.** Obsidian names a vault after its folder, so scratch and scratch2 (and every future project) are all "vault" to Obsidian. Never target a vault by name (`vault=` in a CLI call or a URI):
+- `/open` uses `open "obsidian://open?path=<url-encoded absolute path>"`, and Obsidian picks the vault that contains the path.
+- `/here` maps the reported `base` to a registered vault by real path (`realpath`, then `samefile`), never by folder name.
+
+**Trap 2: the CLI launches Obsidian if it isn't running.** `/here` checks `pgrep -x Obsidian` first and answers "Obsidian isn't open" without touching the CLI. `/open` may launch Obsidian, because you asked to see the note.
+
+**`/here`, in order:**
+1. If Obsidian isn't running, return `NotOpen`.
+2. If there's no `obsidian` on PATH, return `CliMissing`, with the setup steps: Settings → General → Advanced → Command line interface, register, then check `obsidian version` in a new terminal.
+3. Run the eval below from `/`, a working directory inside no vault, so the CLI answers for the vault you focused last, with a 5 s timeout:
+
+   ```
+   obsidian eval code="JSON.stringify({base: app.vault.adapter.getBasePath(), file: app.workspace.getActiveFile()?.path ?? null})"
+   ```
+
+4. Treat the output as untrusted, and give each failure its own error, never a guess:
+   - The CLI prints `=> <value>` and **exits 0 even on errors** (`Error: …`, `Vault not found.`). So anything but exactly one `=> {base, file}` line is `NotJson`, and the error quotes what the CLI printed.
+   - `base` must be an existing directory (`BadBase`).
+   - `file` mustn't be null (`NoActiveFile`).
+   - `base + file` must exist (`FileMissing`).
+5. A `base` that isn't registered is `Unregistered`. A registered vault that isn't in the session is `NotInScope`, and the message says `/pull <name>` would bring it in.
+6. Authorize READ on the file, so `.obsidian/` is refused with rule 4, and a path escaping the vault with rule 1. Only `.md` notes are attached.
+
+**The attachment rule.** `/here`'s note is prefixed to your **next user message** as a fenced block headed by its `vault:path`, and never put in the system prompt: that would break the stable prefix and cost cache hits. The fence is longer than any backtick run in the note, and the note is capped at 60,000 characters with a truncation note.
+- It goes with exactly one message.
+- A second `/here` replaces it; it doesn't stack.
+- A failed `/here` attaches nothing and drops any earlier attachment.
+- A failed turn keeps it for the retry.
+- `/end` never carries it.
+- `/vault` clears it, and so does a `/drop` of its vault.
+
+Schema errors are shown as for `read_note`. A test checks the next request's system message is byte-identical to the one before `/here`.
+
+**Tests** fake the CLI with an executable `obsidian` first on PATH, which logs its cwd and argv, and inject the running check. The terminal conftest makes the real app "not running" and refuses `open` for every test.

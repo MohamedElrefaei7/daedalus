@@ -166,8 +166,44 @@
 - `--durations=10` added to pytest's default addopts, so the slowest tests always print.
 - Suite: 645 tests.
 
+### 2026-11-26 — Commit 7: Obsidian bridge — /open and /here
+
+- **`daedalus.terminal.obsidian`.** Obsidian is asked where, never what: every byte of content is read through `daedalus.core`.
+  - `open_note` resolves the ref like `read_note` (ambiguity refused), authorizes READ, then runs `open "obsidian://open?path=<encoded absolute path>"`. It never uses `vault=`.
+  - `active_note` checks that Obsidian is running, then that the CLI is on PATH, then runs `obsidian eval` from `/` with a 5 s timeout. It validates the output and maps `base` to a registered vault by real path, then reads the note with `tools.read_note`.
+- **REPL:**
+  - `/open <note>`;
+  - `/here`, which prints `→ here vault:path (N chars)`, shows any schema errors, and attaches the note to the next user message as a fenced block, capped at 60,000 characters. A second `/here` replaces it.
+- **The CLI on this machine** (Obsidian 1.15.1, installer 1.15.0) differs from the prompt in four ways:
+  - The setting is Settings → General → **Advanced** → Command line interface. Before it's on, the bundled CLI says so, pointing there.
+  - `obsidian eval` prints `=> <value>`, not bare JSON. It **exits 0 on errors**: `Error: boom`, `Error: Command "x" not found…`, `Vault not found.`. So the parser requires exactly one `=> ` line, and the exit code is only a secondary check.
+  - `obsidian help` printed the full list once from `/`. Then it printed `Vault not found.` from `/` and `~`, and `Command "help" not found` from inside a vault. Meanwhile `eval` and `version` worked from `/`.
+  - The help lists a global `vault=<name>` option, which this code never uses.
+- **Tests:** 35 new, so 680 in total, plus one existing test tightened. A fake `obsidian` script first on PATH logs its cwd and argv. The running check is injected. The terminal conftest makes the real app "not running" and refuses `open` everywhere.
+- **Proved red three ways:**
+  1. Skipping the running check failed `test_closed_obsidian_is_not_open_and_the_cli_is_never_run` (the result was `Here(...)` instead of `NotOpen`, and the fake CLI ran). It also failed the default-bridge test.
+  2. Resolving the vault by folder name failed `test_same_named_vaults_resolve_by_real_path`: alpha's same-named note was attached (`'beta:components/fetcher.md' in "alpha:components/fetcher.md …"`). It also failed the symlink, `/pull`-hint, unregistered, and `/drop` tests.
+  3. Putting the attachment in the system prompt failed `test_here_goes_in_the_user_message_and_the_system_prompt_is_unchanged` ("/here changed the system prompt"), plus the same-named-vault and replace tests.
+- **Live check:**
+  - With Obsidian quit, `/here` said "Obsidian isn't open…" and Obsidian stayed closed.
+  - In scratch2, with `CONTEXT.md` focused, `/here` gave `→ here scratch2:CONTEXT.md (1,507 chars)`. DeepSeek summarized the note from the attachment alone, with no tool call, at `↑ 4,871 (1,920 cached)`.
+  - In the scratch window, `/here` attached `scratch:CONTEXT.md` (72 chars). Then `/drop scratch` dropped the attachment, and the next `/here` said `/pull scratch` would bring it in.
+  - `/open shared:practices/red-test-first.md` opened in the shared vault's window.
+
 ## Key decisions
 
+- ★ **Obsidian is asked where, never what.** The CLI reports the focused vault folder and file. Content is read only through `daedalus.core`'s `read_note`, so the policy (`.obsidian/` refused by rule 4, escapes by rule 1) and schema reporting apply. The CLI's `read` and its write commands are never used.
+- ★ **Never target an Obsidian vault by name.** Every project vault is a folder named `vault`. `/open` uses `obsidian://open?path=`, and `/here` maps `base` by real path.
+- ★ **`/here` never launches Obsidian.** `pgrep -x Obsidian` comes first, and the CLI runs only if the app is up. `/open` may launch it.
+- ★ **The CLI's output is untrusted.** Not JSON, a `base` that isn't a directory, a null `file`, and a missing file are four separate errors, never a guess. The parser requires the `=> ` line because the CLI exits 0 on errors.
+- ★ **`/here`'s note goes in the next user message, never the system prompt,** so the cached prefix stays byte-identical. It goes with one message, and a second `/here` replaces it.
+- **`/here` edge cases:**
+  - A failed `/here` attaches nothing and drops an earlier attachment.
+  - A failed turn keeps the attachment for the retry.
+  - `/end` never carries it.
+  - `/vault`, or a `/drop` of its vault, clears it.
+  - Only `.md` files are attached.
+  - The REPL reloads the registry for `/here`, so a vault registered since start is recognized rather than called unregistered.
 - ★ **One schema, in `daedalus.core.schema`.** `SCHEMA` moved out of `tests/test_templates.py`, which now imports it, so one dict guards both the templates and live notes.
 - ★ **`.obsidian/` in any parent of a project vault fails registry load.** This is checked up to and including the repo root, the nearest parent holding `.git`, and catches the commit-1 mistake of opening the repo as a vault. Registering a folder with no `AGENTS.md` fails too, which catches registering `~/code/daedalus-scratch` instead of `.../vault`.
 - ★ **The session is passed in explicitly.** Core functions never read `state.json`, so every one is testable without `~/.config`. Since commit 4, `daedalus.core.state` loads it for front ends (daedalus-mcp now, the REPL from commit 6).
@@ -227,7 +263,7 @@
 
 ## Up Next
 
-Commit 7: Obsidian bridge — /open, /here.
+Commit 8: design-decision gate.
 
 When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).
 

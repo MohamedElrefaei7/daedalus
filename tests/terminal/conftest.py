@@ -51,6 +51,7 @@ open_world = core_conftest.open_world
 
 from fakes import FakeDeepSeek, MemoryKeyring  # noqa: E402
 
+from daedalus.terminal import obsidian  # noqa: E402
 from daedalus.terminal.config import Config  # noqa: E402
 
 
@@ -63,6 +64,16 @@ def memory_keyring(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     yield ring
     keyring.set_keyring(previous)
+
+
+@pytest.fixture(autouse=True)
+def no_real_obsidian(monkeypatch):
+    """No test sees or launches the real Obsidian: it's "not running", and `open` refuses to run."""
+    def refuse(argv):
+        raise AssertionError(f"a test tried to run {argv!r}")
+
+    monkeypatch.setattr(obsidian, "is_running", lambda: False)
+    monkeypatch.setattr(obsidian, "run_open", refuse)
 
 
 @pytest.fixture

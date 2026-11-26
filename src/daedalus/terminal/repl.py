@@ -2,7 +2,8 @@
 
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
-Commands: /new, /vaults, /vault, /pull, /drop, /end, /cost, /pending, /diff, /approve, /reject, /help, /quit.
+Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /end, /cost, /pending, /diff, /approve, /reject,
+/help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
@@ -30,8 +31,11 @@ from daedalus.core.policy import Op, PolicyError, authorize
 from daedalus.core.registry import RegistryError, load_registry
 from daedalus.core.session import Session
 from daedalus.core.state import StateError, drop, load_session, pull, set_active
+from daedalus.core.tools import RefError
 
-from . import ledger
+from . import ledger, obsidian
+from daedalus.toolset import refusal
+
 from .agent import Agent, Events, ToolOutcome, tool_label
 from .config import Config, ConfigError, load_config
 from .deepseek import DeepSeek, DeepSeekError, Reply
@@ -45,6 +49,8 @@ HELP = """\
 /vaults                list registered projects (* active, + pulled)
 /vault <name>          switch projects: starts a fresh conversation
 /pull <name>           read another project too (read-only); /drop <name> stops
+/open <note>           show a note in Obsidian (vault:path/to/note.md, or a wikilink target)
+/here                  attach the note open in Obsidian to your next message
 /end                   propose a CONTEXT.md log entry for this session, review proposals, exit
 /cost                  calls, tokens, and dollars for this session and today, plus the DeepSeek balance
 /pending               proposals waiting for you
@@ -167,7 +173,8 @@ The current CONTEXT.md of {project}, between the markers:
 
 class Repl:
     def __init__(self, session: Session, cfg: Config, ds: DeepSeek, console: Console,
-                 session_id: str | None = None, registry_path=None, state_path=None) -> None:
+                 session_id: str | None = None, registry_path=None, state_path=None,
+                 bridge: obsidian.Bridge | None = None) -> None:
         self.session = session
         self.cfg = cfg
         self.ds = ds
@@ -177,6 +184,10 @@ class Repl:
         self.state_path = state_path
         self.agent = Agent(session, ds, cfg, self.session_id)
         self.view = LiveView(console)
+        self.bridge = bridge or obsidian.Bridge()
+        # /here's note, waiting for your next message. Never the system prompt: that would break the stable
+        # prefix DeepSeek caches. One at a time: a second /here replaces it.
+        self.attached: obsidian.Here | None = None
         self.read_line: Callable[..., str] = lambda prompt="› ": input(prompt)
 
     # The loop -------------------------------------------------------------------------
@@ -203,9 +214,14 @@ class Repl:
                 continue
             self.ask(line)
 
-    def ask(self, text: str) -> None:
+    def ask(self, text: str, attach: bool = True) -> None:
+        sent = self.attached if attach else None
+        if sent is not None:
+            text = f"{obsidian.attachment(sent)}\n\n{text}"
         try:
             self.agent.turn(text, self.view)
+            if sent is not None and self.attached is sent:
+                self.attached = None  # delivered; a failed turn keeps it for the retry
         except CapExceeded as e:
             self.view.end()
             self.console.print(Text(str(e), style="bold red"))
@@ -242,8 +258,16 @@ class Repl:
                 change = pull if name == "/pull" else drop
                 self.session = change(self._id(rest, f"{name} <name>"), self.registry_path, self.state_path)
                 self.agent.rebuild(self.session)
+                if self.attached is not None and self.attached.vault not in {v for v, _ in self.session.scope}:
+                    self.console.print(f"dropped the /here attachment {self.attached.ref}: its vault left the session.")
+                    self.attached = None
                 self.console.print(f"pulled: {', '.join(self.session.pulled) or 'none'} (read-only). The system "
                                    "prompt was rebuilt; the conversation continues.")
+            elif name == "/open":
+                opened = obsidian.open_note(self.session, self._id(rest, "/open <note>"), self.bridge)
+                self.console.print(f"opened {opened.vault}:{opened.rel_path} in Obsidian")
+            elif name == "/here":
+                self.here()
             elif name == "/help":
                 self.console.print(HELP)
             elif name == "/cost":
@@ -261,8 +285,10 @@ class Repl:
                 self.console.print(f"rejected {p.id}: {p.status_reason}")
             else:
                 self.console.print(Text(f"unknown command {name}; /help lists them", style="yellow"))
-        except (PolicyError, queue.ProposalError, StateError, RegistryError, LifecycleError, KeyError,
-                ValueError) as e:
+        except PolicyError as e:
+            self.console.print(Text(f"error: {refusal(e)}", style="red"))
+        except (queue.ProposalError, StateError, RegistryError, LifecycleError, KeyError, ValueError, RefError,
+                obsidian.ObsidianError) as e:
             self.console.print(Text(f"error: {e}", style="red"))
         return None
 
@@ -292,8 +318,36 @@ class Repl:
         # A fresh conversation: history about the old project mustn't carry into this one. Same session id,
         # so the session spend cap carries over: it belongs to this terminal, not to a project.
         self.agent = Agent(self.session, self.ds, self.cfg, self.session_id, meter=self.agent.meter)
+        self.attached = None  # a fresh conversation starts with nothing attached
         self.console.print(Text(f"Switched to {name}. Fresh conversation: history cleared, system prompt rebuilt "
                                 f"from {name}'s AGENTS.md and CONTEXT.md.", style="bold"))
+
+    # Obsidian ---------------------------------------------------------------------------
+
+    def here(self) -> None:
+        """Attach the note open in Obsidian to the next message, replacing any earlier /here."""
+        try:
+            registry = load_registry(self.registry_path)  # fresh, so a vault registered since start is known
+        except RegistryError:
+            registry = None
+        found = obsidian.active_note(self.session, self.bridge, registry)
+        if isinstance(found, obsidian.Problem):
+            dropped = self.attached
+            self.attached = None  # a failed /here attaches nothing, not a stale note
+            self.console.print(Text(found.message, style="yellow"))
+            if dropped is not None:
+                self.console.print(Text(f"(the earlier /here note, {dropped.ref}, was dropped too)", style="yellow"))
+            return
+        replaced = self.attached
+        self.attached = found
+        cut = (f", attaching the first {obsidian.MAX_ATTACH_CHARS:,}"
+               if len(found.text) > obsidian.MAX_ATTACH_CHARS else "")
+        self.console.print(Text(f"→ here {found.ref} ({len(found.text):,} chars{cut})", style="green"))
+        if found.schema_errors:
+            self.view.schema_errors(found.ref, found.schema_errors)
+        if replaced is not None:
+            self.console.print(Text(f"  (replaces {replaced.ref})", style="dim"))
+        self.console.print(Text("  It goes with your next message.", style="dim"))
 
     # /end -------------------------------------------------------------------------------
 
@@ -306,7 +360,7 @@ class Repl:
         current = context.read_text(encoding="utf-8")
         self.console.print(Text(f"Writing the session summary for {self.session.active}'s CONTEXT.md …", style="bold"))
         self.ask(END_PROMPT.format(date=dt.date.today().isoformat(), project=self.session.active,
-                                   context=current if current.endswith("\n") else current + "\n"))
+                                   context=current if current.endswith("\n") else current + "\n"), attach=False)
         self.review(self.agent.proposals)
 
     def review(self, ids: list[str]) -> None:
