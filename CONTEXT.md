@@ -231,6 +231,21 @@
   5. Claude desktop ("find precedent about storage") found the one accepted decision and summarized it. It noted the decision's empty Consequences section.
 - **Found in the live check:** the decision has the same file stem as its question. So the component's `related: ["[[should-scratch2-…-file]]"]` is **ambiguous**: `check_basis` refuses it, while `[[decisions/…]]` is OK. The link rule accepts it, since ambiguous links count, like dangling ones. Up Next has the fix.
 
+### 2026-11-26 — Fix: no ambiguous links in typed drafts; questions get a q- prefix
+
+- **The cause:** in commit 8's live check, the decision took its question's stem, so the component's bare `[[should-scratch2-…-file]]` matched both notes. `check_basis` refused it as ambiguous, but the link rule had let it through.
+- **`ask_user`** now names questions `questions/q-<slug>.md`. `/answer`'s decision keeps the plain `<slug>`, so the two never share a name.
+- **`tools.link_errors`** refuses a typed draft whose link matches more than one note in its scope. The error names the matches and the path-qualified forms. Dangling links stay allowed, and untyped drafts still have no link rule.
+- **scratch2 migrated** in `0e8cdda fix: q- prefix for question note`: the question was renamed to `q-should-…`, and the decision's two links to it were updated. The component note is unchanged. Its bare link now resolves uniquely, and `check_basis` returns `OK scratch2:decisions/should-scratch2-s-storage-layer-use-sqlite-embedded-file.md`.
+- **Tests:** 753, 6 new:
+  - an ambiguous bare link is refused, naming both matches and both qualified forms; it failed first with `DID NOT RAISE DraftInvalid`;
+  - an ambiguous body link is refused;
+  - a dangling link is accepted;
+  - an untyped draft may keep an ambiguous link;
+  - an answered question and its decision have different stems;
+  - an `ambiguous_link` row in the integrity table (40 rows).
+  - Three commit-8 tests were updated for the new names.
+
 ## Key decisions
 
 - ★ **No design choice goes ahead without precedent or the human's answer.** Precedent is an accepted, schema-valid note in the active `decisions/` or the shared `practices/`, and nothing else: no drafts or proposed notes, no other folders, no pulled projects' decisions (promote those to a shared practice).
@@ -249,9 +264,10 @@
   - It records its own "why no precedent applied" from a `find_precedent` run, rather than taking a fifth argument.
   - It needs at least two distinct options.
   - The question note's status is `proposed`, and `Category: \`x\`` goes in the body, not the frontmatter.
+- ★ **Questions are `q-<slug>`, decisions `<slug>`;** a bare link always means the decision. The link rule refuses ambiguous links in typed drafts, while dangling ones stay allowed.
 - **`/answer` decision notes:**
-  - They are named after the question's stem, with `-2` and so on if taken.
-  - Their links are path-qualified (`[[questions/x]]` and `[[decisions/x]]`).
+  - They take the question's stem without `q-`, with `-2` and so on if taken.
+  - Their links are path-qualified (`[[questions/q-x]]` and `[[decisions/x]]`).
   - Free text rejects every option.
   - The answer is validated before the question is approved.
 - ★ **Obsidian is asked where, never what.** The CLI reports the focused vault folder and file. Content is read only through `daedalus.core`'s `read_note`, so the policy (`.obsidian/` refused by rule 4, escapes by rule 1) and schema reporting apply. The CLI's `read` and its write commands are never used.
@@ -326,8 +342,6 @@
 ## Up Next
 
 Commit 9: uploads via /add.
-
-Decision notes share their question's stem, so a bare `[[stem]]` is ambiguous (seen live in scratch2's `components/storage-layer.md`). Either give the decision a distinct name, or have the link rule refuse ambiguous links in typed drafts; then fix that note's link.
 
 When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).
 

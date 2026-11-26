@@ -95,3 +95,45 @@ def test_shared_inbox_lesson_needs_a_link(world) -> None:
         propose(world, "inbox/l.md", lesson, vault="shared")
     propose(world, "inbox/l.md", note_text("lesson", "# L\n", source="claude", applies_to=["testing"],
                                            related=["[[red-test-first]]"]), vault="shared")
+
+
+# Ambiguous links ---------------------------------------------------------------------------
+
+def test_ambiguous_bare_link_is_refused(world) -> None:
+    """[[x]] matching two notes in scope (a question and its decision, say) is refused, naming both."""
+    from conftest import write_note
+
+    write_note(world.alpha, "questions/pick-db.md", "question", "# Pick a database?\n", options=["a", "b"])
+    write_note(world.alpha, "decisions/pick-db.md", "decision", "# Pick a database\n")
+    with pytest.raises(DraftInvalid) as exc:
+        propose(world, "inbox/c.md", concept(related=["[[pick-db]]"]))
+    text = str(exc.value)
+    assert "[[pick-db]]" in text and "ambiguous" in text
+    assert "alpha:questions/pick-db.md" in text and "alpha:decisions/pick-db.md" in text
+    assert "[[decisions/pick-db]]" in text and "[[questions/pick-db]]" in text  # the path-qualified forms
+    assert queue.statuses() == {}
+    p = propose(world, "inbox/c.md", concept(related=["[[decisions/pick-db]]"]))  # qualified, it's fine
+    assert queue.get(p.id).status == "pending"
+
+
+def test_ambiguous_body_link_is_refused_too(world) -> None:
+    from conftest import write_note
+
+    write_note(world.alpha, "concepts/twin.md", "concept", "# twin\n")
+    write_note(world.alpha, "experiments/twin.md", "experiment", "# twin\n")
+    with pytest.raises(DraftInvalid, match="ambiguous"):
+        propose(world, "inbox/c.md", note_text("concept", "# c\n\nSee [[twin]].\n", source="claude"))
+
+
+def test_dangling_link_is_still_accepted(world) -> None:
+    p = propose(world, "inbox/c.md", concept(related=["[[a-note-not-written-yet]]"]))
+    assert queue.get(p.id).status == "pending"
+
+
+def test_untyped_draft_may_keep_an_ambiguous_link(world) -> None:
+    from conftest import write_note
+
+    write_note(world.alpha, "concepts/twin.md", "concept", "# twin\n")
+    write_note(world.alpha, "experiments/twin.md", "experiment", "# twin\n")
+    p = propose(world, "inbox/jot.md", "a jotting about [[twin]]\n")
+    assert queue.get(p.id).status == "pending"

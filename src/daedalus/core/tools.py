@@ -371,17 +371,20 @@ _ROOT_STEMS = frozenset(name[:-3].casefold() for name in ROOT_FILES)
 
 
 def link_errors(session: Session, auth, content: str) -> list[str]:
-    """The link rule for typed drafts: at least one link, and none to AGENTS.md or CONTEXT.md.
+    """The link rule for typed drafts: at least one link, none to AGENTS.md or CONTEXT.md, none ambiguous.
 
     Any of related, shared_refs, project_refs, or a body link satisfies the
-    rule; a dangling link counts, as it does in Obsidian. A link is refused
-    if it resolves to a root file in the vault it points into, or if its
-    target's name is AGENTS or CONTEXT whether or not it resolves.
+    rule; a dangling link counts, as it does in Obsidian (the note may not be
+    written yet). A link is refused if it resolves to a root file in the vault
+    it points into, if its target's name is AGENTS or CONTEXT whether or not
+    it resolves, or if it matches more than one note in its scope: the error
+    names the matches and their path-qualified forms.
     """
     if notes.draft_type(content, auth) is None:
         return []
     links = notes.draft_links(content)
     errors: list[str] = []
+    root_links = 0
     catalogs = _catalogs(session)
     projects = [session.active, *session.pulled]
     for link in links:
@@ -389,15 +392,22 @@ def link_errors(session: Session, auth, content: str) -> list[str]:
         name = link.target.rsplit("/", 1)[-1]
         stem = name[:-3] if name.casefold().endswith(".md") else name
         scope = [v for v in link_scope(link.key, auth.vault, projects, SHARED_NAME) if v in catalogs]
-        roots = [m for m in resolve(link.target, (catalogs[v] for v in scope)).matches if m.rel_path in ROOT_FILES]
+        res = resolve(link.target, (catalogs[v] for v in scope))
+        roots = [m for m in res.matches if m.rel_path in ROOT_FILES]
         if roots or stem.casefold() in _ROOT_STEMS:
+            root_links += 1
             target = f" (resolves to {roots[0].vault}:{roots[0].rel_path})" if roots else ""
             errors.append(f"[[{link.target}]] in {where}{target}: AGENTS.md and CONTEXT.md are never link "
                           "targets; link a note instead")
+        elif res.ambiguous:  # a link that doesn't resolve yet is fine; one that resolves to several isn't
+            names = ", ".join(f"{m.vault}:{m.rel_path}" for m in res.matches)
+            qualified = " or ".join(f"[[{m.rel_path[:-3]}]]" for m in res.matches)
+            errors.append(f"[[{link.target}]] in {where} is ambiguous: it matches {names}. Link by path instead, "
+                          f"e.g. {qualified}")
     if not links:
         errors.append("no links: a note must link at least one other note, in related, shared_refs, or "
                       "project_refs, or in the body (AGENTS.md and CONTEXT.md don't count)")
-    elif len(errors) == len(links):
+    elif root_links == len(links):
         errors.append("every link here is to a root file, so the note links no other note")
     return errors
 

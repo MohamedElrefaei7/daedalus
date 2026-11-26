@@ -211,6 +211,15 @@ def link_only_to_context(w):
     return Case(lambda: propose_note(w.session, "alpha", "inbox/c.md", draft, "claude", "s"), DraftInvalid)
 
 
+def ambiguous_link(w):
+    write_note(w.alpha, "questions/pick-db.md", "question", "# Pick a database?\n", options=["a", "b"])
+    write_note(w.alpha, "decisions/pick-db.md", "decision", "# Pick a database\n")
+    git(w.alpha_repo, "add", "-A")
+    git(w.alpha_repo, "commit", "-q", "-m", "a question and a decision with one name")
+    draft = note_text("concept", "# Hello\n", source="claude", related=["[[pick-db]]"])
+    return Case(lambda: propose_note(w.session, "alpha", "inbox/c.md", draft, "claude", "s"), DraftInvalid)
+
+
 def create_over_existing(w):
     return Case(note(w, "alpha", "CONTEXT.md"), ProposalError)
 
@@ -259,7 +268,7 @@ CASES = [
     rule5_propose_decision, rule5_edit_agents, rule5_edit_template, rule5_propose_into_logs, rule5_log_exists,
     stale_edit, stale_create_collision, double_apply, apply_rejected, commit_failure, log_commit_failure,
     oversized, invalid_draft, invalid_lesson_draft, source_mismatch_on_create, agent_edit_changes_source,
-    link_only_to_context,
+    link_only_to_context, ambiguous_link,
     create_over_existing, edit_missing, forged_trailer_summary,
     reject_without_reason,
     non_precedent_basis_in_proposal, promote_type_mismatch, answer_unknown_question,

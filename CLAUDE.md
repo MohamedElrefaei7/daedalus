@@ -128,7 +128,7 @@ Every invariant gets a test that fails when the invariant is broken.
 
 ## Writes: proposals, the queue, apply
 
-Agents never write a vault directly. `propose_note`, `propose_edit`, and `propose_lesson` validate the draft against `SCHEMA` and write only to the queue. **The link rule.** A typed draft must link at least one other note. A typed draft is one for a typed folder, or one that declares a type elsewhere, such as an `inbox/` draft. Any of `related`, `shared_refs`, `project_refs`, or a body link counts, dangling links included. A link to `AGENTS.md` or `CONTEXT.md` is refused, whether it resolves to one or just names one. **Source is provenance.** A create's frontmatter `source` must equal the proposal's source. An edit may change it only when the proposal's source is `human`, so an agent may edit a human's draft but can't re-attribute it. The queue is SQLite at `~/.local/state/daedalus/queue.sqlite`, outside every vault, in WAL mode with short transactions. Content is capped at 256 KB.
+Agents never write a vault directly. `propose_note`, `propose_edit`, and `propose_lesson` validate the draft against `SCHEMA` and write only to the queue. **The link rule.** A typed draft must link at least one other note. A typed draft is one for a typed folder, or one that declares a type elsewhere, such as an `inbox/` draft. Any of `related`, `shared_refs`, `project_refs`, or a body link counts, dangling links included (the note may not be written yet). A link to `AGENTS.md` or `CONTEXT.md` is refused, whether it resolves to one or just names one. A link that matches more than one note in its scope is refused too, and the error names the matches and their path-qualified forms (`[[decisions/x]]`). **Source is provenance.** A create's frontmatter `source` must equal the proposal's source. An edit may change it only when the proposal's source is `human`, so an agent may edit a human's draft but can't re-attribute it. The queue is SQLite at `~/.local/state/daedalus/queue.sqlite`, outside every vault, in WAL mode with short transactions. Content is capped at 256 KB.
 
 **A write that isn't committed shouldn't exist.** `daedalus.core.apply.apply(session, change_id)`, in order:
 
@@ -314,7 +314,7 @@ The gate only reads, through `tools.read_note`. `gate.propose_with_basis` is `ch
 - With `category`, notes that mention it come first.
 
 **`ask_user(question, category, options, context_refs)`** is for the agent only; Claude asks in its own chat.
-- It proposes a typed `question` note into `questions/` through the queue, as `source: deepseek`. The note holds:
+- It proposes a typed `question` note, `questions/q-<slug>.md`, through the queue, as `source: deepseek`. The `q-` prefix means a question never shares a name with its decision. The note holds:
   - `options`, with at least two distinct;
   - `answered: false`;
   - `related` set to `context_refs`, at least one, under the link rule;
@@ -326,11 +326,11 @@ The gate only reads, through `tools.read_note`. `gate.propose_with_basis` is `ch
 1. The answer is validated against the question first.
 2. If the question proposal is still pending, it's approved (its own commit).
 3. Then **one** commit:
-   - it creates `decisions/<question-stem>.md` (`-2`, `-3` … if taken), with `type: decision`, `status: accepted`, and `source: human`;
-   - its `related` is `["[[questions/<stem>]]"]`;
+   - it creates `decisions/<slug>.md`, the question's stem without `q-` (`-2`, `-3` … if taken), with `type: decision`, `status: accepted`, and `source: human`;
+   - its `related` is `["[[questions/q-<slug>]]"]`;
    - its body holds the question, the category, the decision, and the rejected options;
-   - it edits the question to `answered: true`, adds `[[decisions/<stem>]]` to its `related`, and fills `## Answer`.
-   - Links are path-qualified, because the question and decision share a stem.
+   - it edits the question to `answered: true`, adds `[[decisions/<slug>]]` to its `related`, and fills `## Answer`.
+   - A bare `[[<slug>]]` therefore always means the decision.
 
 Free text rejects every option. An already-answered, rejected, or non-question proposal is refused, as is an unknown id.
 

@@ -1,11 +1,12 @@
 """How precedent gets made: ask_user's question, the human's /answer, and /promote.
 
-ask_user (agents): proposes a typed question note into questions/ through the
-normal queue. The agent's turn ends there.
+ask_user (agents): proposes a typed question note, questions/q-<slug>.md,
+through the normal queue. The agent's turn ends there.
 
 answer_question (/answer, the human): approves the question if it's still
-pending, then in ONE commit creates an accepted decision (source: human,
-linked to the question) and marks the question answered, linked to the
+pending, then in ONE commit creates an accepted decision, decisions/<slug>.md
+without the q- prefix so the two never share a name (source: human, linked to
+the question) and marks the question answered, linked to the
 decision. Plan approval in commit 12 reuses the same multi-path apply.
 
 promote (/promote, the human): moves an inbox draft into the folder its type
@@ -38,6 +39,9 @@ from .session import Session
 
 MAX_QUESTION = 300
 MAX_SLUG = 60
+# Question notes are questions/q-<slug>.md and their decisions decisions/<slug>.md, so the two never
+# share a name and a bare [[<slug>]] link always means the decision.
+QUESTION_PREFIX = "q-"
 
 
 class AnswerError(ProposalError):
@@ -174,7 +178,7 @@ def ask_user(session: Session, source: str, question: str, category: str, option
         why = ("Why no precedent applied: find_precedent found no accepted decision in this project's decisions/ "
                f"and no accepted shared practice for this {category} choice.")
     folder = session.active_vault / "questions"
-    rel = f"questions/{_free_name(folder, slugify(question))}"
+    rel = f"questions/{_free_name(folder, QUESTION_PREFIX + slugify(question))}"
     content = question_note(question, category, opts, refs, source, why)
     summary = f"question: {question}"[:200]
     p = tools.propose_note(session, session.active, rel, content, source, summary)
@@ -262,7 +266,7 @@ def answer_question(session: Session, question_id: str, answer: str) -> Answered
     chosen, rejected = parse_answer(answer, options)
 
     decisions = authorize(root / "decisions" / "x.md", Op.USER_ACTION, session).path.parent
-    stem = rec.rel_path.rsplit("/", 1)[-1][:-3]
+    stem = rec.rel_path.rsplit("/", 1)[-1][:-3].removeprefix(QUESTION_PREFIX)
     decision_rel = f"decisions/{_free_name(decisions, stem)}"
     dpath = authorize(root / decision_rel, Op.USER_ACTION, session).path
     q_link, d_link = f"[[{rec.rel_path[:-3]}]]", f"[[{decision_rel[:-3]}]]"

@@ -40,7 +40,7 @@ def test_ask_user_proposes_a_typed_linked_question(gworld) -> None:
     asked = ask(gworld)
     p = queue.get(asked.proposal.id)
     assert (p.vault, p.rel_path, p.kind, p.status, p.source) == (
-        "alpha", "questions/should-alpha-store-its-data-in-sqlite-or-postgres.md", "create", "pending", "deepseek")
+        "alpha", "questions/q-should-alpha-store-its-data-in-sqlite-or-postgres.md", "create", "pending", "deepseek")
     raw, body = notes.split_frontmatter(p.content)
     meta = yaml.safe_load(raw)
     assert meta["type"] == "question" and meta["source"] == "deepseek"
@@ -80,7 +80,7 @@ def test_answer_is_one_commit_with_exactly_the_decision_and_the_question(gworld)
     done = answer_question(gworld.session, asked.proposal.id, "1")
 
     assert commits_since(repo, base) == 1, "the decision and the question update must be one commit"
-    stem = q.rel_path[len("questions/"):-3]
+    stem = q.rel_path[len("questions/q-"):-3]
     assert changed_files(repo) == [("A", f"vault/decisions/{stem}.md"), ("M", f"vault/{q.rel_path}")]
     assert git(repo, "log", "-1", "--format=%s").strip().startswith("answer: Should alpha store")
     assert f"Daedalus-Change: " in git(repo, "log", "-1", "--format=%B")
@@ -88,7 +88,7 @@ def test_answer_is_one_commit_with_exactly_the_decision_and_the_question(gworld)
 
     decision = fm(gworld.alpha / "decisions" / f"{stem}.md")
     assert (decision["type"], decision["status"], decision["source"]) == ("decision", "accepted", "human")
-    assert decision["related"] == [f"[[questions/{stem}]]"]
+    assert decision["related"] == [f"[[questions/q-{stem}]]"]
     body = (gworld.alpha / "decisions" / f"{stem}.md").read_text()
     assert "## Decision\n\nSQLite\n" in body and "## Rejected options\n\n- Postgres\n" in body
     assert QUESTION in body and "Category: `data_source`" in body
@@ -146,7 +146,7 @@ def test_crash_between_writes_and_commit_restores_both(gworld, state_root) -> No
     q = apply(gworld.session, asked.proposal.id)
     qpath = gworld.alpha / q.rel_path
     before_q, base = qpath.read_bytes(), head(gworld.alpha_repo)
-    stem = q.rel_path[len("questions/"):-3]
+    stem = q.rel_path[len("questions/q-"):-3]
 
     ctx = multiprocessing.get_context("spawn")
     proc = ctx.Process(target=workers.answer_and_crash,
@@ -322,3 +322,17 @@ def test_apply_changes_stale_check_writes_nothing(gworld) -> None:
     with pytest.raises(StaleProposal):
         apply_changes(gworld.alpha_repo, [Change(a, "# a\n", None), Change(ctx, "x\n", "0" * 64)], "s")
     assert not a.exists() and head(gworld.alpha_repo) == base and queue.changesets() == []
+
+
+def test_answered_question_and_decision_have_different_stems(gworld) -> None:
+    """A bare [[slug]] must mean one note: the decision. The question is q-<slug>."""
+    from daedalus.core.gate import OK, check_basis
+
+    asked = ask(gworld)
+    done = answer_question(gworld.session, asked.proposal.id, "1")
+    q_stem = done.question_ref.rsplit("/", 1)[1][:-3]
+    d_stem = done.decision_ref.rsplit("/", 1)[1][:-3]
+    assert q_stem == "q-" + d_stem and q_stem != d_stem
+    assert isinstance(check_basis(gworld.session, "data_source", "SQLite", f"[[{d_stem}]]"), OK)
+    draft = note_text("component", "# Store\n", source="deepseek", related=[f"[[{d_stem}]]"])
+    assert queue.get(propose_note(gworld.session, "alpha", "inbox/store.md", draft, "deepseek", "s").id)
