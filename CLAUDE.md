@@ -44,9 +44,10 @@ daedalus/
 │   │   └── config.py         # ~/.config/daedalus/config.toml: model, effort, max_tokens, caps
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
-│       ├── registry.py       # vaults.toml loading + validation (RegistryError)
+│       ├── registry.py       # vaults.toml loading + validation; register/unregister_project (tomlkit)
 │       ├── session.py        # Session dataclass, Area enum
-│       ├── state.py          # state.json -> Session (load_session, save_state, StateError) + stopgap CLI
+│       ├── state.py          # state.json -> Session (load_session, save_state, set_active/pull/drop) + CLI
+│       ├── lifecycle.py      # /new: vault from template, path-limited init commit, register; full rollback
 │       ├── policy.py         # Op enum, authorize(), authorize_command(): the seven rules
 │       ├── notes.py          # frontmatter parsing + schema validation (NoteSchemaError)
 │       ├── links.py          # wikilink extraction + Obsidian-style resolution
@@ -64,6 +65,9 @@ daedalus/
     ├── core/                 # one file per core part, test_bench.py, test_write_integrity.py
     ├── mcp/                  # daedalus-mcp via FastMCP's in-memory client, plus a stdio subprocess test
     └── terminal/             # recorded SSE streams through httpx2.MockTransport; no live calls
+
+Test helpers live in plain modules (`tests/terminal/fakes.py`, `tests/mcp/mcp_helpers.py`), not in conftest:
+pytest binds `conftest` to whichever folder's it imported last. Every conftest re-exports the core helpers.
 ```
 
 Run the tests with `uv run pytest`.
@@ -164,11 +168,35 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 
 ## The terminal: `daedalus`
 
-`daedalus [project]` sets the active project (like `python -m daedalus.state set-active`), then starts a plain REPL: `prompt_toolkit` input with history, `rich` `Live` output. A DeepSeek agent answers with the daedalus tools. Commands: `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`. `queue_cli` stays as a debug tool. The REPL's session is fixed at start; commit 6 adds `/vault` and `/pull`.
+`daedalus [project]` sets the active project (like `python -m daedalus.state set-active`), then starts a plain REPL: `prompt_toolkit` input with history, `rich` `Live` output. A DeepSeek agent answers with the daedalus tools. Commands:
+- `/new <name> --repo <path>`, `/vaults`, `/vault <name>`, `/pull <name>`, `/drop <name>`, `/end`;
+- `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
+
+`queue_cli` stays as a debug tool. The REPL changes the session only through its own commands, which write `state.json` through `daedalus.core.state`; `daedalus-mcp` follows on its next call.
+
+**Switching.**
+- `/vault <name>` starts a **fresh conversation**: history is cleared, the system prompt is rebuilt, and the REPL says so. History about project A mustn't carry into B. The session id is kept, so the session spend cap carries over: it belongs to this terminal, not to a project.
+- `/pull` and `/drop` change `pulled` and rebuild the system prompt, keeping history. Pulled projects stay read-only (rule 3).
+
+**`/new <name> --repo <path>`** (`daedalus.core.lifecycle`), in order:
+1. The name is valid under the registry's rules and not registered yet.
+2. `--repo` is an existing git repo's top level, with no `.obsidian/` at its root (refused with the commit-1 message).
+3. `<repo>/vault/` doesn't exist, or is empty.
+4. `templates/project-vault/` is copied into `<repo>/vault/`.
+5. Exactly `vault/` is committed (`git add -- vault`, then `git commit --only -- vault`) as `init: daedalus vault from template`. Anything else staged or modified in that repo stays as it was.
+6. The project is registered.
+7. The manual Obsidian step is printed: Open folder as vault on `<repo>/vault`, then turn on Templates, set Deleted files to system trash, and make `created` a Date.
+
+Any failure rolls back in reverse. Each undo is armed before its step and tolerates a half-done step:
+- unregister;
+- undo the init commit, only if it's still HEAD and touches only `vault/`: a soft reset (or deleting HEAD for a first commit), then `vault/` alone is dropped from the index;
+- remove the copied folder.
+
+**The registry** is written only by `registry.register_project` and `unregister_project` (only `/new` calls them). They edit with `tomlkit`, so comments, key order, and other entries survive byte for byte. They validate the new text with `load_registry` before an atomic replace, so an invalid result leaves the old file untouched. `unregister_project` refuses the active project and a pulled one.
 
 **The API key lives in the macOS Keychain,** through `keyring`: service `daedalus`, account `deepseek`, never in a file. `python -m daedalus.secrets set deepseek` stores it (via `getpass`), and `status` says whether one is present without printing it. `DEEPSEEK_API_KEY` overrides the Keychain, for tests and CI. With no key, `daedalus` exits saying how to set one, before any client exists.
 
-**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
+**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, plus `propose_edit` and `propose_lesson` for `/end` (daedalus-mcp keeps the first eight). The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
 
 **Pricing** (`terminal/pricing.py`, one table with `checked: 2026-11-25`). USD per 1M tokens, off-peak; peak is double.
 
@@ -194,4 +222,19 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 
 **The meter.** While streaming, the line is an estimate (leading `~`), with reasoning shown separately. On the final chunk it snaps to the billed numbers, for example `↑ 12,480 (9,100 cached)   ↓ 312 (reasoning 180)   $0.0021 this call   $0.21 today   off-peak`.
 
-**The system prompt is byte-identical across calls:** a fixed preamble, then the shared vault's `AGENTS.md`, then the active project's. There are no timestamps or set iteration in it, because identical prefixes are what DeepSeek's cache hits on. A test compares it across processes with different hash seeds.
+**The system prompt runs from most stable to least stable**, so DeepSeek's prefix cache hits as much as possible:
+1. the role preamble;
+2. the shared `AGENTS.md`;
+3. the active project's `AGENTS.md`;
+4. accepted shared practices (`status: accepted`), by path, at most 12,000 characters, packing whole practices and naming any left out;
+5. each pulled project, sorted by name: only the "Decisions index" and "Where things live" sections of its `CONTEXT.md`, at most 6,000 characters each;
+6. the active project's `CONTEXT.md`, last, because it changes most.
+
+It's byte-identical for identical files: fixed order, sorted paths, no timestamps, no set iteration. A test compares all six blocks across processes with different hash seeds. Anything dated, such as `/end`'s date, goes in the user message, never the system prompt.
+
+**`/end`.**
+- If the session ran no tools and made no proposals, it just exits.
+- Otherwise it sends one more user turn, carrying today's date and the current `CONTEXT.md`. The agent proposes, through `propose_edit` (so with the current `base_sha256`), the full file plus a dated Log entry: what was asked, learned, proposed or decided, and open threads. Up Next changes only if the session clearly changed it.
+- The agent may also propose lessons into the shared `inbox/`. A lesson records what failed, why, and the fix; nothing else qualifies.
+- The REPL then walks this session's pending proposals one at a time (diff, then approve, reject with a reason, or skip), and exits.
+- Nothing is written until you approve. A `CONTEXT.md` edited meanwhile makes the approval refuse as stale.

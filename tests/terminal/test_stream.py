@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import httpx2
 import pytest
-from conftest import WED_OFF, Explodes, chunk, fixed, reply_chunks, sse, usage
+from fakes import WED_OFF, Explodes, chunk, fixed, reply_chunks, sse, usage
 
 from daedalus.terminal import ledger
 from daedalus.terminal.config import Config

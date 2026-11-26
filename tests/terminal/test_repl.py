@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 import pytest
-from conftest import TEST_KEY, reply_chunks, usage
+from fakes import TEST_KEY, reply_chunks, usage
 from core_conftest import note_text
 from rich.console import Console
 
@@ -20,7 +20,7 @@ from daedalus.terminal.repl import main
 def script(*lines: str):
     it = iter(lines)
 
-    def read_line() -> str:
+    def read_line(prompt: str = "") -> str:
         try:
             return next(it)
         except StopIteration:
@@ -199,3 +199,23 @@ def test_cost_shows_session_today_and_balance(gworld, fake, keyed) -> None:
     assert "balance       4.98 USD" in out
     assert "caps          $1.00 per session, $3.00 per UTC day" in out
 
+
+
+def test_streaming_view_never_exceeds_the_terminal_height() -> None:
+    """A transient Live can't erase rows that scrolled off; the view must fit, wrapped lines included."""
+    from daedalus.terminal.meter import Reading
+    from daedalus.terminal.repl import LiveView
+
+    for width, height in ((80, 24), (40, 10), (120, 50)):
+        out = Console(file=io.StringIO(), width=width, height=height, force_terminal=False, color_system=None)
+        view = LiveView(out)
+        view.reasoning = "\n".join(f"thinking step {i} " * 6 for i in range(40))
+        view.content = "\n".join(f"line {i} " + "word " * (i % 30) for i in range(200))
+        view.reading(Reading(True, 12_480, None, 300, 180, 0.0021, 0.21, "off-peak"))
+        rows = len(out.render_lines(view._render(), out.options, pad=False))
+        assert rows <= height - 1, (width, height, rows)
+        shown = ["".join(seg.text for seg in line).rstrip() for line in out.render_lines(view._render(), out.options)]
+        last_content_row = view._rows(view.content)[-1].rstrip()
+        meter_rows = len(view._rows(view.line))
+        assert shown[-meter_rows - 1] == last_content_row  # the newest text is what's shown...
+        assert shown[-meter_rows].startswith("~ ↑ 12,480")  # ...with the meter under it

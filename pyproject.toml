@@ -10,6 +10,7 @@ dependencies = [
     "prompt-toolkit>=3.0.53",
     "pyyaml",
     "rich>=15.0.0",
+    "tomlkit>=0.15.3",
 ]
 
 [project.scripts]

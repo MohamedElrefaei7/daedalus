@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from conftest import TEST_KEY
+from fakes import TEST_KEY
 
 from daedalus import secrets
 

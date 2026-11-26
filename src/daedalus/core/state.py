@@ -111,6 +111,36 @@ def save_state(
     return session
 
 
+# The three changes: used by the CLI below and by the REPL's /vault, /pull, /drop --------------
+
+def set_active(name: str, registry_path=None, state_path=None) -> Session:
+    """Make ``name`` active. A pulled project that becomes active leaves pulled."""
+    try:
+        pulled = [p for p in read_state(state_path)["pulled"] if p != name]
+    except StateError:
+        pulled = []  # no usable state yet: set-active is how you make one
+    return save_state(name, pulled, registry_path, state_path)
+
+
+def pull(name: str, registry_path=None, state_path=None) -> Session:
+    """Pull ``name`` in for reading. Pulling one that's already pulled changes nothing."""
+    state = read_state(state_path)
+    if name == state["active"]:
+        raise StateError(f"{name!r} is the active project, so it can't also be pulled")
+    pulled = list(state["pulled"])
+    if name not in pulled:
+        pulled.append(name)
+    return save_state(state["active"], pulled, registry_path, state_path)
+
+
+def drop(name: str, registry_path=None, state_path=None) -> Session:
+    """Stop pulling ``name``."""
+    state = read_state(state_path)
+    if name not in state["pulled"]:
+        raise StateError(f"{name!r} is not pulled (pulled: {', '.join(state['pulled']) or 'none'})")
+    return save_state(state["active"], [p for p in state["pulled"] if p != name], registry_path, state_path)
+
+
 # The stopgap CLI ---------------------------------------------------------------------
 
 def _describe(session: Session) -> str:
@@ -135,25 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "show":
             print(_describe(load_session(args.registry, args.state)))
             return 0
-        if args.cmd == "set-active":
-            try:
-                pulled = [p for p in read_state(args.state)["pulled"] if p != args.name]
-            except StateError:
-                pulled = []  # no usable state yet: set-active is how you make one
-            session = save_state(args.name, pulled, args.registry, args.state)
-        else:
-            state = read_state(args.state)
-            pulled = list(state["pulled"])
-            if args.cmd == "pull":
-                if args.name == state["active"]:
-                    raise StateError(f"{args.name!r} is the active project, so it can't also be pulled")
-                if args.name not in pulled:
-                    pulled.append(args.name)
-            else:
-                if args.name not in pulled:
-                    raise StateError(f"{args.name!r} is not pulled (pulled: {', '.join(pulled) or 'none'})")
-                pulled.remove(args.name)
-            session = save_state(state["active"], pulled, args.registry, args.state)
+        change = {"set-active": set_active, "pull": pull, "drop": drop}[args.cmd]
+        session = change(args.name, args.registry, args.state)
     except (StateError, RegistryError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

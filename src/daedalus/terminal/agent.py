@@ -1,7 +1,8 @@
 """The DeepSeek agent: the eight daedalus tools and the tool-calling loop for one user turn.
 
-* Exactly the eight tools in daedalus.toolset.NAMES. None takes a source:
-  propose_note is called with source="deepseek" here, never by the model.
+* Exactly the ten tools in daedalus.toolset.AGENT_NAMES: daedalus-mcp's eight
+  plus propose_edit and propose_lesson, which /end needs. None takes a
+  source: proposals are made with source="deepseek" here, never by the model.
 * Each tool result is capped at 60,000 characters, with a note when cut.
 * At most 12 tool rounds per user turn; then the turn stops and says so.
 * Refusals (PolicyError and friends) go back to the model as the tool
@@ -69,6 +70,17 @@ PARAMETERS: dict[str, dict[str, Any]] = {
         "summary": {**_STR, "description": "one line, at most 200 characters"},
         "vault": {**_OPT_STR, "description": "'shared' for the shared inbox; omit for the active project"},
     }, "required": ["rel_path", "content", "summary"]},
+    "propose_edit": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "the note to replace, e.g. 'CONTEXT.md' or 'inbox/idea.md'"},
+        "content": {**_STR, "description": "the complete new file"},
+        "summary": {**_STR, "description": "one line, at most 200 characters"},
+        "vault": {**_OPT_STR, "description": "'shared' for the shared inbox; omit for the active project"},
+    }, "required": ["rel_path", "content", "summary"]},
+    "propose_lesson": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "file name in the shared inbox/, e.g. 'git-hooks-path.md'"},
+        "content": {**_STR, "description": "the whole lesson note"},
+        "summary": {**_STR, "description": "one line, at most 200 characters"},
+    }, "required": ["rel_path", "content", "summary"]},
 }
 for _schema in PARAMETERS.values():
     _schema["additionalProperties"] = False
@@ -78,15 +90,18 @@ TOOLS: list[dict[str, Any]] = [
     {"type": "function", "function": {
         "name": name, "description": toolset.description(name, SOURCE), "parameters": PARAMETERS[name],
     }}
-    for name in toolset.NAMES
+    for name in toolset.AGENT_NAMES
 ]
+PROPOSING = ("propose_note", "propose_edit", "propose_lesson")
 
 
 def call_tool(session: Session, name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Run one tool. source is fixed here; the model can't pass it (the schemas refuse extras)."""
-    if name == "propose_note":
-        return toolset.propose_note(session, SOURCE, args["rel_path"], args["content"], args["summary"],
-                                    args.get("vault"))
+    if name in ("propose_note", "propose_edit"):
+        fn = getattr(toolset, name)
+        return fn(session, SOURCE, args["rel_path"], args["content"], args["summary"], args.get("vault"))
+    if name == "propose_lesson":
+        return toolset.propose_lesson(session, SOURCE, args["rel_path"], args["content"], args["summary"])
     fn = getattr(toolset, name)
     return fn(session, **args)
 
@@ -106,12 +121,13 @@ class ToolOutcome:
     ok: bool
     text: str  # what goes back to the model
     schema_errors: list[str] = field(default_factory=list)
+    result: dict[str, Any] | None = None
 
 
 def run_tool(session: Session, name: str, raw_args: str) -> ToolOutcome:
     """Execute one model tool call; every failure becomes a tool result, never an exception."""
-    if name not in toolset.NAMES:
-        return ToolOutcome(name, {}, False, f"Unknown tool {name!r}. Tools: {', '.join(toolset.NAMES)}.")
+    if name not in toolset.AGENT_NAMES:
+        return ToolOutcome(name, {}, False, f"Unknown tool {name!r}. Tools: {', '.join(toolset.AGENT_NAMES)}.")
     try:
         args = json.loads(raw_args or "{}")
         if not isinstance(args, dict):
@@ -138,16 +154,18 @@ def run_tool(session: Session, name: str, raw_args: str) -> ToolOutcome:
             text = f"internal error in {name} ({type(e).__name__}: {e})"
         return ToolOutcome(name, args, False, text)
     errors = list(result.get("schema_errors") or []) if name == "read_note" else []
-    return ToolOutcome(name, args, True, cap_result(json.dumps(result, ensure_ascii=False)), errors)
+    return ToolOutcome(name, args, True, cap_result(json.dumps(result, ensure_ascii=False)), errors, result)
 
 
 def tool_label(name: str, args: dict[str, Any]) -> str:
     """The one-line form shown in the terminal: → read_note shared:practices/red-test-first.md"""
     main = {"read_note": "ref", "backlinks": "ref", "search": "query", "list_files": "subdir",
             "read_code": "rel_path", "list_notes": "folder"}.get(name)
-    if name == "propose_note":
+    if name in ("propose_note", "propose_edit"):
         target = f"{args.get('vault') or ''}:{args.get('rel_path', '')}".lstrip(":")
-        return f"→ propose_note {target}"
+        return f"→ {name} {target}"
+    if name == "propose_lesson":
+        return f"→ propose_lesson shared:inbox/{args.get('rel_path', '')}"
     value = args.get(main) if main else None
     return f"→ {name} {value}" if value else f"→ {name}"
 
@@ -183,6 +201,13 @@ class Agent:
         self.meter = meter or Meter()
         self.system = system_prompt(session)
         self.history: list[dict[str, Any]] = []
+        self.tool_calls = 0  # tools run this conversation
+        self.proposals: list[str] = []  # ids of proposals made this conversation, in order
+
+    def rebuild(self, session: Session) -> None:
+        """Point at a new session (a /pull or /drop) and rebuild the system prompt; history is kept."""
+        self.session = session
+        self.system = system_prompt(session)
 
     def messages(self) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.system}, *self.history]
@@ -215,6 +240,9 @@ class Agent:
                     log.info("session %s %s %s", self.session_id, tool_label(outcome.name, outcome.args),
                              "ok" if outcome.ok else f"refused: {outcome.text.splitlines()[0][:200]}")
                     ev.tool(outcome)
+                    self.tool_calls += 1
+                    if outcome.ok and outcome.name in PROPOSING and outcome.result:
+                        self.proposals.append(outcome.result["id"])
                     if outcome.schema_errors:
                         ev.schema_errors(str(outcome.args.get("ref", "")), outcome.schema_errors)
                     self.history.append({"role": "tool", "tool_call_id": call.id, "content": outcome.text})

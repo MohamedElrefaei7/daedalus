@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from conftest import TOOLS, run, write_state
+from mcp_helpers import TOOLS, run, write_state
 from core_conftest import git, note_text, write_raw
 
 from daedalus.core import queue, tools

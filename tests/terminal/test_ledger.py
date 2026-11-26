@@ -7,7 +7,7 @@ import sqlite3
 from decimal import Decimal
 
 import pytest
-from conftest import WED_OFF
+from fakes import WED_OFF
 
 from daedalus.terminal import ledger
 from daedalus.terminal.ledger import CapExceeded

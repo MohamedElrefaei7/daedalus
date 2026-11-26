@@ -1,32 +1,49 @@
-"""The system message: a fixed role preamble, the shared AGENTS.md, then the project's AGENTS.md.
+"""The system message, in six blocks ordered from most stable to least stable.
 
-The assembly must be byte-identical across calls with the same vault state:
-DeepSeek's context cache matches on identical prefixes, so a timestamp or a
-set-ordered list in here would turn every call into a cache miss. Files are
-read in a fixed order, through the path policy.
+  1. the role preamble
+  2. the shared vault's AGENTS.md
+  3. the active project's AGENTS.md
+  4. accepted shared practices (practices/**.md with status: accepted), by path,
+     at most 12,000 characters in all, with a note naming any left out
+  5. each pulled project, by name: its CONTEXT.md "Decisions index" and
+     "Where things live" sections only, at most 6,000 characters each
+  6. the active project's CONTEXT.md, last, because it changes most often
 
-CONTEXT.md loading and /end come in commit 6.
+DeepSeek's context cache matches on identical prefixes, so the order puts what
+changes least first, and the assembly is byte-identical for identical files:
+fixed order, sorted paths, no timestamps, no set iteration. Every file is read
+through the path policy.
 """
 
 from __future__ import annotations
 
+import re
+
+from daedalus.core import index, notes
 from daedalus.core.policy import Op, authorize
 from daedalus.core.registry import SHARED_NAME
 from daedalus.core.session import Session
+
+SEPARATOR = "\n\n---\n\n"
+MAX_PRACTICES_CHARS = 12_000
+MAX_PULLED_CHARS = 6_000
+PULLED_SECTIONS = ("Decisions index", "Where things live")
 
 PREAMBLE = """\
 You are the Daedalus terminal agent, working for the user in their project knowledge vaults.
 
 You can read notes in the active project's vault, any pulled project vaults, and the shared vault of \
 practices and lessons, and you can read the active project's code. You can't change anything directly: \
-propose_note queues a new note, and nothing is written until the user approves it in this terminal. \
-Proposals are recorded as source deepseek; drafts that claim another source are refused.
+propose_note, propose_edit, and propose_lesson queue proposals, and nothing is written until the user approves \
+it in this terminal. Proposals are recorded as source deepseek; drafts that claim another source are refused. \
+Pulled projects are read-only.
 
 Ground answers in the notes: read before you answer, cite notes as vault:path, and say when the vaults \
 don't cover something. When a tool refuses, its message names the rule; adjust instead of retrying the same \
 call. Keep answers short.
 
-The two documents below are the vaults' own rules. Follow them."""
+The documents below are the vaults' own rules and context: both AGENTS.md files, the accepted shared \
+practices, pulled projects' indexes, then the active project's CONTEXT.md. Follow them."""
 
 
 def _read(session: Session, path) -> str:
@@ -34,13 +51,75 @@ def _read(session: Session, path) -> str:
     return auth.path.read_text(encoding="utf-8")
 
 
+def _section(text: str, heading: str) -> str | None:
+    """A '## heading' section's text (heading line included), up to the next heading of level 1 or 2."""
+    lines = text.splitlines()
+    want = heading.casefold()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(#{1,2})\s+(.*?)\s*#*\s*$", line)
+        if m and len(m.group(1)) == 2 and m.group(2).casefold() == want:
+            end = next((j for j in range(i + 1, len(lines)) if re.match(r"^#{1,2}\s", lines[j])), len(lines))
+            return "\n".join(lines[i:end]).strip()
+    return None
+
+
+def _cap(text: str, limit: int, what: str) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n\n[truncated: {what} is {len(text):,} characters; the first {limit:,} are shown]"
+
+
+def practices_block(session: Session) -> str:
+    root = session.registry.shared
+    included: list[str] = []
+    left_out: list[str] = []
+    used = 0
+    for rel, _ in sorted(index.walk_markdown(root), key=lambda item: item[0]):
+        if not rel.startswith("practices/"):
+            continue
+        note, _errors = notes.read_note(root / rel, session, strict=False)
+        if note.frontmatter.get("status") != "accepted":
+            continue
+        text = f"## {SHARED_NAME}:{rel}\n\n{_read(session, root / rel).strip()}"
+        cost = len(text) + 2
+        if used + cost > MAX_PRACTICES_CHARS:
+            if not included and not left_out:  # a single practice over the cap: show its head
+                included.append(_cap(text, MAX_PRACTICES_CHARS, f"{SHARED_NAME}:{rel}"))
+                used = MAX_PRACTICES_CHARS
+            else:
+                left_out.append(f"{SHARED_NAME}:{rel}")
+            continue
+        included.append(text)
+        used += cost
+    body = "\n\n".join(included) if included else "(no accepted practices)"
+    if left_out:
+        body += (f"\n\n[truncated: the {MAX_PRACTICES_CHARS:,}-character cap for practices left out "
+                 f"{len(left_out)} accepted practice(s); read them with read_note: {', '.join(left_out)}]")
+    return f"# Accepted shared practices\n\n{body}"
+
+
+def pulled_block(session: Session, name: str) -> str:
+    text = _read(session, session.registry.projects[name] / "CONTEXT.md")
+    sections = [s for s in (_section(text, h) for h in PULLED_SECTIONS) if s]
+    body = "\n\n".join(sections) if sections else f"(no {' or '.join(repr(h) for h in PULLED_SECTIONS)} section)"
+    return f"# Pulled project ({name}, read-only): CONTEXT.md, {' and '.join(PULLED_SECTIONS)}\n\n" + \
+        _cap(body, MAX_PULLED_CHARS, f"{name}'s CONTEXT.md sections")
+
+
+def blocks(session: Session) -> list[str]:
+    """The six blocks, in order (block 5 is one entry per pulled project, so there may be more or fewer)."""
+    out = [
+        PREAMBLE,
+        f"# Shared vault ({SHARED_NAME}): AGENTS.md\n\n{_read(session, session.registry.shared / 'AGENTS.md').strip()}",
+        f"# Active project ({session.active}): AGENTS.md\n\n{_read(session, session.active_vault / 'AGENTS.md').strip()}",
+        practices_block(session),
+    ]
+    out += [pulled_block(session, name) for name in sorted(session.pulled)]
+    out.append(f"# Active project ({session.active}): CONTEXT.md\n\n"
+               f"{_read(session, session.active_vault / 'CONTEXT.md').strip()}")
+    return out
+
+
 def system_prompt(session: Session) -> str:
-    """The system message for ``session``; identical bytes for identical vault state."""
-    parts = [PREAMBLE]
-    sources = (
-        (f"Shared vault ({SHARED_NAME}): AGENTS.md", session.registry.shared / "AGENTS.md"),
-        (f"Active project ({session.active}): AGENTS.md", session.active_vault / "AGENTS.md"),
-    )
-    for title, path in sources:
-        parts.append(f"# {title}\n\n{_read(session, path).strip()}")
-    return "\n\n---\n\n".join(parts) + "\n"
+    """The system message for ``session``; identical bytes for identical files."""
+    return SEPARATOR.join(blocks(session)) + "\n"

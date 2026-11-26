@@ -6,7 +6,7 @@ import datetime as dt
 from decimal import Decimal
 
 import pytest
-from conftest import WED_OFF, WED_PEAK
+from fakes import WED_OFF, WED_PEAK
 
 from daedalus.terminal.pricing import PRICES, UnknownModel, Usage, cost, is_peak, period, worst_case
 

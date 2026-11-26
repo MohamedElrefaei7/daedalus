@@ -104,6 +104,55 @@
 - The integrity table gained `link_only_to_context` (36 rows). Twelve older tests proposed typed drafts with no links and now give them one. Two tests that listed every error now also expect the "no links" error, since every error goes back to the agent at once.
 - Suite: 605 tests.
 
+### 2026-11-26 — Commit 6: project lifecycle, switching, session context, /end
+
+- **`registry.register_project` / `unregister_project`:** edits with `tomlkit` (comments, order, and other entries kept byte for byte), validated through `load_registry` before an atomic replace. Unregister refuses the active project or a pulled one.
+- **`daedalus.core.lifecycle.new_project`** (`/new <name> --repo <path>`):
+  - It checks the name, the repo (its top level, with no `.obsidian/` at the root), and the vault (`vault/` absent or empty).
+  - It copies the template, then commits exactly `vault/` with `git commit --only` as `init: daedalus vault from template`.
+  - It registers the project, then prints the Obsidian step.
+  - Rollback runs in reverse. Each undo is armed before its step, so a half-done step is undone too.
+- **`daedalus.core.state`** gained `set_active`, `pull`, and `drop`. The CLI and the REPL share them.
+- **REPL commands:**
+  - `/vaults`;
+  - `/vault <name>`: a fresh conversation, with the same session id, so the session cap carries over;
+  - `/pull` and `/drop`: rebuild the prompt and keep history;
+  - `/new`;
+  - `/end`.
+- **The agent tools** gain `propose_edit` and `propose_lesson`, for ten. daedalus-mcp keeps eight.
+- **The system prompt** has six blocks, most stable first:
+  1. the preamble;
+  2. the shared `AGENTS.md`;
+  3. the project `AGENTS.md`;
+  4. accepted practices (12,000 characters);
+  5. the pulled projects' Decisions index and Where things live (6,000 characters each);
+  6. the active `CONTEXT.md`.
+- **`/end`:**
+  - one user turn carrying today's date and the current `CONTEXT.md`;
+  - `propose_edit` of the whole file with a new Log entry, plus optional lessons into the shared `inbox/`;
+  - then a one-at-a-time review (approve, reject with a reason, or skip), then exit;
+  - nothing to log means it just exits.
+- **Tests:** 640 in total, 35 new:
+  - registry writes 4, `/new` 13, prompt 9 (replacing commit 5's 4), switching and `/end` 12;
+  - commit 5's tool-set tests updated to ten tools;
+  - one rendering test.
+- **Proved red four ways:**
+  1. A `tomllib`/`tomli_w` round-trip dropped the file's comments, failing the byte-for-byte test.
+  2. `git add -A` swept `notes.txt` and `staged.txt` into the init commit, failing the pre-staged-file test. It also left the commit in place on rollback ("touches files outside vault/").
+  3. Putting the active `CONTEXT.md` before the practices failed the prefix test ("changing the active CONTEXT.md changed an earlier block").
+  4. Writing `CONTEXT.md` directly in `/end` failed the nothing-written test ("/end wrote CONTEXT.md before approval").
+- **Test layout:**
+  - `from conftest import` picked whichever folder's conftest pytest imported last, so `pytest tests/core/x.py tests/terminal/y.py` failed to collect. The full suite only passed because of collection order.
+  - Terminal helpers moved to `tests/terminal/fakes.py` and MCP helpers to `tests/mcp/mcp_helpers.py`, and every conftest re-exports the core helpers. Any mix of folders now runs.
+- **Live check:**
+  - `/new scratch2 --repo ~/code/daedalus-scratch2` committed 21 template files (`2d002de`) and added one line to `vaults.toml`.
+  - In the REPL, `/vault scratch2` printed the fresh-conversation notice, and `/pull scratch` rebuilt the prompt.
+  - DeepSeek answered from scratch's empty `CONTEXT.md` and the two practices; the cache was warm from the second call on.
+  - Asked to propose into scratch, it declined on its own (pulled projects are read-only) without calling the tool. The same `propose_note` call through the agent's `run_tool`, against the live session, returns "Refused by rule 3: PROPOSE is not allowed in a pulled vault".
+  - `/end` proposed the `CONTEXT.md` entry, which was approved and committed as `9b41e4a` in scratch2, and a lesson, which was rejected with "Lesson, testing".
+  - A new Claude desktop chat ("use daedalus to show my scope") showed scratch2 active and scratch pulled. That server process had started at 23:22, before the switch, and it followed `state.json` with no restart.
+- **REPL rendering fix:** the live check showed streamed text, and the reasoning tail, left behind above the settled answer. A transient `rich` `Live` can't erase rows that scrolled off the top. The streaming view now shows only the wrapped tail that fits the terminal, and a test checks its height (376 rows on a 24-row terminal before the fix).
+
 ## Key decisions
 
 - ★ **One schema, in `daedalus.core.schema`.** `SCHEMA` moved out of `tests/test_templates.py`, which now imports it, so one dict guards both the templates and live notes.
@@ -141,6 +190,14 @@
 - **A failed turn is rolled back out of history** (a cap, an API error, Ctrl-C), so the next turn never sends a half-finished tool exchange.
 - **Unknown keys in `config.toml` are errors,** so a misspelled cap can't silently fall back to the default.
 - **The link rule covers every typed draft, not only typed folders.** That includes an `inbox/` draft that declares a type, because that's where agents propose, and it's how `[[CONTEXT]]` got in. An untyped jotting in `inbox/` has no link rule. A root file is caught by name as well as by resolution, so `[[CONTEXT]]` is refused even in the shared vault, which has no `CONTEXT.md`.
+- ★ **The registry is written with `tomlkit`, validated before replace.** Only `register_project` and `unregister_project` write it, and only `/new` calls them. Your comments and order survive. An invalid result never reaches the file.
+- ★ **`/new` commits exactly `vault/`, path-limited.** Your staged and modified work in that repo stays as it was, including through a rollback: a soft reset moves HEAD only, then `vault/` alone leaves the index. The commit is undone only while it's still HEAD and touches only `vault/`.
+- ★ **Switching projects starts a fresh conversation;** pulling doesn't. History about project A mustn't leak into B. The session id, and so the session cap, belongs to the terminal.
+- ★ **The system prompt runs from most stable to least stable,** so a `CONTEXT.md` change only re-bills the tail. Dated text, such as `/end`'s date, goes in the user message.
+- ★ **`/end` goes through `propose_edit` with the current `base_sha256`,** never a direct write. A `CONTEXT.md` edited before approval makes the approval refuse as stale.
+- **Practices are packed whole, in path order, until the 12,000-character cap.** The rest are named in the truncation note, for `read_note`. A single practice over the cap is cut.
+- **`/end` reviews every proposal this conversation made that's still pending,** not only the ones from `/end`.
+- **`/new` doesn't switch to the new project;** it prints `/vault <name>` as the next step. `/vault` to the already-active project is a no-op.
 - ★ **queue_cli is a stopgap.** Every command is one call into `daedalus.core`. Since commit 5 the REPL's `/pending`, `/diff`, `/approve`, and `/reject` call the same functions, and `queue_cli` stays as a debug tool.
 - **templates/ is not notes.** One walk skips the vault's top-level `templates/` for every read tool, so the tools can't disagree about what a note is. An explicit `vault:templates/x.md` read still works.
 - ★ **FTS5 is required.** `require_fts5()` fails with a clear message, and a test asserts FTS5 is present.
@@ -156,7 +213,9 @@
 
 ## Up Next
 
-Commit 6: project lifecycle — /new, /vault, /pull, /end, CONTEXT.md in session context.
+Commit 7: Obsidian bridge — /open, /here.
+
+When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).
 
 Commit 10: rule 7 must refuse program paths containing / and pin allowed programs to resolved locations; basename matching lets /tmp/evil/pytest through.
 

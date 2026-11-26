@@ -2,15 +2,17 @@
 
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
-Commands: /cost, /pending, /diff <id>, /approve <id>, /reject <id> <reason>, /help, /quit.
+Commands: /new, /vaults, /vault, /pull, /drop, /end, /cost, /pending, /diff, /approve, /reject, /help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import secrets as _stdlib_secrets
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -23,10 +25,11 @@ from rich.text import Text
 from daedalus import secrets
 from daedalus.core import queue
 from daedalus.core.apply import apply, diff, pending, reject
-from daedalus.core.policy import PolicyError
-from daedalus.core.registry import RegistryError
+from daedalus.core.lifecycle import LifecycleError, new_project
+from daedalus.core.policy import Op, PolicyError, authorize
+from daedalus.core.registry import RegistryError, load_registry
 from daedalus.core.session import Session
-from daedalus.core.state import StateError, load_session, read_state, save_state
+from daedalus.core.state import StateError, drop, load_session, pull, set_active
 
 from . import ledger
 from .agent import Agent, Events, ToolOutcome, tool_label
@@ -38,13 +41,18 @@ from .meter import Interrupted, Reading, render
 log = logging.getLogger("daedalus.terminal")
 
 HELP = """\
+/new <name> --repo <path>  create <path>/vault/ from the template, commit it, register the project
+/vaults                list registered projects (* active, + pulled)
+/vault <name>          switch projects: starts a fresh conversation
+/pull <name>           read another project too (read-only); /drop <name> stops
+/end                   propose a CONTEXT.md log entry for this session, review proposals, exit
 /cost                  calls, tokens, and dollars for this session and today, plus the DeepSeek balance
 /pending               proposals waiting for you
 /diff <id>             what a proposal would change
 /approve <id>          apply a proposal and commit it
 /reject <id> <reason>  reject a proposal
 /help                  this list
-/quit                  exit (Ctrl-D works too)
+/quit                  exit without /end (Ctrl-D works too)
 Ctrl-C stops a streaming answer; the call is recorded as an estimate."""
 
 REASONING_TAIL = 6  # lines of reasoning shown while it streams
@@ -72,13 +80,33 @@ class LiveView(Events):
             self.live.stop()
             self.live = None
 
+    def _rows(self, text: str) -> list[str]:
+        """``text`` as the terminal rows rich would wrap it into."""
+        return [line.plain for line in Text(text.rstrip("\n")).wrap(self.console, max(20, self.console.width))]
+
+    def _tail(self, text: str, rows: int) -> str:
+        """The last ``rows`` terminal rows of ``text``."""
+        return "\n".join(self._rows(text)[-rows:]) if rows > 0 else ""
+
     def _render(self) -> Group:
+        """The streaming view, never taller than the terminal.
+
+        A transient Live can only erase what's still on screen: anything that
+        scrolled off the top stays behind once the call settles. So while a
+        call streams, it shows the tail that fits (the settled answer is
+        printed in full by call_done).
+        """
+        budget = max(3, self.console.height - 2)  # room for the meter line and the prompt
+        meter_rows = max(1, len(self._rows(self.line)))
+        rows = max(1, budget - meter_rows)
         parts: list[Any] = []
         if self.reasoning:
-            tail = "\n".join(self.reasoning.rstrip().splitlines()[-REASONING_TAIL:])
-            parts.append(Text(tail, style="dim italic"))
-        if self.content:
-            parts.append(Text(self.content))
+            r_rows = min(REASONING_TAIL, rows - 1 if self.content else rows)
+            if r_rows > 0:
+                parts.append(Text(self._tail(self.reasoning, r_rows), style="dim italic"))
+                rows -= r_rows
+        if self.content and rows > 0:
+            parts.append(Text(self._tail(self.content, rows)))
         parts.append(Text(self.line, style="cyan"))
         return Group(*parts)
 
@@ -119,27 +147,49 @@ class LiveView(Events):
         self.console.print(Text(message, style="bold yellow"))
 
 
+END_PROMPT = """\
+The session is ending. Write its summary now, in this order:
+
+1. Call propose_edit on the active project's CONTEXT.md (rel_path "CONTEXT.md") with the complete new file: \
+the current content below, unchanged, plus one new entry at the end of its "## Log" section, headed \
+"### {date} — <a short title>". The entry says what was asked, what was learned, what was proposed or \
+decided (with proposal ids), and any open threads. Change "## Up Next" only if this session clearly changed \
+it. Use the summary "session log: <the short title>".
+2. Then, only for something that failed in this session where you learned why and how it was fixed, call \
+propose_lesson (type lesson, applies_to tags, source deepseek, a link to a related practice). A lesson records \
+what failed, why, and the fix; nothing else qualifies, and most sessions have none.
+3. Then reply with one line saying what you proposed.
+
+The current CONTEXT.md of {project}, between the markers:
+----- begin CONTEXT.md -----
+{context}----- end CONTEXT.md -----"""
+
+
 class Repl:
     def __init__(self, session: Session, cfg: Config, ds: DeepSeek, console: Console,
-                 session_id: str | None = None) -> None:
+                 session_id: str | None = None, registry_path=None, state_path=None) -> None:
         self.session = session
         self.cfg = cfg
         self.ds = ds
         self.console = console
         self.session_id = session_id or _stdlib_secrets.token_hex(8)
+        self.registry_path = registry_path
+        self.state_path = state_path
         self.agent = Agent(session, ds, cfg, self.session_id)
         self.view = LiveView(console)
+        self.read_line: Callable[..., str] = lambda prompt="› ": input(prompt)
 
     # The loop -------------------------------------------------------------------------
 
-    def run(self, read_line: Callable[[], str]) -> int:
+    def run(self, read_line: Callable[..., str]) -> int:
+        self.read_line = read_line
         self.console.print(Text(
             f"daedalus · {self.session.active} · {self.cfg.model} (reasoning {self.cfg.reasoning_effort}, "
             f"max {self.cfg.max_tokens:,} tokens) · caps ${self.cfg.session_cap_usd:.2f}/session "
             f"${self.cfg.daily_cap_usd:.2f}/day · /help", style="bold"))
         while True:
             try:
-                line = read_line()
+                line = read_line("› ")
             except KeyboardInterrupt:
                 continue
             except EOFError:
@@ -179,7 +229,22 @@ class Repl:
         try:
             if name in ("/quit", "/exit"):
                 return "quit"
-            if name == "/help":
+            if name == "/end":
+                self.end()
+                return "quit"
+            if name == "/new":
+                self.new(rest)
+            elif name == "/vaults":
+                self.vaults()
+            elif name == "/vault":
+                self.switch(self._id(rest, "/vault <name>"))
+            elif name in ("/pull", "/drop"):
+                change = pull if name == "/pull" else drop
+                self.session = change(self._id(rest, f"{name} <name>"), self.registry_path, self.state_path)
+                self.agent.rebuild(self.session)
+                self.console.print(f"pulled: {', '.join(self.session.pulled) or 'none'} (read-only). The system "
+                                   "prompt was rebuilt; the conversation continues.")
+            elif name == "/help":
                 self.console.print(HELP)
             elif name == "/cost":
                 self.cost()
@@ -196,9 +261,87 @@ class Repl:
                 self.console.print(f"rejected {p.id}: {p.status_reason}")
             else:
                 self.console.print(Text(f"unknown command {name}; /help lists them", style="yellow"))
-        except (PolicyError, queue.ProposalError, KeyError, ValueError) as e:
+        except (PolicyError, queue.ProposalError, StateError, RegistryError, LifecycleError, KeyError,
+                ValueError) as e:
             self.console.print(Text(f"error: {e}", style="red"))
         return None
+
+    # Projects ---------------------------------------------------------------------------
+
+    def new(self, rest: str) -> None:
+        words = shlex.split(rest)
+        if len(words) != 3 or words[1] != "--repo":
+            raise ValueError("usage: /new <name> --repo <path>")
+        made = new_project(words[0], words[2], self.registry_path, self.state_path)
+        self.console.print(f"{len(made.files)} files committed in {made.repo} as \"init: daedalus vault from "
+                           f"template\" ({made.commit_sha[:7]}).")
+        self.console.print(made.instructions())
+
+    def vaults(self) -> None:
+        reg = load_registry(self.registry_path)
+        for name in sorted(reg.projects):
+            mark = "*" if name == self.session.active else ("+" if name in self.session.pulled else " ")
+            note = " (active)" if mark == "*" else (" (pulled, read-only)" if mark == "+" else "")
+            self.console.print(f"{mark} {name:20} {reg.projects[name]}{note}")
+
+    def switch(self, name: str) -> None:
+        if name == self.session.active:
+            self.console.print(f"{name} is already the active project.")
+            return
+        self.session = set_active(name, self.registry_path, self.state_path)
+        # A fresh conversation: history about the old project mustn't carry into this one. Same session id,
+        # so the session spend cap carries over: it belongs to this terminal, not to a project.
+        self.agent = Agent(self.session, self.ds, self.cfg, self.session_id, meter=self.agent.meter)
+        self.console.print(Text(f"Switched to {name}. Fresh conversation: history cleared, system prompt rebuilt "
+                                f"from {name}'s AGENTS.md and CONTEXT.md.", style="bold"))
+
+    # /end -------------------------------------------------------------------------------
+
+    def end(self) -> None:
+        """Propose this session's CONTEXT.md log entry (and any lessons), walk the proposals, then exit."""
+        if self.agent.tool_calls == 0 and not self.agent.proposals:
+            self.console.print("Nothing happened in this session that needs a log entry. Bye.")
+            return
+        context = authorize(self.session.active_vault / "CONTEXT.md", Op.READ, self.session).path
+        current = context.read_text(encoding="utf-8")
+        self.console.print(Text(f"Writing the session summary for {self.session.active}'s CONTEXT.md …", style="bold"))
+        self.ask(END_PROMPT.format(date=dt.date.today().isoformat(), project=self.session.active,
+                                   context=current if current.endswith("\n") else current + "\n"))
+        self.review(self.agent.proposals)
+
+    def review(self, ids: list[str]) -> None:
+        """Walk proposals one at a time: approve, reject with a reason, or skip (leave pending)."""
+        waiting = [i for i in dict.fromkeys(ids) if queue.get(i).status == "pending"]
+        if not waiting:
+            self.console.print("No proposals to review.")
+            return
+        for n, change_id in enumerate(waiting, 1):
+            p = queue.get(change_id)
+            self.console.print(Text(f"\n[{n}/{len(waiting)}] {p.id}  {p.kind}  {p.vault}:{p.rel_path}  ({p.source}) "
+                                    f"{p.summary}", style="bold"))
+            self.console.print(Text(diff(p.id)))
+            while True:
+                try:
+                    choice = self.read_line("[a]pprove, [r]eject, or [s]kip? ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    self.console.print("Left the rest pending.")
+                    return
+                try:
+                    if choice in ("a", "approve"):
+                        done = apply(self.session, p.id)
+                        self.console.print(f"applied {done.id} in commit {done.commit_sha[:7]}")
+                    elif choice in ("r", "reject"):
+                        reason = ""
+                        while not reason:
+                            reason = self.read_line("reason: ").strip()
+                        self.console.print(f"rejected {reject(p.id, reason).id}: {reason}")
+                    elif choice in ("s", "skip", ""):
+                        self.console.print(f"skipped {p.id}; it stays pending (/pending lists it).")
+                    else:
+                        continue
+                except (PolicyError, queue.ProposalError) as e:
+                    self.console.print(Text(f"error: {e}", style="red"))
+                break
 
     @staticmethod
     def _id(value: str, usage: str) -> str:
@@ -264,13 +407,15 @@ def _prompt_reader() -> Callable[[], str]:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
 
+    if not sys.stdin.isatty():  # piped input: no line editor
+        return lambda prompt="› ": input(prompt)
     history = queue.STATE_ROOT / "repl_history"
     history.parent.mkdir(parents=True, exist_ok=True)
     ps: PromptSession = PromptSession(history=FileHistory(str(history)))
-    return lambda: ps.prompt("› ")
+    return lambda prompt="› ": ps.prompt(prompt)
 
 
-def main(argv: list[str] | None = None, *, transport=None, read_line: Callable[[], str] | None = None,
+def main(argv: list[str] | None = None, *, transport=None, read_line: Callable[..., str] | None = None,
          console: Console | None = None) -> int:
     parser = argparse.ArgumentParser(prog="daedalus", description="The Daedalus terminal.")
     parser.add_argument("project", nargs="?", help="make this the active project first")
@@ -286,11 +431,7 @@ def main(argv: list[str] | None = None, *, transport=None, read_line: Callable[[
 
     try:
         if args.project:
-            try:
-                pulled = [p for p in read_state(args.state)["pulled"] if p != args.project]
-            except StateError:
-                pulled = []
-            save_state(args.project, pulled, args.registry, args.state)
+            set_active(args.project, args.registry, args.state)
         session = load_session(args.registry, args.state)
         cfg = load_config(args.config)
     except (StateError, RegistryError, ConfigError) as e:
@@ -303,7 +444,7 @@ def main(argv: list[str] | None = None, *, transport=None, read_line: Callable[[
     undo_logging = setup_logging()
     ds = DeepSeek(key, transport=transport)
     try:
-        repl = Repl(session, cfg, ds, out)
+        repl = Repl(session, cfg, ds, out, registry_path=args.registry, state_path=args.state)
         log.info("session %s started: project %s, model %s", repl.session_id, session.active, cfg.model)
         code = repl.run(read_line or _prompt_reader())
         log.info("session %s ended", repl.session_id)

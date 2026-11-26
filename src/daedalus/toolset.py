@@ -17,8 +17,10 @@ from daedalus.core.registry import SHARED_NAME, RegistryError
 from daedalus.core.session import Session, SessionError
 from daedalus.core.state import StateError
 
-# The exact tool set, in the order the agent declares them.
+# daedalus-mcp's exact tool set (Claude), in order.
 NAMES = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note")
+# The terminal agent's (DeepSeek) adds the two /end needs: CONTEXT.md and inbox edits, and lessons.
+AGENT_NAMES = NAMES + ("propose_edit", "propose_lesson")
 
 MAX_NOTES = 2000
 MAX_SEARCH = 50
@@ -114,6 +116,20 @@ def propose_note(s: Session, source: str, rel_path: str, content: str, summary: 
     }
 
 
+def propose_edit(s: Session, source: str, rel_path: str, content: str, summary: str,
+                 vault: str | None = None) -> dict[str, Any]:
+    p = tools.propose_edit(s, vault or s.active, rel_path, content, source, summary)
+    return {"id": p.id, "status": p.status, "vault": p.vault, "rel_path": p.rel_path, "source": p.source,
+            "base_sha256": p.base_sha256,
+            "message": "Queued. Nothing is written until Mohamed approves it in the terminal."}
+
+
+def propose_lesson(s: Session, source: str, rel_path: str, content: str, summary: str) -> dict[str, Any]:
+    p = tools.propose_lesson(s, rel_path, content, source, summary)
+    return {"id": p.id, "status": p.status, "vault": p.vault, "rel_path": p.rel_path, "source": p.source,
+            "message": "Queued in the shared inbox/. Nothing is written until Mohamed approves it in the terminal."}
+
+
 # Descriptions, written for the model. Both front ends use these words.
 DESCRIPTIONS = {
     "get_scope": (
@@ -162,6 +178,20 @@ DESCRIPTIONS = {
         "project_refs, or in the body; AGENTS.md and CONTEXT.md are never link targets. summary is one line, at most 200 characters, and becomes the commit subject. "
         "Refused: any other folder (practices/, decisions/, ...), editing an existing note, paths outside "
         "the vault, and drafts that break the schema; the error says which rule and why."
+    ),
+    "propose_edit": (
+        "Creates a pending proposal to replace an existing note's whole content; it changes nothing until "
+        "Mohamed approves it in the terminal. The proposal records the note's current hash, so if the note "
+        "changes before approval, the approval is refused as stale. Allowed only for the active project's "
+        "CONTEXT.md and inbox/ notes (questions/ too), and the shared vault's inbox/ with vault='shared'. "
+        "content is the complete new file, not a diff. An agent can't change a note's source. summary is "
+        "one line, at most 200 characters."
+    ),
+    "propose_lesson": (
+        "Creates a pending lesson in the shared vault's inbox/ (rel_path is relative to inbox/, e.g. "
+        "'git-hooks-path.md'); it changes nothing until Mohamed approves it. A lesson records something that "
+        "failed, why it failed, and the fix; nothing else qualifies. Frontmatter type lesson, with applies_to "
+        "tags, source '{source}', and at least one link (usually a related practice)."
     ),
 }
 
