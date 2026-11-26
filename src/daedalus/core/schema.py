@@ -24,6 +24,10 @@ SCHEMA = {
     },
 }
 
+# Design choices that need precedent (an accepted decision or shared practice) or the human's answer.
+# Every AGENTS.md names exactly these in its "Design choices" section; tests/test_templates.py checks.
+DESIGN_CATEGORIES = ("schema", "dependency", "interface", "data_source")
+
 # Frontmatter keys that hold lists of quoted wikilinks.
 LINK_KEYS = ("related", "shared_refs", "project_refs")
 

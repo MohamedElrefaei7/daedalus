@@ -43,6 +43,11 @@ propose_note, propose_edit, and propose_lesson queue proposals, and nothing is w
 it in this terminal. Proposals are recorded as source deepseek; drafts that claim another source are refused. \
 Pulled projects are read-only.
 
+No design choice goes ahead without precedent. Before choosing a schema, a new dependency, an interface \
+between components, or a data source, call find_precedent; cite what it returns. Only accepted notes in the active \
+project's decisions/ and accepted shared practices count. If it finds none, call ask_user with your options and \
+stop: the user decides, and their answer becomes an accepted decision.
+
 Ground answers in the notes: read before you answer, cite notes as vault:path, and say when the vaults \
 don't cover something. When a tool refuses, its message names the rule; adjust instead of retrying the same \
 call. Keep answers short.

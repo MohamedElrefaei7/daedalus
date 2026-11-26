@@ -62,7 +62,7 @@ ACTIVE_VAULT_ALLOW: Mapping[Op, tuple[str, ...]] = {
     Op.CREATE_LOG: ("logs/",),
     Op.WRITE_PLAN: ("plans/",),
     Op.USER_ACTION: (
-        "goals/", "sources/", "decisions/", "components/", "experiments/", "concepts/", "CONTEXT.md",
+        "goals/", "sources/", "decisions/", "components/", "experiments/", "concepts/", "questions/", "CONTEXT.md",
     ),
 }
 SHARED_ALLOW: Mapping[Op, tuple[str, ...]] = {

@@ -29,7 +29,7 @@ daedalus/
 │   └── smoke_read.py         # live read-layer smoke test against the real registry
 ├── src/daedalus/
 │   ├── mcp_server.py         # daedalus-mcp: the stdio MCP server for the Claude desktop app
-│   ├── toolset.py            # the eight agent tools, shared by daedalus-mcp and the terminal agent
+│   ├── toolset.py            # the agent tools, shared by daedalus-mcp (nine) and the terminal agent (twelve)
 │   ├── secrets.py            # API keys in the macOS Keychain (`python -m daedalus.secrets set|status`)
 │   ├── queue_cli.py          # debug CLI for the queue (list/diff/apply/reject); the REPL replaces it
 │   ├── state.py              # `python -m daedalus.state` entry point (logic in core/state.py)
@@ -56,7 +56,9 @@ daedalus/
 │       ├── errors.py         # ProposalError and its subclasses
 │       ├── vaultio.py        # write lock, fd-relative file ops, path-limited git commits
 │       ├── queue.py          # proposal queue (SQLite, WAL) + crash reconciliation
-│       ├── apply.py          # apply, reject, pending, recent_rejections, diff
+│       ├── apply.py          # apply, apply_changes (several paths, one commit), reject, pending, diff
+│       ├── gate.py           # the design-decision gate: check_basis, find_precedent, propose_with_basis
+│       ├── accept.py         # ask_user's question, /answer, /promote
 │       └── tools.py          # note read tools; list_files/read_code; propose_note/edit/lesson; write_log
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
@@ -89,7 +91,7 @@ Every read and write goes through `daedalus.core.policy.authorize(path, op, sess
 2. **Shared vault.** `READ`; `PROPOSE` into `inbox/`; `USER_ACTION` into `practices/` and `lessons/`.
 3. **Pulled vaults.** `READ` only.
 4. **Off limits for every op.** Any `.obsidian` or `.git` component (case-folded), and anything in `<worktree>/vault/`.
-5. **Active vault writes.** `PROPOSE`: `inbox/`, `questions/`, `CONTEXT.md`. `CREATE_LOG`: new files in `logs/`. `WRITE_PLAN`: `plans/`. `USER_ACTION`: `goals/`, `sources/`, `decisions/`, `components/`, `experiments/`, `concepts/`, `CONTEXT.md`. Never `AGENTS.md` or `templates/`.
+5. **Active vault writes.** `PROPOSE`: `inbox/`, `questions/`, `CONTEXT.md`. `CREATE_LOG`: new files in `logs/`. `WRITE_PLAN`: `plans/`. `USER_ACTION`: `goals/`, `sources/`, `decisions/`, `components/`, `experiments/`, `concepts/`, `questions/` (since commit 8, so `/answer` can mark a question answered), `CONTEXT.md`. Never `AGENTS.md` or `templates/`. Agents still can't write `decisions/`: `PROPOSE` is refused there.
 6. **Code.** `WRITE_CODE` only in the worktree, never in your own checkout.
 7. **Commands.** `authorize_command(argv, allowlist)`: `argv[0]`'s basename must be allowlisted.
 
@@ -148,7 +150,7 @@ A refused write leaves every vault's digest, every repo's HEAD, and the queue un
 
 The MCP server for the Claude desktop app, in `src/daedalus/mcp_server.py` (FastMCP, pinned in `pyproject.toml`), run over stdio as `daedalus-mcp`. It's a thin layer over `daedalus.core`: every tool goes through the same session, path policy, and queue. The tool bodies and descriptions live in `daedalus.toolset`, shared with the terminal agent.
 
-**The exact tool set.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`. Nothing else: never `apply`, `reject`, `propose_edit`, `write_log`, or anything touching queue state. `tests/mcp/test_server.py::test_exact_tool_set` fails if a tool is added or removed.
+**The exact tool set.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent` (nine). Nothing else: never `apply`, `reject`, `propose_edit`, `ask_user`, `write_log`, or anything touching queue state. `tests/mcp/test_server.py::test_exact_tool_set` fails if a tool is added or removed.
 
 - **The server sets `source="claude"`.** `propose_note` has no `source` parameter, and its input schema refuses extra arguments. With the source rule, a draft saying `source: human` is refused, so Claude can't present its work as the human's.
 - **Never write to stdout.** Over stdio, stdout carries only JSON-RPC; one stray `print()` corrupts the stream. Logging goes to stderr and to `~/.local/state/daedalus/mcp.log`; the FastMCP banner is off. `test_stdout_is_only_json_rpc` runs the real script and parses every stdout line.
@@ -172,6 +174,7 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 `daedalus [project]` sets the active project (like `python -m daedalus.state set-active`), then starts a plain REPL: `prompt_toolkit` input with history, `rich` `Live` output. A DeepSeek agent answers with the daedalus tools. Commands:
 - `/new <name> --repo <path>`, `/vaults`, `/vault <name>`, `/pull <name>`, `/drop <name>`, `/end`;
 - `/open <note>`, `/here`;
+- `/answer <question-id> <option-number | "free text">`, `/promote <inbox-note> [folder]`;
 - `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
 
 `queue_cli` stays as a debug tool. The REPL changes the session only through its own commands, which write `state.json` through `daedalus.core.state`; `daedalus-mcp` follows on its next call.
@@ -198,7 +201,7 @@ Any failure rolls back in reverse. Each undo is armed before its step and tolera
 
 **The API key lives in the macOS Keychain,** through `keyring`: service `daedalus`, account `deepseek`, never in a file. `python -m daedalus.secrets set deepseek` stores it (via `getpass`), and `status` says whether one is present without printing it. `DEEPSEEK_API_KEY` overrides the Keychain, for tests and CI. With no key, `daedalus` exits saying how to set one, before any client exists.
 
-**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, plus `propose_edit` and `propose_lesson` for `/end` (daedalus-mcp keeps the first eight). The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
+**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus `propose_edit` and `propose_lesson` for `/end`, and `ask_user`: twelve. daedalus-mcp keeps the first nine. The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
 
 **Pricing** (`terminal/pricing.py`, one table with `checked: 2026-11-25`). USD per 1M tokens, off-peak; peak is double.
 
@@ -279,3 +282,82 @@ It's byte-identical for identical files: fixed order, sorted paths, no timestamp
 Schema errors are shown as for `read_note`. A test checks the next request's system message is byte-identical to the one before `/here`.
 
 **Tests** fake the CLI with an executable `obsidian` first on PATH, which logs its cwd and argv, and inject the running check. The terminal conftest makes the real app "not running" and refuses `open` for every test.
+
+## The design-decision gate
+
+**No design choice goes ahead without a precedent or the human's answer.** `daedalus.core.gate`, `daedalus.core.accept`.
+
+**The four categories** are `DESIGN_CATEGORIES` in `daedalus.core.schema`: `schema`, `dependency`, `interface`, `data_source`. Every `AGENTS.md` (both templates and every live vault) names exactly these four in its "Design choices" section, as `` - `name`: ... `` bullets. `tests/test_templates.py::test_agents_md_names_exactly_the_design_categories` checks the templates and every vault in the real registry.
+
+**What counts as precedent, and nothing else:**
+- an accepted note (`status: accepted`, passing the schema) in the **active** project's `decisions/`;
+- an accepted note in the **shared** vault's `practices/`.
+
+**`check_basis(session, category, choice, basis) -> Verdict`.** `basis` is a wikilink or the literal `new`. The verdict is one of three:
+- `OK(note, ref)`: the basis is precedent.
+- `NEEDS_USER`: the basis was `new`; ask with `ask_user` and stop.
+- `REFUSED(reason)`: anything else. The reason says what would make it valid. The refusal kinds:
+  - a `proposed`, `draft`, or `superseded` note;
+  - any other folder, including shared `lessons/` and `inbox/`;
+  - a **pulled** project's decision: it doesn't bind this project, so promote it into a shared practice;
+  - a missing, ambiguous, or out-of-scope link (an ambiguous link names its matches and the `[[decisions/x]]` path form);
+  - an unknown category;
+  - a basis that isn't a wikilink;
+  - a note that breaks the schema.
+
+The gate only reads, through `tools.read_note`. `gate.propose_with_basis` is `check_basis` followed by `propose_note`, raising `GateRefused` (a `ProposalError`) unless the verdict is `OK`; the coding loop and plan approval (commits 10–12) call it.
+
+**`find_precedent(topic, category=None)`**, in both daedalus-mcp and the agent:
+- It runs an any-word FTS search over the active `decisions/` and the shared `practices/`.
+- Only accepted, schema-valid notes are kept, so every result passes `check_basis`.
+- It returns at most 10 entries of `(ref, title, status, excerpt)`, where the excerpt is the body's first 300 characters, best match first.
+- With `category`, notes that mention it come first.
+
+**`ask_user(question, category, options, context_refs)`** is for the agent only; Claude asks in its own chat.
+- It proposes a typed `question` note into `questions/` through the queue, as `source: deepseek`. The note holds:
+  - `options`, with at least two distinct;
+  - `answered: false`;
+  - `related` set to `context_refs`, at least one, under the link rule;
+  - a body with the question, `` Category: `x` ``, the numbered options, the context links, and why no precedent applied, from its own `find_precedent` run.
+- ★ **A successful `ask_user` ends the agent's turn.** No further model call is made that turn. Later tool calls in the same reply get a "Not run: ask_user ended this turn" result, so the history stays valid. A refused `ask_user` doesn't end the turn: the model can fix it.
+- The REPL shows the question and its numbered options at once.
+
+**`/answer <question-id> <option-number | "free text">`:**
+1. The answer is validated against the question first.
+2. If the question proposal is still pending, it's approved (its own commit).
+3. Then **one** commit:
+   - it creates `decisions/<question-stem>.md` (`-2`, `-3` … if taken), with `type: decision`, `status: accepted`, and `source: human`;
+   - its `related` is `["[[questions/<stem>]]"]`;
+   - its body holds the question, the category, the decision, and the rejected options;
+   - it edits the question to `answered: true`, adds `[[decisions/<stem>]]` to its `related`, and fills `## Answer`.
+   - Links are path-qualified, because the question and decision share a stem.
+
+Free text rejects every option. An already-answered, rejected, or non-question proposal is refused, as is an unknown id.
+
+**`/promote <inbox-ref> [folder]`** moves an inbox draft into the folder its `type` maps to, in **one** commit that holds the inbox file's deletion and the target's creation:
+- `status` becomes `accepted`;
+- every other byte stays as it was, `source` included, because acceptance is the status;
+- `folder`, if given, must agree with the mapping.
+
+It's refused in these cases:
+- the draft has no `type`;
+- the target already exists;
+- the draft doesn't validate, under the schema and the link rule, against the target type;
+- a shared `inbox/` draft isn't a `practice` or `lesson`;
+- a project `inbox/` draft is a `practice` or `lesson` (those belong in the shared inbox);
+- the note isn't directly in `inbox/`;
+- the draft is in a pulled vault.
+
+The inbox deletion is authorized as `PROPOSE` (inbox is where drafts live), and the target as `USER_ACTION`, so the shared `practices/` and `lessons/` are allowed by rule 2.
+
+**Multi-path apply.** `apply.apply_changes(repo, [Change(path, content | None, base_sha256 | None)], summary)` writes N paths and commits them as one, under the OS write lock throughout:
+1. **Stale check.** Every path is checked against its `base_sha256`; `None` means the path must not exist yet.
+2. **Record.** One `applying` change set goes into `queue.sqlite` (tables `changesets` and `changeset_paths`, queue schema v3), holding every path's prior content, mode, and new content.
+3. **Write.** Each path is replaced atomically, or unlinked for a delete, and checked to still resolve to its authorized path.
+4. **Commit.** One `git commit --only -- <paths>`: new or untracked paths are `git add`ed first, and deleted tracked paths need no staging. The commit carries `Daedalus-Change: <changeset id>`.
+5. **On failure.** A failing commit (a hook included) or any exception restores **every** path, unstages what was staged, and marks the change set `failed`.
+6. **Crash recovery.** Every queue open reconciles `applying` change sets like proposals:
+   - if a commit with the trailer landed, the set is marked applied;
+   - otherwise every path still holding our content is restored, and a path changed since is left alone.
+
+Plan approval in commit 12 will reuse this to write several decision notes at once.

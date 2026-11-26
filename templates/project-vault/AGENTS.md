@@ -46,7 +46,16 @@ lesson:     applies_to
 
 ## 4. Design choices
 
-These categories require an accepted decision or practice to cite: schemas, new dependencies, interfaces between components, and data sources. Cite it by linking it: an accepted note in `decisions/` goes in `related`, and a practice from the shared vault goes in `shared_refs`. With no precedent, the agent writes a note in `questions/` and stops.
+A design choice in one of these categories needs precedent before an agent acts on it:
+
+- `schema`: the shape of stored data, files, or messages
+- `dependency`: adding a library, service, or tool
+- `interface`: how two components talk to each other
+- `data_source`: where data comes from
+
+Precedent is an accepted note in this project's `decisions/`, or an accepted practice in the shared vault's `practices/`, and nothing else. A draft or proposed note doesn't count, nor does a note in any other folder, nor another project's decisions: to make one apply everywhere, promote it to a shared practice. Cite precedent by linking it: a decision in `related`, a practice in `shared_refs`.
+
+Look for precedent with `find_precedent`. With none, ask with `ask_user`, which proposes a note in `questions/`, and stop until the human answers. The answer becomes an accepted decision, which is precedent from then on.
 
 ## 5. Linking
 

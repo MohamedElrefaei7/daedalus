@@ -134,6 +134,11 @@ def build_server(registry_path: str | os.PathLike[str] | None = None,
         log.info("proposed %s -> %s:%s", result["id"], result["vault"], result["rel_path"])
         return result
 
+    @mcp.tool(name="find_precedent", description=describe("find_precedent"))
+    @_tool_errors("find_precedent")
+    def find_precedent(topic: str, category: str | None = None) -> dict[str, Any]:
+        return toolset.find_precedent(session(), topic, category)
+
     return mcp
 
 

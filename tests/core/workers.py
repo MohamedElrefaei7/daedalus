@@ -99,3 +99,19 @@ def hold_lock_until(state_root: str, held, release) -> None:
     with apply_mod.write_lock():
         held.set()
         release.wait(timeout=30)
+
+
+def answer_and_crash(registry_path: str, state_root: str, cache_root: str, question_id: str) -> None:
+    """answer_question, killed with os._exit(1) after both files are written and before the commit."""
+    import os
+
+    from daedalus.core import accept, apply as apply_mod
+
+    session = _setup(registry_path, state_root, cache_root)
+
+    def crash(*args, **kwargs):
+        os._exit(1)
+
+    apply_mod.commit_paths = crash
+    accept.answer_question(session, question_id, "1")
+    os._exit(0)  # not reached

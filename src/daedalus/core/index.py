@@ -118,14 +118,18 @@ def index_path(vault_root: str | os.PathLike[str]) -> Path:
     return CACHE_ROOT / "index" / (hashlib.sha1(real.encode("utf-8")).hexdigest() + ".sqlite")
 
 
-def to_fts_query(query: str) -> str:
+def to_fts_query(query: str, any_word: bool = False) -> str:
     """Turn free text into a safe FTS5 query.
 
     Each whitespace-separated chunk becomes a phrase of its word tokens
     ("one-commit" -> "one commit"), a double-quoted span becomes one phrase,
     and all parts must match. Only word characters reach FTS5, so no user
-    input is parsed as FTS5 syntax.
+    input is parsed as FTS5 syntax. ``any_word`` instead matches a note
+    holding any one word of the query (find_precedent's recall over a small,
+    filtered set).
     """
+    if any_word:
+        return " OR ".join(f'"{w}"' for w in dict.fromkeys(_TOKEN.findall(query)))
     parts = []
     for m in _QUERY_PART.finditer(query):
         words = _TOKEN.findall(m.group(1) if m.group(1) is not None else m.group(2))
@@ -219,9 +223,9 @@ class SearchIndex:
                 )
         return len(changed), len(dropped)
 
-    def search(self, query: str, limit: int = 20) -> list[Hit]:
+    def search(self, query: str, limit: int = 20, any_word: bool = False) -> list[Hit]:
         self.refresh()
-        fts_query = to_fts_query(query)
+        fts_query = to_fts_query(query, any_word)
         if not fts_query or limit <= 0:
             return []
         rows = self.con.execute(

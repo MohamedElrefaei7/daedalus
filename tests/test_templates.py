@@ -341,3 +341,39 @@ def test_example_registry_parses() -> None:
     assert isinstance(projects, dict), f"{rel(path)}: key 'projects' must be a table"
     bad = [k for k, v in projects.items() if not isinstance(v, str)]
     assert not bad, f"{rel(path)}: project path(s) {bad} must be strings"
+
+
+# Design categories, single-sourced ------------------------------------------------------
+
+def _live_agents_files() -> list[Path]:
+    """The live vaults' AGENTS.md copies, from the real registry (read-only); none on a machine without one."""
+    from daedalus.core.registry import RegistryError, load_registry
+
+    try:
+        reg = load_registry(Path("~/.config/daedalus/vaults.toml").expanduser())
+    except RegistryError:
+        return []
+    return [reg.shared / "AGENTS.md", *(root / "AGENTS.md" for _, root in sorted(reg.projects.items()))]
+
+
+AGENTS_FILES = [TEMPLATES / "project-vault" / "AGENTS.md", TEMPLATES / "shared-vault" / "AGENTS.md",
+                *_live_agents_files()]
+
+
+def design_categories(text: str) -> tuple[str, ...] | None:
+    """The `name` bullets of an AGENTS.md "Design choices" section, in order; None if it has no such section."""
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if re.match(r"^##\s+(\d+\.\s+)?Design choices\s*$", line)), None)
+    if start is None:
+        return None
+    end = next((j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
+    return tuple(m.group(1) for line in lines[start + 1:end] if (m := re.match(r"^- `([a-z_]+)`", line)))
+
+
+@pytest.mark.parametrize("path", AGENTS_FILES, ids=lambda p: str(p).replace(str(Path.home()), "~"))
+def test_agents_md_names_exactly_the_design_categories(path: Path) -> None:
+    from daedalus.core.schema import DESIGN_CATEGORIES
+
+    found = design_categories(path.read_text(encoding="utf-8"))
+    assert found is not None, f"{path} has no 'Design choices' section"
+    assert found == DESIGN_CATEGORIES, f"{path} names {found}, expected {DESIGN_CATEGORIES}"

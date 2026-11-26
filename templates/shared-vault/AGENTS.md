@@ -22,6 +22,17 @@ Only the human promotes a note: they move it from `inbox/` to `practices/` or `l
 
 Every note links to at least one other note, as in the project vaults. Any link counts: one in `related`, `shared_refs`, or `project_refs`, or a wikilink in the body. A practice or lesson usually links a related practice in `related`. `AGENTS.md` is never a valid link target: it describes the vault rather than being a note in it, so a draft that links `[[AGENTS]]` (or a project's `[[CONTEXT]]`) is refused.
 
+## 6. Design choices
+
+Accepted practices in `practices/` are precedent for design choices in every project, in these categories:
+
+- `schema`: the shape of stored data, files, or messages
+- `dependency`: adding a library, service, or tool
+- `interface`: how two components talk to each other
+- `data_source`: where data comes from
+
+A project's own decisions bind only that project. When one should apply everywhere, promote it into a practice here.
+
 ## Frontmatter schema
 
 Same contract as the project vaults. Wikilinks inside YAML must be quoted: `related: ["[[red-test-first]]"]`.

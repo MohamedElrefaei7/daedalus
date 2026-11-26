@@ -190,8 +190,70 @@
   - In the scratch window, `/here` attached `scratch:CONTEXT.md` (72 chars). Then `/drop scratch` dropped the attachment, and the next `/here` said `/pull scratch` would bring it in.
   - `/open shared:practices/red-test-first.md` opened in the shared vault's window.
 
+### 2026-11-26 — Commit 8: design-decision gate, ask_user, /answer, /promote, multi-path apply
+
+- **Categories.** `DESIGN_CATEGORIES = ("schema", "dependency", "interface", "data_source")` in `core/schema.py`.
+  - Every `AGENTS.md` names exactly these four in its "Design choices" section, and a test checks the templates and every vault in the real registry.
+  - The shared template gained a §6 "Design choices".
+  - The live copies are committed in their own repos: scratch `afe2b4a`, scratch2 `ab294da`, shared `4cd9324`. The test failed first on all three live copies, before they were updated.
+- **`core/gate.py`.**
+  - `check_basis` returns `OK(note)`, `NEEDS_USER`, or `REFUSED(reason)`.
+  - Precedent is an accepted note in the active `decisions/` or the shared `practices/`, nothing else.
+  - `find_precedent` runs an any-word FTS search, filtered to accepted, schema-valid notes in those two folders, and returns at most 10.
+  - `propose_with_basis` is the entry point for commits 10–12.
+- **`core/accept.py`.** `ask_user` writes a typed question into `questions/` through the queue. `answer_question` (`/answer`) and `promote` (`/promote`) each make one multi-path commit.
+- **`apply.apply_changes`.** It writes N paths and makes one commit, recording a change set in the queue first (schema v3, tables `changesets` and `changeset_paths`). A failed commit or crash restores every path, and reconciliation covers change sets.
+- **Rule 5.** `USER_ACTION` now includes `questions/`.
+- **Tools.**
+  - daedalus-mcp has 9 tools, with `find_precedent`.
+  - The agent has 12, with `find_precedent` and `ask_user`.
+  - A successful `ask_user` ends the turn; later calls in the same reply get a "Not run" result.
+  - The REPL prints the question with numbered options.
+  - The preamble states the gate.
+- **Tests:** 747 in total, 67 new (680 at commit 7):
+  - gate 24;
+  - ask_user, /answer, /promote, and multi-path apply 29;
+  - terminal 5;
+  - MCP 1;
+  - the integrity table +3 rows (39);
+  - the `AGENTS.md` categories 5;
+  - plus the updated exact-tool-set tests (nine and twelve).
+- **Proved red four ways:**
+  1. Accepting `proposed` notes as precedent failed `test_proposed_note_is_refused` ("expected REFUSED, got OK(… status 'proposed' …)"), plus the parametrized proposed case and the integrity row.
+  2. Accepting a pulled project's decision failed `test_pulled_projects_accepted_decision_is_refused` (`expected REFUSED, got OK(… ref='beta:decisions/beta-uses-postgres.md')`).
+  3. Continuing the loop after `ask_user` failed `test_ask_user_ends_the_turn_with_zero_further_requests` ("the agent made a model call after ask_user", `assert 4 == 2`), and three more.
+  4. Two commits for `/answer` failed `test_answer_is_one_commit_with_exactly_the_decision_and_the_question` ("must be one commit", `assert 2 == 1`), plus the pending-question, crash, and REPL tests.
+- **Live check** (scratch2, off-peak, 18:20 UTC):
+  1. DeepSeek ran `get_scope`, `find_precedent`, then `ask_user` on its own, with no nudge. The turn stopped, and the REPL showed the question `1m8chavq3632ny` with two options.
+  2. `/answer 1m8chavq3632ny 1` approved the question (`5b7731e`), then made one commit, `0afe779`. It added `decisions/should-scratch2-s-storage-layer-use-sqlite-embedded-file.md` and modified the same-named question.
+  3. "Now draft the component note": DeepSeek ran `list_notes questions`, then `find_precedent`, which found the decision, then `read_note` of the decision, `list_files`, `read_code README.md`, and `read_note templates/component.md`. It then proposed `inbox/storage-layer.md`, citing the decision in `related` and `red-test-first` in `shared_refs`.
+  4. `/approve` committed `498876d`. Then `/promote storage-layer components` made `f7506bd`: A `components/storage-layer.md`, D `inbox/storage-layer.md`, now `status: accepted` with `source: deepseek` kept.
+  5. Claude desktop ("find precedent about storage") found the one accepted decision and summarized it. It noted the decision's empty Consequences section.
+- **Found in the live check:** the decision has the same file stem as its question. So the component's `related: ["[[should-scratch2-…-file]]"]` is **ambiguous**: `check_basis` refuses it, while `[[decisions/…]]` is OK. The link rule accepts it, since ambiguous links count, like dangling ones. Up Next has the fix.
+
 ## Key decisions
 
+- ★ **No design choice goes ahead without precedent or the human's answer.** Precedent is an accepted, schema-valid note in the active `decisions/` or the shared `practices/`, and nothing else: no drafts or proposed notes, no other folders, no pulled projects' decisions (promote those to a shared practice).
+- ★ **The four design categories are single-sourced** in `DESIGN_CATEGORIES`, and every `AGENTS.md`, template and live, is tested against them.
+- ★ **`ask_user` ends the agent's turn.** No model call follows it that turn. Other calls in the same reply get a "Not run" tool result, so the history stays a valid tool exchange. A refused `ask_user` doesn't end the turn.
+- ★ **`/answer` and `/promote` are one commit each,** through `apply_changes`. The question approval, if still pending, is its own commit first.
+- ★ **Multi-path apply has single-path apply's guarantees:**
+  - a stale check on every path;
+  - a recorded change set with prior content before the first write;
+  - path-limited `git commit --only`;
+  - every path restored on failure or crash;
+  - the write lock throughout.
+- **Promotion keeps `source`:** acceptance is the status, and provenance stays honest. The inbox deletion is authorized as `PROPOSE` (inbox is where drafts live), the target as `USER_ACTION`.
+- **`find_precedent` matches any word of the topic** (FTS `OR`). The set is small and already filtered to accepted notes, so recall matters more than precision.
+- **`ask_user`:**
+  - It records its own "why no precedent applied" from a `find_precedent` run, rather than taking a fifth argument.
+  - It needs at least two distinct options.
+  - The question note's status is `proposed`, and `Category: \`x\`` goes in the body, not the frontmatter.
+- **`/answer` decision notes:**
+  - They are named after the question's stem, with `-2` and so on if taken.
+  - Their links are path-qualified (`[[questions/x]]` and `[[decisions/x]]`).
+  - Free text rejects every option.
+  - The answer is validated before the question is approved.
 - ★ **Obsidian is asked where, never what.** The CLI reports the focused vault folder and file. Content is read only through `daedalus.core`'s `read_note`, so the policy (`.obsidian/` refused by rule 4, escapes by rule 1) and schema reporting apply. The CLI's `read` and its write commands are never used.
 - ★ **Never target an Obsidian vault by name.** Every project vault is a folder named `vault`. `/open` uses `obsidian://open?path=`, and `/here` maps `base` by real path.
 - ★ **`/here` never launches Obsidian.** `pgrep -x Obsidian` comes first, and the CLI runs only if the app is up. `/open` may launch it.
@@ -263,7 +325,9 @@
 
 ## Up Next
 
-Commit 8: design-decision gate.
+Commit 9: uploads via /add.
+
+Decision notes share their question's stem, so a bare `[[stem]]` is ambiguous (seen live in scratch2's `components/storage-layer.md`). Either give the decision a distinct name, or have the link rule refuse ambiguous links in typed drafts; then fix that note's link.
 
 When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).
 

@@ -1,7 +1,8 @@
 """Test 13: a refused write leaves everything unchanged.
 
 Every refusal path through a public write function (propose_note,
-propose_edit, propose_lesson, write_log, apply, reject) is a row below. For
+propose_edit, propose_lesson, write_log, apply, reject, and since commit 8
+gate.propose_with_basis, answer_question, promote) is a row below. For
 each row, all four hold:
   1. the right error is raised;
   2. every vault's digest is unchanged (all files except .git/ and ignored files);
@@ -20,14 +21,16 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import pytest
-from conftest import DROP, note_text, write_raw, write_registry
+from conftest import DROP, git, note_text, write_note, write_raw, write_registry
 from test_apply import install_hook
 
 from daedalus.core import queue
+from daedalus.core.accept import PromoteError, answer_question, promote
+from daedalus.core.gate import GateRefused, propose_with_basis
 from daedalus.core.apply import apply, reject
 from daedalus.core.policy import PolicyError
 from daedalus.core.queue import (
-    CommitFailed, DraftInvalid, NotPending, ProposalError, ProposalTooLarge, StaleProposal,
+    CommitFailed, DraftInvalid, NotPending, ProposalError, ProposalTooLarge, StaleProposal, UnknownProposal,
 )
 from daedalus.core.registry import load_registry
 from daedalus.core.session import Session
@@ -226,6 +229,27 @@ def reject_without_reason(w):
     return Case(lambda: reject(pid, " "), ProposalError)
 
 
+def non_precedent_basis_in_proposal(w):
+    write_note(w.alpha, "decisions/maybe-postgres.md", "decision", "# Maybe\n", status="proposed")
+    git(w.alpha_repo, "add", "-A")
+    git(w.alpha_repo, "commit", "-q", "-m", "a proposed decision")
+    draft = note_text("component", "# Store\n", source="deepseek", related=["[[maybe-postgres]]"])
+    return Case(lambda: propose_with_basis(w.session, "data_source", "Postgres", "[[maybe-postgres]]", "alpha",
+                                           "inbox/store.md", draft, "deepseek", "s"), GateRefused)
+
+
+def promote_type_mismatch(w):
+    write_raw(w.alpha, "inbox/store.md", note_text("component", "# Store\n", status="draft",
+                                                   related=["[[storage-engine]]"]))
+    git(w.alpha_repo, "add", "-A")
+    git(w.alpha_repo, "commit", "-q", "-m", "a component draft")
+    return Case(lambda: promote(w.session, "alpha:inbox/store.md", "decisions"), PromoteError)
+
+
+def answer_unknown_question(w):
+    return Case(lambda: answer_question(w.session, "0000000000zzzz", "1"), UnknownProposal)
+
+
 CASES = [
     rule1_traversal_into_repo, rule1_traversal_outside, rule1_unpulled_vault, rule1_unregistered_vault,
     rule1_symlink_escape, rule1_reauth_unregistered_on_apply,
@@ -238,6 +262,7 @@ CASES = [
     link_only_to_context,
     create_over_existing, edit_missing, forged_trailer_summary,
     reject_without_reason,
+    non_precedent_basis_in_proposal, promote_type_mismatch, answer_unknown_question,
 ]
 
 

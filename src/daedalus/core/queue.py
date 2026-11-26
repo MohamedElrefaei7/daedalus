@@ -11,6 +11,12 @@ applying records whose apply is no longer running are reconciled: if a commit
 carrying the proposal's Daedalus-Change trailer exists, the proposal is
 applied; otherwise the old content is restored (or a create removed), the
 path unstaged, and the proposal marked failed with reason "interrupted".
+
+Change sets: a write of several paths as one commit (/answer, /promote, and
+plan approval later). apply.apply_changes records one "applying" change set
+with every path's prior and new content before it writes anything, so
+reconciliation can restore all of them, or mark it applied if the commit
+carrying its Daedalus-Change trailer landed.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from .errors import (  # re-exported: callers import these from daedalus.core.qu
 
 STATE_ROOT = Path("~/.local/state/daedalus").expanduser()
 MAX_CONTENT_BYTES = 256 * 1024
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 KINDS = ("create", "edit")
 STATUSES = ("pending", "applying", "applied", "rejected", "stale", "failed")
@@ -60,6 +66,29 @@ CREATE TABLE {name} (
     base_head     TEXT   -- set when applying: HEAD before the write
 )
 """
+_CHANGESETS = (
+    """CREATE TABLE IF NOT EXISTS changesets (
+        id            TEXT PRIMARY KEY,
+        repo_path     TEXT NOT NULL,
+        base_head     TEXT,
+        summary       TEXT NOT NULL,
+        status        TEXT NOT NULL CHECK (status IN ('applying', 'applied', 'failed')),
+        status_reason TEXT,
+        commit_sha    TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS changeset_paths (
+        changeset_id  TEXT NOT NULL REFERENCES changesets (id),
+        seq           INTEGER NOT NULL,
+        target_path   TEXT NOT NULL,  -- the authorized real path
+        prior         BLOB,           -- NULL: the path didn't exist
+        prior_mode    INTEGER,
+        new           BLOB,           -- NULL: the change deletes the path
+        staged        INTEGER NOT NULL,  -- 1 if apply git-added it (a new or untracked path)
+        PRIMARY KEY (changeset_id, seq)
+    )""",
+)
 _V1_COLUMNS = (
     "id", "vault", "rel_path", "kind", "content", "base_sha256", "base_content", "source", "summary",
     "created_at", "updated_at", "status", "status_reason", "commit_sha",
@@ -106,18 +135,20 @@ def connect() -> sqlite3.Connection:
     con.execute("PRAGMA synchronous = NORMAL")
     _ensure_schema(con)
     if not _reconciling and not vaultio.lock_held_here():
-        if con.execute("SELECT 1 FROM proposals WHERE status = 'applying' LIMIT 1").fetchone():
+        if con.execute("SELECT 1 FROM proposals WHERE status = 'applying' UNION ALL "
+                       "SELECT 1 FROM changesets WHERE status = 'applying' LIMIT 1").fetchone():
             reconcile()
     return con
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
-    """Create the table, or migrate a version-1 queue (no 'applying' status) in place."""
+    """Create the tables, or migrate in place: v1 had no 'applying' status, v2 no change sets."""
     if con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
         return
     con.execute("BEGIN IMMEDIATE")
     try:
-        if con.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:  # re-check under the lock
+        version = con.execute("PRAGMA user_version").fetchone()[0]  # re-check under the lock
+        if version < 2:
             exists = con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'proposals'").fetchone()
             con.execute(_TABLE.format(name="proposals_v2"))
             if exists:
@@ -126,6 +157,10 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
                 con.execute("DROP TABLE proposals")
             con.execute("ALTER TABLE proposals_v2 RENAME TO proposals")
             con.execute("CREATE INDEX proposals_by_status ON proposals (status, vault, id)")
+        if version < 3:
+            for ddl in _CHANGESETS:
+                con.execute(ddl)
+        if version < SCHEMA_VERSION:
             con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         con.execute("COMMIT")
     except BaseException:
@@ -290,6 +325,12 @@ def reconcile() -> list[str]:
                 settled.append(rec.id)
             except Exception:
                 continue  # leave it applying; the next open retries
+        for cs in changesets(status="applying"):
+            try:
+                _reconcile_changeset(cs)
+                settled.append(cs.id)
+            except Exception:
+                continue
         return settled
     finally:
         _reconciling = False
@@ -329,3 +370,103 @@ def _reconcile_one(rec: Proposal) -> None:
     if not vaultio.in_head(repo, rel):
         vaultio.unstage(repo, rel)
     transition(rec.id, "applying", "failed", reason=reason)
+
+
+# Change sets ------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ChangePath:
+    target_path: str
+    prior: bytes | None
+    prior_mode: int | None
+    new: bytes | None
+    staged: bool
+
+
+@dataclass(frozen=True)
+class ChangeSet:
+    id: str
+    repo_path: str
+    base_head: str | None
+    summary: str
+    status: str
+    status_reason: str | None
+    commit_sha: str | None
+    paths: tuple[ChangePath, ...]
+
+
+def begin_changeset(change_id: str, repo: Path, base_head: str | None, summary: str,
+                    paths: list[ChangePath]) -> None:
+    """Record a change set as applying, with every path's prior and new content, in one transaction."""
+    now = _now()
+    with closing(connect()) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute("INSERT INTO changesets (id, repo_path, base_head, summary, status, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 'applying', ?, ?)", (change_id, str(repo), base_head, summary, now, now))
+            con.executemany(
+                "INSERT INTO changeset_paths (changeset_id, seq, target_path, prior, prior_mode, new, staged) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(change_id, i, cp.target_path, cp.prior, cp.prior_mode, cp.new, int(cp.staged))
+                 for i, cp in enumerate(paths)])
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+
+
+def finish_changeset(change_id: str, status: str, *, reason: str | None = None, commit_sha: str | None = None) -> bool:
+    if status not in ("applied", "failed"):
+        raise ValueError("a change set finishes applied or failed")
+    with closing(connect()) as con:
+        cur = con.execute("UPDATE changesets SET status = ?, status_reason = ?, commit_sha = ?, updated_at = ? "
+                          "WHERE id = ? AND status = 'applying'", (status, reason, commit_sha, _now(), change_id))
+        return cur.rowcount == 1
+
+
+def changesets(status: str | None = None, change_id: str | None = None) -> list[ChangeSet]:
+    where, args = [], []
+    if status is not None:
+        where.append("status = ?")
+        args.append(status)
+    if change_id is not None:
+        where.append("id = ?")
+        args.append(change_id)
+    sql = "SELECT id, repo_path, base_head, summary, status, status_reason, commit_sha FROM changesets"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    with closing(connect()) as con:
+        out = []
+        for row in con.execute(sql + " ORDER BY id", args).fetchall():
+            paths = tuple(ChangePath(t, p, m, n, bool(st)) for t, p, m, n, st in con.execute(
+                "SELECT target_path, prior, prior_mode, new, staged FROM changeset_paths WHERE changeset_id = ? "
+                "ORDER BY seq", (row[0],)))
+            out.append(ChangeSet(*row, paths=paths))
+        return out
+
+
+def _reconcile_changeset(cs: ChangeSet) -> None:
+    """Applied if its commit landed; otherwise every path we wrote goes back to its prior content."""
+    repo = Path(cs.repo_path)
+    sha = vaultio.find_commit_with_trailer(repo, cs.id, since=cs.base_head)
+    if sha is not None:
+        finish_changeset(cs.id, "applied", commit_sha=sha)
+        return
+    left = []
+    for cp in cs.paths:
+        target = Path(cp.target_path)
+        dirfd = vaultio.open_dir_nofollow(target.parent)
+        try:
+            current = vaultio.read_at(dirfd, target.name)
+            now = None if current is None else current[0]
+            if now == cp.new:  # our write (or delete) is in place: undo it
+                prior = None if cp.prior is None else (cp.prior, cp.prior_mode or 0o644)
+                vaultio.restore_at(dirfd, target.name, prior)
+            elif now != cp.prior:  # changed by someone after the crash: leave it
+                left.append(target.name)
+        finally:
+            os.close(dirfd)
+        if cp.staged:
+            vaultio.unstage(repo, os.path.relpath(target, repo))
+    reason = INTERRUPTED if not left else f"{INTERRUPTED}; changed since, so left as is: {', '.join(left)}"
+    finish_changeset(cs.id, "failed", reason=reason)

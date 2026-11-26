@@ -16,6 +16,11 @@ apply() is the only path from the queue into a vault. Its steps, in order:
   7. Mark the proposal applied and store the commit sha.
 
 A write that isn't committed shouldn't exist.
+
+apply_changes() does the same for several paths at once, as one commit:
+creates, edits, and deletes, all in one repo. Every path's prior and new
+content is recorded (queue.begin_changeset) before the first write, so a
+failed commit or a crash restores every one of them.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import difflib
 import hashlib
 import os
 from pathlib import Path
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from . import queue
@@ -33,8 +39,8 @@ from .queue import Proposal
 from .registry import SHARED_NAME, Registry
 from .session import Session
 from .vaultio import (  # module-level names, so tests can patch them here
-    atomic_write_at, check_still_authorized, commit_path, exists_at, head_or_none, is_tracked, open_dir_nofollow,
-    read_at, restore_at, unstage, write_lock,
+    atomic_write_at, check_still_authorized, commit_path, commit_paths, exists_at, head_or_none, is_tracked,
+    open_dir_nofollow, read_at, restore_at, unstage, write_lock,
 )
 
 
@@ -146,6 +152,96 @@ def apply(session: Session, change_id: str) -> Proposal:
         # 7. Applied.
         queue.transition(rec.id, "applying", "applied", commit_sha=sha)
         return queue.get(rec.id)
+
+
+# Several paths, one commit -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Change:
+    """One path in a change set. The caller has already authorized ``path`` (a resolved real path)."""
+
+    path: Path
+    content: str | None  # the new content; None deletes the file
+    base_sha256: str | None  # what the caller read: the file must still hash to this; None means it must not exist
+
+
+def apply_changes(repo: Path, changes: list[Change], summary: str, message: list[str] | None = None) -> str:
+    """Write every change and make exactly one commit, or leave every path as it was. Returns the sha.
+
+    Under the write lock, in order: stale-check every path against its
+    base_sha256; record the change set as applying, with each path's prior
+    and new content; write each (atomic replace, or unlink); confirm each
+    still resolves to its authorized path; commit exactly these paths with
+    ``git commit --only``. Any failure, including a failing hook, restores
+    every path and marks the change set failed. A crash anywhere after the
+    record is reconciled on the next queue open.
+    """
+    if not changes:
+        raise ValueError("apply_changes needs at least one change")
+    rels = [os.path.relpath(c.path, repo) for c in changes]
+    if any(r == ".." or r.startswith("../") for r in rels):
+        raise ProposalError(f"every path in a change set must be inside {repo}")
+    if len(set(rels)) != len(rels):
+        raise ProposalError("a change set names the same path twice")
+    change_id = queue.new_id()
+    message = message or [summary]
+    with write_lock():
+        dirfds = [open_dir_nofollow(c.path.parent) for c in changes]
+        try:
+            priors = []
+            for c, fd in zip(changes, dirfds):
+                prior = read_at(fd, c.path.name)
+                current = None if prior is None else hashlib.sha256(prior[0]).hexdigest()
+                if c.base_sha256 is None and (prior is not None or exists_at(fd, c.path.name)):
+                    raise StaleProposal(f"{c.path} already exists")
+                if c.base_sha256 is not None and current != c.base_sha256:
+                    what = "was deleted" if current is None else "changed"
+                    raise StaleProposal(f"{c.path} {what} since it was read; nothing was written")
+                priors.append(prior)
+
+            # New or untracked paths must be staged for `git commit --only`; a deleted untracked path has
+            # nothing for git to commit, so it stays out of the pathspec.
+            tracked = [prior is not None and is_tracked(repo, rel) for prior, rel in zip(priors, rels)]
+            staged = [c.content is not None and not t for c, t in zip(changes, tracked)]
+            in_commit = [rel for c, rel, t in zip(changes, rels, tracked) if c.content is not None or t]
+            queue.begin_changeset(change_id, repo, head_or_none(repo), summary, [
+                queue.ChangePath(str(c.path), None if prior is None else prior[0], None if prior is None else prior[1],
+                                 None if c.content is None else c.content.encode("utf-8"), st)
+                for c, prior, st in zip(changes, priors, staged)])
+
+            def roll_back(reason: str) -> None:
+                for c, fd, prior, rel, st in zip(changes, dirfds, priors, rels, staged):
+                    restore_at(fd, c.path.name, prior)
+                    if st:
+                        unstage(repo, rel)
+                queue.finish_changeset(change_id, "failed", reason=reason)
+
+            try:
+                for c, fd, prior in zip(changes, dirfds, priors):
+                    if c.content is None:
+                        os.unlink(c.path.name, dir_fd=fd)
+                        os.fsync(fd)
+                    else:
+                        atomic_write_at(fd, c.path.name, c.content.encode("utf-8"), prior[1] if prior else None)
+                        check_still_authorized(c.path)
+            except BaseException as e:
+                roll_back(f"write failed: {e!r}")
+                raise
+
+            try:
+                sha = commit_paths(repo, in_commit, [*message, f"Daedalus-Change: {change_id}"],
+                                   add=[rel for rel, st in zip(rels, staged) if st])
+            except CommitFailed as e:
+                roll_back(e.output or str(e))
+                raise
+            except BaseException as e:
+                roll_back(f"commit interrupted: {e!r}")
+                raise
+        finally:
+            for fd in dirfds:
+                os.close(fd)
+        queue.finish_changeset(change_id, "applied", commit_sha=sha)
+        return sha
 
 
 def reject(change_id: str, reason: str) -> Proposal:

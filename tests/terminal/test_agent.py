@@ -15,8 +15,10 @@ from daedalus.core import queue
 from daedalus.terminal import agent as agent_mod
 from daedalus.terminal.agent import MAX_RESULT_CHARS, MAX_TOOL_ROUNDS, TOOLS, Agent, Events
 
-EIGHT = {"get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note"}
-TEN = EIGHT | {"propose_edit", "propose_lesson"}  # the agent adds what /end needs; daedalus-mcp stays at eight
+NINE = {"get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
+        "find_precedent"}
+# The agent adds what /end needs, and ask_user (which ends its turn); daedalus-mcp stays at nine.
+TWELVE = NINE | {"propose_edit", "propose_lesson", "ask_user"}
 
 
 class Recorder(Events):
@@ -84,7 +86,7 @@ def test_tool_results_follow_their_calls(agent, fake) -> None:
 
 def test_exact_agent_tool_set_and_no_source_parameter() -> None:
     names = [t["function"]["name"] for t in TOOLS]
-    assert set(names) == TEN and len(names) == 10
+    assert set(names) == TWELVE and len(names) == 12
     for t in TOOLS:
         params = t["function"]["parameters"]
         assert "source" not in params["properties"], t["function"]["name"]
@@ -93,8 +95,8 @@ def test_exact_agent_tool_set_and_no_source_parameter() -> None:
 
 def test_agent_parameters_match_daedalus_mcp(mcp_schemas) -> None:
     ours = {t["function"]["name"]: set(t["function"]["parameters"]["properties"]) for t in TOOLS}
-    assert set(mcp_schemas) == EIGHT  # Claude never gets the edit and lesson tools
-    assert {name: ours[name] for name in EIGHT} == mcp_schemas
+    assert set(mcp_schemas) == NINE  # Claude never gets the edit, lesson, and ask_user tools
+    assert {name: ours[name] for name in NINE} == mcp_schemas
 
 
 @pytest.fixture
@@ -212,4 +214,4 @@ def test_tool_label() -> None:
         "→ read_note shared:practices/red-test-first.md"
     assert agent_mod.tool_label("get_scope", {}) == "→ get_scope"
     assert agent_mod.tool_label("propose_note", {"rel_path": "inbox/x.md"}) == "→ propose_note inbox/x.md"
-    assert set(toolset.NAMES) == EIGHT
+    assert set(toolset.NAMES) == NINE

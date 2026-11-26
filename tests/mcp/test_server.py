@@ -400,3 +400,17 @@ def test_refusals_are_not_logged_as_errors(mcp, monkeypatch, caplog) -> None:
     run(fault())
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert any(r.name == "daedalus.mcp" and r.exc_info for r in errors), "an internal error keeps its traceback"
+
+
+def test_find_precedent_over_mcp(mcp, mworld) -> None:
+    write_raw(mworld.alpha, "decisions/maybe-postgres.md", note_text("decision", "# Storage in Postgres?\n",
+                                                                       status="proposed"))
+
+    async def go():
+        async with mcp:
+            return (await mcp.ok("find_precedent", {"topic": "storage"}),
+                    await mcp.call("find_precedent", {"topic": "storage", "category": "database"}))
+
+    found, (is_error, text) = run(go())
+    assert [p["ref"] for p in found["precedents"]] == ["alpha:decisions/storage-engine.md"]  # proposed: left out
+    assert is_error and "unknown design category" in text

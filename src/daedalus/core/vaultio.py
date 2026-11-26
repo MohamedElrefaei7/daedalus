@@ -194,6 +194,30 @@ def commit_path(repo: Path, rel: str, message: list[str], add: bool) -> str:
     return git(repo, "rev-parse", "HEAD").strip()
 
 
+def commit_paths(repo: Path, rels: list[str], message: list[str], add: list[str]) -> str:
+    """Commit exactly ``rels`` (any mix of new, changed, and deleted paths) as one commit; returns its sha.
+
+    ``add`` are the new or untracked paths among them, staged first so that
+    ``git commit --only`` will take them; a deleted tracked path needs no
+    staging. Whatever else is staged stays staged. Never -a, never `git add .`.
+    """
+    if not rels:
+        raise ValueError("commit_paths needs at least one path")
+    if add:
+        git(repo, "add", "--", *add)
+    args = ["commit", "-q", "--only"]
+    for paragraph in message:
+        args += ["-m", paragraph]
+    git(repo, *args, "--", *rels)
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def commit_files(repo: Path, sha: str) -> list[str]:
+    """The repo-relative paths a commit touches, sorted."""
+    out = git(repo, "show", "--name-only", "--format=", "-z", sha)
+    return sorted(p for p in out.split("\0") if p)
+
+
 def is_tracked(repo: Path, rel: str) -> bool:
     try:
         git(repo, "ls-files", "--error-unmatch", "--", rel)

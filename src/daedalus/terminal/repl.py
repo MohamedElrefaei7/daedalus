@@ -2,8 +2,8 @@
 
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
-Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /end, /cost, /pending, /diff, /approve, /reject,
-/help, /quit.
+Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /answer, /promote, /end, /cost, /pending, /diff,
+/approve, /reject, /help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
@@ -24,7 +24,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from daedalus import secrets
-from daedalus.core import queue
+from daedalus.core import accept, queue
 from daedalus.core.apply import apply, diff, pending, reject
 from daedalus.core.lifecycle import LifecycleError, new_project
 from daedalus.core.policy import Op, PolicyError, authorize
@@ -51,6 +51,8 @@ HELP = """\
 /pull <name>           read another project too (read-only); /drop <name> stops
 /open <note>           show a note in Obsidian (vault:path/to/note.md, or a wikilink target)
 /here                  attach the note open in Obsidian to your next message
+/answer <id> <n|text>  answer a design question: its option number, or your own answer in quotes
+/promote <note> [dir]  accept an inbox draft into the folder its type maps to (e.g. components/)
 /end                   propose a CONTEXT.md log entry for this session, review proposals, exit
 /cost                  calls, tokens, and dollars for this session and today, plus the DeepSeek balance
 /pending               proposals waiting for you
@@ -151,6 +153,17 @@ class LiveView(Events):
     def stopped(self, message: str) -> None:
         self.end()
         self.console.print(Text(message, style="bold yellow"))
+
+    def asked(self, result: dict[str, Any]) -> None:
+        """ask_user ended the turn: show the question and its numbered options now."""
+        self.end()
+        self.console.print(Text(f"\n? {result.get('question', '')}", style="bold magenta"))
+        self.console.print(Text(f"  {result['category']} · {result['vault']}:{result['rel_path']} · proposal "
+                                f"{result['id']}", style="dim"))
+        for n, option in enumerate(result.get("options", []), 1):
+            self.console.print(f"  {n}. {option}")
+        self.console.print(Text(f"  Answer with /answer {result['id']} <number>, or /answer {result['id']} "
+                                "\"your own answer\". The agent waits.", style="magenta"))
 
 
 END_PROMPT = """\
@@ -268,6 +281,24 @@ class Repl:
                 self.console.print(f"opened {opened.vault}:{opened.rel_path} in Obsidian")
             elif name == "/here":
                 self.here()
+            elif name == "/answer":
+                change_id, _, answer = rest.partition(" ")
+                if not change_id or not answer.strip():
+                    raise ValueError('usage: /answer <question-id> <option-number | "free text">')
+                done = accept.answer_question(self.session, change_id, answer)
+                if done.approved_question:
+                    self.console.print(f"approved the question {done.question_ref} "
+                                       f"(commit {done.approved_question[:7]})")
+                self.console.print(f"answered {done.question_ref}: {done.chosen}")
+                self.console.print(f"accepted {done.decision_ref} (source: human); one commit, {done.commit_sha[:7]}, "
+                                   "holds the decision and the answered question.")
+            elif name == "/promote":
+                words = shlex.split(rest)
+                if not 1 <= len(words) <= 2:
+                    raise ValueError("usage: /promote <inbox-note> [folder]")
+                done = accept.promote(self.session, words[0], words[1] if len(words) == 2 else None)
+                self.console.print(f"promoted {done.source_ref} → {done.target_ref} (status: accepted, source kept) "
+                                   f"in commit {done.commit_sha[:7]}")
             elif name == "/help":
                 self.console.print(HELP)
             elif name == "/cost":

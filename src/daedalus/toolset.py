@@ -1,4 +1,4 @@
-"""The eight agent tools, shared by daedalus-mcp (Claude) and the terminal agent (DeepSeek).
+"""The agent tools, shared by daedalus-mcp (Claude, nine) and the terminal agent (DeepSeek, twelve).
 
 Each function takes the Session first and returns a JSON-ready dict. The
 front end decides where the session comes from and what ``source`` a
@@ -10,7 +10,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from daedalus.core import queue, tools
+from daedalus.core import accept, gate, queue, tools
+from daedalus.core.schema import DESIGN_CATEGORIES
 from daedalus.core.notes import NoteSchemaError
 from daedalus.core.policy import PolicyError
 from daedalus.core.registry import SHARED_NAME, RegistryError
@@ -18,9 +19,11 @@ from daedalus.core.session import Session, SessionError
 from daedalus.core.state import StateError
 
 # daedalus-mcp's exact tool set (Claude), in order.
-NAMES = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note")
-# The terminal agent's (DeepSeek) adds the two /end needs: CONTEXT.md and inbox edits, and lessons.
-AGENT_NAMES = NAMES + ("propose_edit", "propose_lesson")
+NAMES = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
+         "find_precedent")
+# The terminal agent's (DeepSeek) adds the two /end needs (CONTEXT.md and inbox edits, and lessons), and
+# ask_user, which ends its turn. Claude asks in its own chat, so daedalus-mcp has no ask_user.
+AGENT_NAMES = NAMES + ("propose_edit", "propose_lesson", "ask_user")
 
 MAX_NOTES = 2000
 MAX_SEARCH = 50
@@ -130,6 +133,28 @@ def propose_lesson(s: Session, source: str, rel_path: str, content: str, summary
             "message": "Queued in the shared inbox/. Nothing is written until Mohamed approves it in the terminal."}
 
 
+def find_precedent(s: Session, topic: str, category: str | None = None) -> dict[str, Any]:
+    found = gate.find_precedent(s, topic, category)
+    return {
+        "precedents": [p._asdict() for p in found],
+        "note": ("Each is accepted precedent: cite one in related (a decision) or shared_refs (a practice)."
+                 if found else "No precedent. For a design choice, ask with ask_user and stop; don't decide it."),
+    }
+
+
+def ask_user(s: Session, source: str, question: str, category: str, options: list[str],
+             context_refs: list[str]) -> dict[str, Any]:
+    asked = accept.ask_user(s, source, question, category, options, context_refs)
+    p = asked.proposal
+    return {
+        "id": p.id, "status": p.status, "vault": p.vault, "rel_path": p.rel_path, "source": p.source,
+        "question": asked.question, "category": asked.category, "options": list(asked.options),
+        "message": (f"Question queued as {p.id}. Your turn ends now: make no more tool calls and don't decide this "
+                    f"yourself. Mohamed answers with /answer {p.id} <option>; his answer becomes an accepted "
+                    "decision you can then find with find_precedent."),
+    }
+
+
 # Descriptions, written for the model. Both front ends use these words.
 DESCRIPTIONS = {
     "get_scope": (
@@ -178,6 +203,21 @@ DESCRIPTIONS = {
         "project_refs, or in the body; AGENTS.md and CONTEXT.md are never link targets. summary is one line, at most 200 characters, and becomes the commit subject. "
         "Refused: any other folder (practices/, decisions/, ...), editing an existing note, paths outside "
         "the vault, and drafts that break the schema; the error says which rule and why."
+    ),
+    "find_precedent": (
+        "Read-only. Finds precedent for a design choice: accepted notes in the active project's decisions/ and the "
+        "shared vault's practices/ that mention any word of topic, best matches first, at most 10, each with its "
+        "ref, title, status, and first 300 characters. Only these are precedent: drafts, proposed notes, other "
+        "folders, and pulled projects' decisions never are. category (one of " + ", ".join(DESIGN_CATEGORIES) +
+        ") puts notes that mention it first. Call it before any design choice: a schema, a new dependency, an "
+        "interface between components, or a data source."
+    ),
+    "ask_user": (
+        "Asks Mohamed a design question when find_precedent found no precedent for a design choice (category one "
+        "of " + ", ".join(DESIGN_CATEGORIES) + "). Queues a question note in questions/ with your options "
+        "(at least two) and links to the notes that give context (context_refs, at least one; not AGENTS or "
+        "CONTEXT). It ENDS YOUR TURN: no further tool calls run, and you must not make the choice yourself. His "
+        "answer becomes an accepted decision."
     ),
     "propose_edit": (
         "Creates a pending proposal to replace an existing note's whole content; it changes nothing until "

@@ -1,8 +1,11 @@
-"""The DeepSeek agent: the eight daedalus tools and the tool-calling loop for one user turn.
+"""The DeepSeek agent: the daedalus tools and the tool-calling loop for one user turn.
 
-* Exactly the ten tools in daedalus.toolset.AGENT_NAMES: daedalus-mcp's eight
-  plus propose_edit and propose_lesson, which /end needs. None takes a
-  source: proposals are made with source="deepseek" here, never by the model.
+* Exactly the twelve tools in daedalus.toolset.AGENT_NAMES: daedalus-mcp's nine
+  plus propose_edit and propose_lesson, which /end needs, and ask_user. None
+  takes a source: proposals are made with source="deepseek" here, never by
+  the model.
+* A successful ask_user ENDS THE TURN: no further model call is made, and
+  any later tool calls in the same reply get a "not run" result.
 * Each tool result is capped at 60,000 characters, with a note when cut.
 * At most 12 tool rounds per user turn; then the turn stops and says so.
 * Refusals (PolicyError and friends) go back to the model as the tool
@@ -20,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from daedalus import toolset
+from daedalus.core.schema import DESIGN_CATEGORIES
 from daedalus.core.session import Session
 
 from .config import Config
@@ -70,6 +74,17 @@ PARAMETERS: dict[str, dict[str, Any]] = {
         "summary": {**_STR, "description": "one line, at most 200 characters"},
         "vault": {**_OPT_STR, "description": "'shared' for the shared inbox; omit for the active project"},
     }, "required": ["rel_path", "content", "summary"]},
+    "find_precedent": {"type": "object", "properties": {
+        "topic": {**_STR, "description": "a few words about the choice, e.g. 'storage database'"},
+        "category": {**_OPT_STR, "enum": list(DESIGN_CATEGORIES), "description": "the design category"},
+    }, "required": ["topic"]},
+    "ask_user": {"type": "object", "properties": {
+        "question": {**_STR, "description": "the design question, one sentence"},
+        "category": {**_STR, "enum": list(DESIGN_CATEGORIES), "description": "the design category"},
+        "options": {"type": "array", "items": _STR, "minItems": 2, "description": "the choices, at least two"},
+        "context_refs": {"type": "array", "items": _STR, "minItems": 1,
+                         "description": "wikilinks to notes giving context, e.g. ['[[usgs-fetcher]]']"},
+    }, "required": ["question", "category", "options", "context_refs"]},
     "propose_edit": {"type": "object", "properties": {
         "rel_path": {**_STR, "description": "the note to replace, e.g. 'CONTEXT.md' or 'inbox/idea.md'"},
         "content": {**_STR, "description": "the complete new file"},
@@ -92,7 +107,9 @@ TOOLS: list[dict[str, Any]] = [
     }}
     for name in toolset.AGENT_NAMES
 ]
-PROPOSING = ("propose_note", "propose_edit", "propose_lesson")
+PROPOSING = ("propose_note", "propose_edit", "propose_lesson", "ask_user")
+ENDS_TURN = "ask_user"
+NOT_RUN = "Not run: ask_user ended this turn. Wait for Mohamed's answer."
 
 
 def call_tool(session: Session, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -102,6 +119,9 @@ def call_tool(session: Session, name: str, args: dict[str, Any]) -> dict[str, An
         return fn(session, SOURCE, args["rel_path"], args["content"], args["summary"], args.get("vault"))
     if name == "propose_lesson":
         return toolset.propose_lesson(session, SOURCE, args["rel_path"], args["content"], args["summary"])
+    if name == "ask_user":
+        return toolset.ask_user(session, SOURCE, args["question"], args["category"], args["options"],
+                                args["context_refs"])
     fn = getattr(toolset, name)
     return fn(session, **args)
 
@@ -180,6 +200,7 @@ class Events:
     def tool(self, outcome: ToolOutcome) -> None: ...
     def schema_errors(self, ref: str, errors: list[str]) -> None: ...
     def stopped(self, message: str) -> None: ...
+    def asked(self, result: dict[str, Any]) -> None: ...
 
 
 @dataclass
@@ -187,6 +208,7 @@ class TurnResult:
     answer: str
     rounds: int  # tool rounds run
     stopped: bool  # hit MAX_TOOL_ROUNDS
+    asked: dict[str, Any] | None = None  # ask_user's result, when it ended the turn
 
 
 class Agent:
@@ -235,7 +257,11 @@ class Agent:
                 calls = reply.ordered_tool_calls()
                 if not calls:
                     return TurnResult(reply.content, rounds, False)
+                asked: dict[str, Any] | None = None
                 for call in calls:
+                    if asked is not None:  # ask_user ended the turn; every call still needs a tool result
+                        self.history.append({"role": "tool", "tool_call_id": call.id, "content": NOT_RUN})
+                        continue
                     outcome = run_tool(self.session, call.name, call.arguments)
                     log.info("session %s %s %s", self.session_id, tool_label(outcome.name, outcome.args),
                              "ok" if outcome.ok else f"refused: {outcome.text.splitlines()[0][:200]}")
@@ -246,7 +272,12 @@ class Agent:
                     if outcome.schema_errors:
                         ev.schema_errors(str(outcome.args.get("ref", "")), outcome.schema_errors)
                     self.history.append({"role": "tool", "tool_call_id": call.id, "content": outcome.text})
+                    if outcome.ok and outcome.name == ENDS_TURN:
+                        asked = outcome.result
                 rounds += 1
+                if asked is not None:  # no further model call this turn
+                    ev.asked(asked)
+                    return TurnResult(reply.content, rounds, False, asked)
                 if rounds >= MAX_TOOL_ROUNDS:
                     message = (f"Stopped after {MAX_TOOL_ROUNDS} tool rounds without an answer. Ask again more "
                                "narrowly, or say what to look at.")
