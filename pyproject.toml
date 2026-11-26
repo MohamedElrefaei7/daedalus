@@ -3,7 +3,13 @@ name = "daedalus"
 version = "0.1.0"
 description = "Personal knowledge-graph and agent system built on Obsidian."
 requires-python = ">=3.11"
-dependencies = ["pyyaml"]
+dependencies = [
+    "fastmcp==4.2.6",
+    "pyyaml",
+]
+
+[project.scripts]
+daedalus-mcp = "daedalus.mcp_server:main"
 
 [project.optional-dependencies]
 dev = ["pytest"]

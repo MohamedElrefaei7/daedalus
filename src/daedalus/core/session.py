@@ -1,7 +1,8 @@
 """The session: which project is active, which are pulled in, and the worktree.
 
-The session is always passed in explicitly. Core never reads state.json (that
-is commit 6's job), so every core function is testable without ~/.config.
+The session is always passed in explicitly. Core functions never read
+state.json, so every one is testable without ~/.config; front ends build a
+Session from it with daedalus.core.state.load_session.
 """
 
 from __future__ import annotations

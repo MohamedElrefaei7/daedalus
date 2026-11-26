@@ -46,11 +46,23 @@
 - Final suite: 463 tests.
 - Live check: proposed `inbox/hello.md` into scratch, then listed, diffed, and applied it with `queue_cli`. That made commit `748cecb` (`agent(human): live check: hello note` plus a `Daedalus-Change` trailer), touching only that file. Then proposed a lesson into shared and rejected it; the shared HEAD stayed at `b9bfa46` and its `git status` stayed clean.
 
+### 2026-11-25 — Commit 4: daedalus-mcp server and Claude desktop connection
+
+- `daedalus.core.state`: `load_session` / `save_state` over `~/.config/daedalus/state.json`, with `StateError` messages that say how to fix the file. `python -m daedalus.state show | set-active | pull | drop` is a stopgap. The real state file now says `{"active": "scratch", "pulled": []}`.
+- `tools.list_files` (git's view of the active repo, minus `vault/`, capped at 2,000 paths) and `tools.read_code` (2,000 lines and 200,000 characters per call, paged, binary refused), both through `authorize(Op.READ)`.
+- `daedalus-mcp` (`src/daedalus/mcp_server.py`, `fastmcp==4.2.6`): exactly eight tools, `source="claude"` set by the server, the session loaded on every call, refusals returned as tool errors, logs to stderr and `~/.local/state/daedalus/mcp.log`.
+- Tests: 500 in total, 37 new (`tests/mcp/test_server.py` 20, `tests/core/test_state.py` 17). The MCP tests use FastMCP's in-memory client against the core `gworld` fixture; one starts the installed `daedalus-mcp` script and parses every stdout line.
+- Proved red four ways. Registering `apply` fails the exact-tool-set test. A pass-through `source` parameter fails the no-source and can't-impersonate tests. `print("ready")` at startup fails the stdout test (`JSONDecodeError` on `'ready\n'`). Caching the session at startup fails the switching test: after the switch to gamma, reading gamma was refused.
+- Claude desktop app: `~/Library/Application Support/Claude/claude_desktop_config.json` backed up to `.bak`; a `daedalus` entry merged in under `mcpServers` (there were none before), with absolute paths to `uv` and the repo. The exact command was checked first from `/` with a bare `PATH`.
+- `~/code/daedalus-scratch` gained a two-line `README.md` (`docs: scratch readme`) for `read_code` to read.
+- Live check, run from a Claude Code chat in the desktop app. `mcp.log` confirms every call went through daedalus-mcp. Claude showed the scope (scratch active, nothing pulled), listed the scratch and shared notes, quoted `red-test-first`, and showed the scratch `README.md`. Asked to add "always use tabs" to shared `practices/`, it reported "Refused by rule 2: PROPOSE in the shared vault is allowed only in: inbox/" and queued nothing. It proposed `scratch:inbox/hello-from-claude.md` (type concept, `shared_refs: ["[[red-test-first]]"]`), which `queue_cli list` showed as `(claude)`; it was rejected with "live check: rejecting on purpose".
+- The live log showed FastMCP logging every refusal as `ERROR Error calling tool`. Refusals now raise `ToolError(..., log_level=DEBUG)`, so a refusal appears once, at INFO, and only real faults appear at ERROR. `test_refusals_are_not_logged_as_errors` failed before the change.
+
 ## Key decisions
 
 - ★ **One schema, in `daedalus.core.schema`.** `SCHEMA` moved out of `tests/test_templates.py`, which now imports it, so one dict guards both the templates and live notes.
 - ★ **`.obsidian/` in any parent of a project vault fails registry load.** This is checked up to and including the repo root, the nearest parent holding `.git`, and catches the commit-1 mistake of opening the repo as a vault. Registering a folder with no `AGENTS.md` fails too, which catches registering `~/code/daedalus-scratch` instead of `.../vault`.
-- ★ **The session is passed in explicitly.** Core never reads `state.json`, which is commit 6's job, so every core function is testable without `~/.config`.
+- ★ **The session is passed in explicitly.** Core functions never read `state.json`, so every one is testable without `~/.config`. Since commit 4, `daedalus.core.state` loads it for front ends (daedalus-mcp now, the REPL from commit 6).
 - ★ **Deny by default.** Each area has an explicit allow table per op, and anything not listed is refused. A consequence: deleting an area's branch makes the policy stricter, not looser.
 - ★ **Rule 4 compares case-insensitively.** macOS file systems ignore case, so `.OBSIDIAN/app.json` *is* `.obsidian/app.json`. Allow checks stay exact-case: a case variant of an allowed name is refused, which errs safe.
 - ★ **Typed folders are validated against SCHEMA,** and link-list keys must hold only strings. That catches `related: [[a]]`, which parses as `[['a']]`.
@@ -63,6 +75,14 @@
 - **Source is provenance.** An agent can't file its work as a human's on create, or re-attribute a note on edit. A human proposal may change `source`.
 - **Crash recovery by reconciliation, not a journal.** apply marks the record `applying` before the replace; the old content is already stored. Reconciliation runs on every queue open, but only for records whose apply isn't running: taking the write lock without waiting is the test. A commit carrying the trailer means the record was applied; anything else is rolled back. A file changed after the crash is never overwritten.
 - **The write lock is an OS lock** (`flock`), so a crashed holder can't leave it stuck.
+- ★ **daedalus-mcp exposes exactly eight tools.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`. Claude can read and propose, never approve, apply, reject, edit, or log. A test pins the set.
+- ★ **The server sets `source="claude"`.** `propose_note` has no `source` parameter and its schema refuses extra arguments. With commit 3's source rule, a draft saying `source: human` is refused, so Claude can't present its work as yours.
+- ★ **The session is loaded on every tool call, never cached.** Switching projects takes effect on Claude's next call without restarting the desktop app. Reading two small files per call costs microseconds.
+- ★ **Nothing goes to stdout except protocol messages.** Logs go to stderr and `mcp.log`; the FastMCP banner is off. A subprocess test parses every stdout line, so a stray `print()` fails the suite. There's deliberately no stdout redirect hiding mistakes: the test is the guard.
+- ★ **Read caps protect Pro usage, not speed.** `read_code` 2,000 lines (and 200,000 characters) per call, `list_files` 2,000 paths. One careless "read the whole repo" shouldn't burn a five-hour window.
+- **Refusals are tool errors.** `PolicyError` reads "Refused by rule N: <reason>"; schema, state, registry, ref, and read errors pass their messages through; anything unexpected is logged with its traceback and returned as an internal error. The server keeps running. A refusal is logged once at INFO, never at ERROR: ERROR in `mcp.log` means a real fault.
+- **`read_note` over MCP returns invalid notes with their schema errors** instead of refusing them, so Claude can see and explain a broken note. Schema errors on drafts still refuse the proposal.
+- **Code tools read only the active repo area.** A path that resolves into any vault is refused with a pointer to the note tools; `list_files` lists only what `read_code` would let you read.
 - ★ **queue_cli is a stopgap.** Every command is one call into `daedalus.core`, so commit 5's REPL replaces it by calling the same functions.
 - **templates/ is not notes.** One walk skips the vault's top-level `templates/` for every read tool, so the tools can't disagree about what a note is. An explicit `vault:templates/x.md` read still works.
 - ★ **FTS5 is required.** `require_fts5()` fails with a clear message, and a test asserts FTS5 is present.
@@ -78,7 +98,7 @@
 
 ## Up Next
 
-Commit 4: daedalus-mcp + Claude desktop app (read tools + propose_note only; plan tools come in commit 11).
+Commit 5: REPL with DeepSeek streaming, token meter, and caps.
 
 Commit 10: rule 7 must refuse program paths containing / and pin allowed programs to resolved locations; basename matching lets /tmp/evil/pytest through.
 

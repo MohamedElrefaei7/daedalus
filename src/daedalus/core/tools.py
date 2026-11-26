@@ -4,6 +4,10 @@ Read tools: list_notes, read_note, backlinks, search. Scope is the session's
 active vault, its pulled vaults, and the shared vault; every file is read
 through notes.read_note, so every read passes the policy.
 
+Code read tools: list_files, read_code. Scope is the active repo minus its
+vault/ (the note tools cover that), read through the same policy, with caps
+on how much one call returns.
+
 Write tools: propose_note, propose_edit, propose_lesson write only to the
 queue, never to a vault or a repo. write_log creates one log file and commits
 it at once; logs are records, not decisions, so they need no approval.
@@ -18,13 +22,15 @@ from typing import NamedTuple
 
 from . import index, notes, queue
 from .apply import repo_for, vault_root
-from .vaultio import check_still_authorized, commit_path, open_dir_nofollow, restore_at, unstage, write_lock
+from .vaultio import (
+    check_still_authorized, commit_path, git, open_dir_nofollow, restore_at, unstage, write_lock,
+)
 from .links import Catalog, Match, link_scope, parse_link, resolve
 from .policy import Op, PolicyError, authorize
 from .queue import CommitFailed, DraftInvalid, ProposalError, ProposalTooLarge, Proposal
 from .registry import SHARED_NAME
 from .schema import SCHEMA
-from .session import Session
+from .session import Area, Session
 
 
 class RefError(LookupError):
@@ -161,6 +167,128 @@ def search(session: Session, query: str, limit: int = 20) -> list[SearchHit]:
             ranked.append((hit.rank, vault, hit.rel_path, hit.snippet))
     ranked.sort(key=lambda r: r[0])
     return [SearchHit(vault, rel, snippet) for _, vault, rel, snippet in ranked[:limit]]
+
+
+# Reading code -------------------------------------------------------------------------
+
+MAX_FILES = 2000
+MAX_LINES = 2000
+MAX_CHARS = 200_000  # per read_code call, so one minified file can't return megabytes on one line
+BINARY_SNIFF = 8192
+
+
+class ReadError(Exception):
+    """A code read was refused: not a file, binary, out of range, or a vault path."""
+
+
+class FileList(NamedTuple):
+    files: list[str]  # repo-relative, "/"-separated, sorted
+    truncated: bool  # more paths matched than MAX_FILES
+
+
+class CodeChunk(NamedTuple):
+    path: str  # repo-relative
+    start_line: int
+    end_line: int  # inclusive; start_line - 1 when nothing was returned
+    total_lines: int
+    text: str
+    next_start_line: int | None  # where the next page starts, or None at the end of the file
+
+
+def _vault_rel(session: Session) -> str:
+    return os.path.relpath(session.active_vault, session.active_repo).replace(os.sep, "/")
+
+
+def _in_vault(rel: str, vault_rel: str) -> bool:
+    return rel == vault_rel or rel.startswith(vault_rel + "/")
+
+
+def _repo_target(session: Session, rel_path: str, what: str):
+    """Authorize READ of ``rel_path`` in the active repo, refusing paths that land in a vault."""
+    if not isinstance(rel_path, str) or os.path.isabs(rel_path):
+        raise ReadError(f"{what} {rel_path!r} must be a path relative to the repo root")
+    auth = authorize(session.active_repo / rel_path, Op.READ, session)
+    if auth.area is not Area.ACTIVE_REPO:
+        where = f"the {auth.vault} vault" if auth.vault else auth.area.value
+        raise ReadError(f"{rel_path!r} is in {where}; vault notes are read with read_note and list_notes")
+    return auth
+
+
+def list_files(session: Session, subdir: str = "") -> FileList:
+    """The active repo's files, as git sees them: tracked plus untracked, minus .gitignore'd, minus vault/.
+
+    At most MAX_FILES paths; ``truncated`` says the list was cut short.
+    """
+    repo = session.active_repo
+    subdir = (subdir or "").strip()
+    pathspec: list[str] = []
+    if subdir not in ("", ".", "/"):
+        auth = _repo_target(session, subdir.rstrip("/"), "subdir")
+        pathspec = ["--", auth.rel] if auth.rel else []
+    out = git(repo, "--literal-pathspecs", "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+              *pathspec)
+    vault_rel = _vault_rel(session)
+    files: list[str] = []
+    truncated = False
+    for rel in sorted({p for p in out.split("\0") if p}):
+        if _in_vault(rel, vault_rel) or not os.path.lexists(repo / rel):
+            continue  # notes have their own tools; a deleted-but-staged path can't be read
+        try:
+            authorize(repo / rel, Op.READ, session)
+        except PolicyError:
+            continue  # list only what read_code would let you read
+        if len(files) == MAX_FILES:
+            truncated = True
+            break
+        files.append(rel)
+    return FileList(files, truncated)
+
+
+def read_code(session: Session, rel_path: str, start_line: int | None = None,
+              end_line: int | None = None) -> CodeChunk:
+    """Lines ``start_line``..``end_line`` (1-based, inclusive) of a text file in the active repo.
+
+    At most MAX_LINES lines and MAX_CHARS characters per call; page with
+    ``next_start_line``. Binary files (a NUL byte in the first 8 KB) are refused.
+    """
+    auth = _repo_target(session, rel_path, "rel_path")
+    start = 1 if start_line is None else start_line
+    if start < 1:
+        raise ReadError(f"start_line is {start}; lines are numbered from 1")
+    if end_line is not None and end_line < start:
+        raise ReadError(f"end_line {end_line} is before start_line {start}")
+    last = start + MAX_LINES - 1 if end_line is None else min(end_line, start + MAX_LINES - 1)
+
+    try:
+        f = open(auth.path, "rb")
+    except IsADirectoryError:
+        raise ReadError(f"{auth.rel} is a folder; use list_files") from None
+    except FileNotFoundError:
+        raise ReadError(f"{auth.rel} doesn't exist; use list_files to see what's there") from None
+    with f:
+        if not os.path.isfile(auth.path):
+            raise ReadError(f"{auth.rel} is not a regular file")
+        if b"\0" in f.read(BINARY_SNIFF):
+            raise ReadError(f"{auth.rel} looks binary (a NUL byte in its first {BINARY_SNIFF} bytes), so it isn't returned")
+        f.seek(0)
+        kept: list[str] = []
+        chars = 0
+        cut = False
+        total = 0
+        for total, raw in enumerate(f, start=1):
+            if start <= total <= last and not cut:
+                line = raw.decode("utf-8", errors="replace")
+                if chars + len(line) > MAX_CHARS:
+                    if not kept:  # one line longer than the cap: return its head
+                        kept.append(line[:MAX_CHARS] + "\n[line cut at the character cap]\n")
+                    cut = True
+                    continue
+                kept.append(line)
+                chars += len(line)
+    if total and start > total:
+        raise ReadError(f"start_line {start} is past the end of {auth.rel} ({total} lines)")
+    end = start + len(kept) - 1
+    return CodeChunk(auth.rel, start, end, total, "".join(kept), end + 1 if end < total else None)
 
 
 # Proposing ----------------------------------------------------------------------------

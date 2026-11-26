@@ -21,18 +21,21 @@ Every commit uses these names. Don't invent alternatives.
 daedalus/
 ├── CLAUDE.md                 # this file
 ├── CONTEXT.md                # running log, key decisions, Up Next
-├── pyproject.toml            # hatchling build, src/ layout; runtime dep pyyaml, dev dep pytest
+├── pyproject.toml            # hatchling build, src/ layout; runtime deps pyyaml, fastmcp (pinned); dev dep pytest
 ├── uv.lock
 ├── config/
 │   └── vaults.example.toml   # shape of ~/.config/daedalus/vaults.toml
 ├── scripts/
 │   └── smoke_read.py         # live read-layer smoke test against the real registry
 ├── src/daedalus/
+│   ├── mcp_server.py         # daedalus-mcp: the stdio MCP server for the Claude desktop app
 │   ├── queue_cli.py          # stopgap approval CLI (list/diff/apply/reject) until commit 5's REPL
+│   ├── state.py              # `python -m daedalus.state` entry point (logic in core/state.py)
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
 │       ├── registry.py       # vaults.toml loading + validation (RegistryError)
 │       ├── session.py        # Session dataclass, Area enum
+│       ├── state.py          # state.json -> Session (load_session, save_state, StateError) + stopgap CLI
 │       ├── policy.py         # Op enum, authorize(), authorize_command(): the seven rules
 │       ├── notes.py          # frontmatter parsing + schema validation (NoteSchemaError)
 │       ├── links.py          # wikilink extraction + Obsidian-style resolution
@@ -41,13 +44,14 @@ daedalus/
 │       ├── vaultio.py        # write lock, fd-relative file ops, path-limited git commits
 │       ├── queue.py          # proposal queue (SQLite, WAL) + crash reconciliation
 │       ├── apply.py          # apply, reject, pending, recent_rejections, diff
-│       └── tools.py          # read tools; propose_note/edit/lesson; write_log
+│       └── tools.py          # note read tools; list_files/read_code; propose_note/edit/lesson; write_log
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
 │   └── shared-vault/         # copied to create ~/daedalus/shared/
 └── tests/
     ├── test_templates.py     # template contract test
-    └── core/                 # one file per core part, test_bench.py, test_write_integrity.py
+    ├── core/                 # one file per core part, test_bench.py, test_write_integrity.py
+    └── mcp/                  # daedalus-mcp via FastMCP's in-memory client, plus a stdio subprocess test
 ```
 
 Run the tests with `uv run pytest`.
@@ -72,7 +76,7 @@ Every read and write goes through `daedalus.core.policy.authorize(path, op, sess
 6. **Code.** `WRITE_CODE` only in the worktree, never in your own checkout.
 7. **Commands.** `authorize_command(argv, allowlist)`: `argv[0]`'s basename must be allowlisted.
 
-The `Session` is passed in explicitly; core never reads `state.json`.
+The `Session` is passed in explicitly to every core function. Only `daedalus.core.state` reads `~/.config/daedalus/state.json` (`{"active": "scratch", "pulled": []}`), and only front ends call it: `load_session()` builds a Session or raises `StateError` saying how to fix it; `save_state()` validates against the registry, then writes atomically. `python -m daedalus.state show | set-active <name> | pull <name> | drop <name>` is the stopgap until commit 6's `/vault` and `/pull`.
 
 ## Search index
 
@@ -122,3 +126,26 @@ The commit message is `agent(<source>): <summary>`, a blank line, then the trail
 **Crash recovery.** Every queue open reconciles `applying` records whose apply isn't running; "not running" means the write lock is free. If a commit with the proposal's `Daedalus-Change` trailer exists, the record is marked `applied` with that sha. Otherwise the old content is restored (or a create removed), the path unstaged, and the record marked `failed` with reason `interrupted`. A file changed after the crash is left alone.
 
 A refused write leaves every vault's digest, every repo's HEAD, and the queue unchanged; `tests/core/test_write_integrity.py` checks this for every refusal path.
+
+## daedalus-mcp
+
+The MCP server for the Claude desktop app, in `src/daedalus/mcp_server.py` (FastMCP, pinned in `pyproject.toml`), run over stdio as `daedalus-mcp`. It's a thin layer over `daedalus.core`: every tool goes through the same session, path policy, and queue.
+
+**The exact tool set.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`. Nothing else: never `apply`, `reject`, `propose_edit`, `write_log`, or anything touching queue state. `tests/mcp/test_server.py::test_exact_tool_set` fails if a tool is added or removed.
+
+- **The server sets `source="claude"`.** `propose_note` has no `source` parameter, and its input schema refuses extra arguments. With the source rule, a draft saying `source: human` is refused, so Claude can't present its work as the human's.
+- **Never write to stdout.** Over stdio, stdout carries only JSON-RPC; one stray `print()` corrupts the stream. Logging goes to stderr and to `~/.local/state/daedalus/mcp.log`; the FastMCP banner is off. `test_stdout_is_only_json_rpc` runs the real script and parses every stdout line.
+- **The session is loaded on every tool call, never cached,** so `python -m daedalus.state set-active <name>` takes effect on Claude's next call without restarting the app.
+- **Refusals are tool errors, never crashes.** `PolicyError` becomes "Refused by rule N: <reason>. (path: ...)"; `NoteSchemaError`, `DraftInvalid` and other `ProposalError`s, `StateError`, `RegistryError`, `RefError`, and `ReadError` pass their messages through; anything else is logged with its traceback and returned as an internal error. Refusals are logged at INFO (FastMCP's own line for them is demoted to DEBUG), so ERROR in `mcp.log` always means a fault.
+- **Caps protect usage:** `read_code` returns at most 2,000 lines and 200,000 characters per call (page with `start_line`), `list_files` and `list_notes` at most 2,000 entries, `search` at most 50 hits. `read_code` refuses binary files (a NUL byte in the first 8 KB) and anything outside the active repo area, including its `vault/`.
+
+The desktop app's entry, merged into `~/Library/Application Support/Claude/claude_desktop_config.json` under `mcpServers` with absolute paths (the app doesn't expand `~`):
+
+```json
+"daedalus": {
+  "command": "/opt/homebrew/bin/uv",
+  "args": ["--directory", "/Users/<you>/code/daedalus", "run", "daedalus-mcp"]
+}
+```
+
+`daedalus-mcp --registry <toml> --state <json> --log-file <path>` overrides the defaults; tests use these.
