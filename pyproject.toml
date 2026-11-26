@@ -5,10 +5,15 @@ description = "Personal knowledge-graph and agent system built on Obsidian."
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp==4.2.6",
+    "keyring>=25.7.0",
+    "openai>=3.59.0",
+    "prompt-toolkit>=3.0.53",
     "pyyaml",
+    "rich>=15.0.0",
 ]
 
 [project.scripts]
+daedalus = "daedalus.terminal.repl:main"
 daedalus-mcp = "daedalus.mcp_server:main"
 
 [project.optional-dependencies]

@@ -17,10 +17,12 @@ from typing import Any
 import pytest
 from fastmcp import Client
 
-_spec = importlib.util.spec_from_file_location("core_conftest", Path(__file__).parents[1] / "core" / "conftest.py")
-core_conftest = importlib.util.module_from_spec(_spec)
-sys.modules["core_conftest"] = core_conftest
-_spec.loader.exec_module(core_conftest)
+if "core_conftest" not in sys.modules:  # tests/terminal loads it the same way
+    _spec = importlib.util.spec_from_file_location("core_conftest", Path(__file__).parents[1] / "core" / "conftest.py")
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules["core_conftest"] = _mod
+    _spec.loader.exec_module(_mod)
+core_conftest = sys.modules["core_conftest"]
 
 # Fixtures (autouse ones included) apply here once they're names in this conftest.
 _index_cache = core_conftest._index_cache

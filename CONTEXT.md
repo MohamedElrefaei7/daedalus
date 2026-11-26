@@ -58,6 +58,38 @@
 - Live check, run from a Claude Code chat in the desktop app. `mcp.log` confirms every call went through daedalus-mcp. Claude showed the scope (scratch active, nothing pulled), listed the scratch and shared notes, quoted `red-test-first`, and showed the scratch `README.md`. Asked to add "always use tabs" to shared `practices/`, it reported "Refused by rule 2: PROPOSE in the shared vault is allowed only in: inbox/" and queued nothing. It proposed `scratch:inbox/hello-from-claude.md` (type concept, `shared_refs: ["[[red-test-first]]"]`), which `queue_cli list` showed as `(claude)`; it was rejected with "live check: rejecting on purpose".
 - The live log showed FastMCP logging every refusal as `ERROR Error calling tool`. Refusals now raise `ToolError(..., log_level=DEBUG)`, so a refusal appears once, at INFO, and only real faults appear at ERROR. `test_refusals_are_not_logged_as_errors` failed before the change.
 
+### 2026-11-25 — Commit 5: terminal REPL, DeepSeek streaming, token meter, spend caps
+
+- `daedalus [project]` (`daedalus.terminal.repl:main`) is a plain REPL: `prompt_toolkit` input, `rich` `Live` output, and `/cost`, `/pending`, `/diff`, `/approve`, `/reject`, `/help`, `/quit`.
+  - A DeepSeek agent answers using the eight daedalus tools; `propose_note` carries `source="deepseek"`.
+  - `queue_cli` stays as a debug tool.
+- **The key is in the macOS Keychain** (`keyring`, service `daedalus`, account `deepseek`), with a `DEEPSEEK_API_KEY` override. `python -m daedalus.secrets set|status`.
+- **Modules:**
+  - `terminal/pricing.py`: the price table (`checked: 2026-11-25`), peak windows in UTC.
+  - `terminal/ledger.py`: `ledger.sqlite`, WAL, worst-case reservations.
+  - `terminal/deepseek.py`: OpenAI SDK, streaming, retries.
+  - `terminal/meter.py`: estimates, caps, the meter line, interrupted calls.
+  - `terminal/prompts.py`: the byte-stable system prompt.
+  - `terminal/agent.py`: tools, a 12-round loop, `reasoning_content` kept.
+  - `terminal/config.py`.
+- The tool bodies moved from `mcp_server.py` into `daedalus.toolset`, shared by both front ends. A test checks that the agent's argument names match daedalus-mcp's.
+- **Tests:** 587 in total, 87 new in `tests/terminal/`. They replay recorded SSE streams through `httpx2.MockTransport`, with an in-memory keyring; nothing reaches the network.
+- **Proved red five ways:**
+  1. The streamed estimate as the final number fails the snap test (`300 == 512`).
+  2. Pricing everything off-peak fails the peak-is-double tests.
+  3. Checking the cap after the request fails all four cap tests (the transport received a request).
+  4. Stripping `reasoning_content` fails the pass-back test (`KeyError: 'reasoning_content'`).
+  5. Building the prompt from a `set` fails the cross-process test, where eight hash seeds gave two different prompts. Two assemblies in one process stayed identical, as expected.
+- **Two real bugs found by the tests:**
+  - Float sums of `cost_usd` crossed a cap they shouldn't (15 × $0.20 = 3.0000000000000004 > 3.00); caps now compare at nanodollar resolution.
+  - `executescript()` would have committed the ledger's schema transaction early; the DDL now runs statement by statement.
+- **Live check** (off-peak, 04:45 UTC, `deepseek-flash`):
+  - The first question ran `get_scope`, `read_note red-test-first`, and `backlinks`, then quoted the practice correctly and found `one-commit-one-change`.
+  - Meter lines (billed): `↑ 2,869 (0 cached) ↓ 66`, then `↑ 3,295 (2,816 cached) ↓ 51 (reasoning 5)`, then `↑ 3,397 (3,200 cached) ↓ 204`.
+  - The second question started at `↑ 3,627 (3,456 cached)` and proposed `scratch:inbox/deepseek-hello.md` with `source: deepseek`. It was rejected from the REPL with `/pending`, `/diff`, and `/reject`.
+  - Six calls cost $0.001744 in the ledger. DeepSeek reported 10.00 USD both before and after, because the balance has two decimals and the spend was under a cent.
+  - The key appears in none of the 473 files under the state and config dirs, the repo (minus `.venv`), and both vault repos.
+
 ## Key decisions
 
 - ★ **One schema, in `daedalus.core.schema`.** `SCHEMA` moved out of `tests/test_templates.py`, which now imports it, so one dict guards both the templates and live notes.
@@ -83,7 +115,18 @@
 - **Refusals are tool errors.** `PolicyError` reads "Refused by rule N: <reason>"; schema, state, registry, ref, and read errors pass their messages through; anything unexpected is logged with its traceback and returned as an internal error. The server keeps running. A refusal is logged once at INFO, never at ERROR: ERROR in `mcp.log` means a real fault.
 - **`read_note` over MCP returns invalid notes with their schema errors** instead of refusing them, so Claude can see and explain a broken note. Schema errors on drafts still refuse the proposal.
 - **Code tools read only the active repo area.** A path that resolves into any vault is refused with a pointer to the note tools; `list_files` lists only what `read_code` would let you read.
-- ★ **queue_cli is a stopgap.** Every command is one call into `daedalus.core`, so commit 5's REPL replaces it by calling the same functions.
+- ★ **The DeepSeek key lives in the macOS Keychain, never in a file.** `DEEPSEEK_API_KEY` overrides it for tests and CI. No key means no client and no request.
+- ★ **Prices in one table with a `checked` date; all time math in UTC.** Peak is 01:00–04:00 and 06:00–10:00 UTC on weekdays, half-open, at double the off-peak rate. A call is priced at its start time. The daily cap resets at 00:00 UTC.
+- ★ **Chinese public holidays can't be known here, so weekday peak windows are always peak.** DeepSeek bills holidays off-peak; this overestimates then, the safe direction for a cap.
+- ★ **The ledger is the single source of truth for caps.** The cap check and a worst-case reservation row are one SQLite transaction, so two terminals can't both spend the same headroom (a 20-process race test lets exactly 15 × $0.20 through a $3.00 day). The reservation settles to billed usage, to an estimate if interrupted, or is deleted if DeepSeek never answered with a stream. A killed process leaves the worst case counted.
+- ★ **Worst case before every call:** all input a cache miss, all of `max_tokens` used, at the current rate. Refused before any network I/O, naming the cap.
+- ★ **Interrupted streams are recorded as estimated** and count toward the caps: a stopped stream may have been billed.
+- ★ **`reasoning_content` is passed back,** because DeepSeek returns 400 without it on tools requests. It bills as input on every later call, so `reasoning_effort` defaults to `low` and is sent on every request, along with `max_tokens` (8,000).
+- ★ **The system prompt is byte-identical across calls:** a fixed preamble, the shared `AGENTS.md`, then the project's. No timestamps, no set iteration. The live check showed the shared prefix caching from the second call on.
+- **The agent tools are daedalus-mcp's tools** (`daedalus.toolset`), with `source="deepseek"` set in code. The schemas refuse extra arguments, so a `source` the model invents is refused. Results are capped at 60,000 characters, with at most 12 tool rounds per turn. Refusals go back to the model; `read_note` schema errors are also shown to the user.
+- **A failed turn is rolled back out of history** (a cap, an API error, Ctrl-C), so the next turn never sends a half-finished tool exchange.
+- **Unknown keys in `config.toml` are errors,** so a misspelled cap can't silently fall back to the default.
+- ★ **queue_cli is a stopgap.** Every command is one call into `daedalus.core`. Since commit 5 the REPL's `/pending`, `/diff`, `/approve`, and `/reject` call the same functions, and `queue_cli` stays as a debug tool.
 - **templates/ is not notes.** One walk skips the vault's top-level `templates/` for every read tool, so the tools can't disagree about what a note is. An explicit `vault:templates/x.md` read still works.
 - ★ **FTS5 is required.** `require_fts5()` fails with a clear message, and a test asserts FTS5 is present.
 - ★ **Naming contract.** CLI `daedalus`; package `daedalus` with the safety core in `daedalus.core`; MCP server `daedalus-mcp`; global config `~/.config/daedalus/`; per-vault runtime state `.daedalus/` (git-ignored); shared vault `~/daedalus/shared/`.
@@ -98,7 +141,7 @@
 
 ## Up Next
 
-Commit 5: REPL with DeepSeek streaming, token meter, and caps.
+Commit 6: project lifecycle — /new, /vault, /pull, /end, CONTEXT.md in session context.
 
 Commit 10: rule 7 must refuse program paths containing / and pin allowed programs to resolved locations; basename matching lets /tmp/evil/pytest through.
 

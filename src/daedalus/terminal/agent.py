@@ -1,0 +1,229 @@
+"""The DeepSeek agent: the eight daedalus tools and the tool-calling loop for one user turn.
+
+* Exactly the eight tools in daedalus.toolset.NAMES. None takes a source:
+  propose_note is called with source="deepseek" here, never by the model.
+* Each tool result is capped at 60,000 characters, with a note when cut.
+* At most 12 tool rounds per user turn; then the turn stops and says so.
+* Refusals (PolicyError and friends) go back to the model as the tool
+  result, naming the rule, so it can adjust. They don't end the turn.
+* Schema errors that read_note reports are also surfaced to the user.
+* Every assistant message keeps its reasoning_content, which DeepSeek
+  requires on later requests that carry tools.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from daedalus import toolset
+from daedalus.core.session import Session
+
+from .config import Config
+from .deepseek import DeepSeek, Reply
+from .meter import Meter, Reading, metered_call, render
+from .prompts import system_prompt
+
+SOURCE = "deepseek"
+MAX_TOOL_ROUNDS = 12
+MAX_RESULT_CHARS = 60_000
+
+log = logging.getLogger("daedalus.terminal")
+
+_STR = {"type": "string"}
+_OPT_STR = {"type": "string"}  # optional: left out of "required"; a null the model sends is dropped
+_OPT_INT = {"type": "integer"}
+
+# JSON Schemas for the tool arguments. Property names match daedalus-mcp's
+# (a test compares them), and none of them is "source".
+PARAMETERS: dict[str, dict[str, Any]] = {
+    "get_scope": {"type": "object", "properties": {}},
+    "list_notes": {"type": "object", "properties": {
+        "folder": {**_OPT_STR, "description": "top-level folder, e.g. 'decisions'"},
+        "type": {**_OPT_STR, "description": "note type, e.g. 'practice'"},
+        "status": {**_OPT_STR, "description": "draft, proposed, accepted, superseded, or INVALID"},
+    }},
+    "read_note": {"type": "object", "properties": {
+        "ref": {**_STR, "description": "'vault:path/to/note.md' or a bare wikilink target"},
+    }, "required": ["ref"]},
+    "search": {"type": "object", "properties": {
+        "query": {**_STR, "description": "full-text query"},
+        "limit": {"type": "integer", "description": f"max hits, default 20, capped at {toolset.MAX_SEARCH}"},
+    }, "required": ["query"]},
+    "backlinks": {"type": "object", "properties": {
+        "ref": {**_STR, "description": "the note, named like read_note's ref"},
+    }, "required": ["ref"]},
+    "list_files": {"type": "object", "properties": {
+        "subdir": {**_STR, "description": "repo-relative folder; empty for the whole repo"},
+    }},
+    "read_code": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "repo-relative file path"},
+        "start_line": {**_OPT_INT, "description": "1-based first line"},
+        "end_line": {**_OPT_INT, "description": "1-based last line, inclusive"},
+    }, "required": ["rel_path"]},
+    "propose_note": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "path in the vault, e.g. 'inbox/idea.md'"},
+        "content": {**_STR, "description": "the whole note"},
+        "summary": {**_STR, "description": "one line, at most 200 characters"},
+        "vault": {**_OPT_STR, "description": "'shared' for the shared inbox; omit for the active project"},
+    }, "required": ["rel_path", "content", "summary"]},
+}
+for _schema in PARAMETERS.values():
+    _schema["additionalProperties"] = False
+
+# The tools array, built once in a fixed order: it's part of the cached prefix.
+TOOLS: list[dict[str, Any]] = [
+    {"type": "function", "function": {
+        "name": name, "description": toolset.description(name, SOURCE), "parameters": PARAMETERS[name],
+    }}
+    for name in toolset.NAMES
+]
+
+
+def call_tool(session: Session, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Run one tool. source is fixed here; the model can't pass it (the schemas refuse extras)."""
+    if name == "propose_note":
+        return toolset.propose_note(session, SOURCE, args["rel_path"], args["content"], args["summary"],
+                                    args.get("vault"))
+    fn = getattr(toolset, name)
+    return fn(session, **args)
+
+
+def cap_result(text: str) -> str:
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    note = (f"\n[truncated: showing {MAX_RESULT_CHARS:,} of {len(text):,} characters. Narrow the request, "
+            "e.g. read_code with start_line/end_line or list_files with subdir.]")
+    return text[:MAX_RESULT_CHARS] + note
+
+
+@dataclass
+class ToolOutcome:
+    name: str
+    args: dict[str, Any]
+    ok: bool
+    text: str  # what goes back to the model
+    schema_errors: list[str] = field(default_factory=list)
+
+
+def run_tool(session: Session, name: str, raw_args: str) -> ToolOutcome:
+    """Execute one model tool call; every failure becomes a tool result, never an exception."""
+    if name not in toolset.NAMES:
+        return ToolOutcome(name, {}, False, f"Unknown tool {name!r}. Tools: {', '.join(toolset.NAMES)}.")
+    try:
+        args = json.loads(raw_args or "{}")
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be a JSON object")
+        args = {k: v for k, v in args.items() if v is not None}  # null means "not given"
+    except ValueError as e:
+        return ToolOutcome(name, {}, False, f"Arguments for {name} aren't valid JSON ({e}); send a JSON object.")
+    allowed = set(PARAMETERS[name]["properties"])
+    extra = sorted(set(args) - allowed)
+    missing = [k for k in PARAMETERS[name].get("required", []) if k not in args]
+    if extra or missing:
+        parts = []
+        if extra:
+            parts.append(f"unknown argument(s) {', '.join(extra)}")
+        if missing:
+            parts.append(f"missing {', '.join(missing)}")
+        return ToolOutcome(name, args, False, f"{name}: {'; '.join(parts)}. Allowed: {', '.join(sorted(allowed))}.")
+    try:
+        result = call_tool(session, name, args)
+    except Exception as e:
+        text = toolset.error_text(e)
+        if text is None:
+            log.exception("tool %s failed", name)
+            text = f"internal error in {name} ({type(e).__name__}: {e})"
+        return ToolOutcome(name, args, False, text)
+    errors = list(result.get("schema_errors") or []) if name == "read_note" else []
+    return ToolOutcome(name, args, True, cap_result(json.dumps(result, ensure_ascii=False)), errors)
+
+
+def tool_label(name: str, args: dict[str, Any]) -> str:
+    """The one-line form shown in the terminal: → read_note shared:practices/red-test-first.md"""
+    main = {"read_note": "ref", "backlinks": "ref", "search": "query", "list_files": "subdir",
+            "read_code": "rel_path", "list_notes": "folder"}.get(name)
+    if name == "propose_note":
+        target = f"{args.get('vault') or ''}:{args.get('rel_path', '')}".lstrip(":")
+        return f"→ propose_note {target}"
+    value = args.get(main) if main else None
+    return f"→ {name} {value}" if value else f"→ {name}"
+
+
+class Events:
+    """What the REPL shows. Every method is optional to override."""
+
+    def call_start(self) -> None: ...
+    def delta(self, kind: str, text: str) -> None: ...
+    def reading(self, reading: Reading) -> None: ...
+    def call_done(self, reply: Reply, reading: Reading) -> None: ...
+    def tool(self, outcome: ToolOutcome) -> None: ...
+    def schema_errors(self, ref: str, errors: list[str]) -> None: ...
+    def stopped(self, message: str) -> None: ...
+
+
+@dataclass
+class TurnResult:
+    answer: str
+    rounds: int  # tool rounds run
+    stopped: bool  # hit MAX_TOOL_ROUNDS
+
+
+class Agent:
+    """A conversation: the fixed system prompt, history, and the metered calls."""
+
+    def __init__(self, session: Session, ds: DeepSeek, cfg: Config, session_id: str,
+                 meter: Meter | None = None) -> None:
+        self.session = session
+        self.ds = ds
+        self.cfg = cfg
+        self.session_id = session_id
+        self.meter = meter or Meter()
+        self.system = system_prompt(session)
+        self.history: list[dict[str, Any]] = []
+
+    def messages(self) -> list[dict[str, Any]]:
+        return [{"role": "system", "content": self.system}, *self.history]
+
+    def turn(self, text: str, events: Events | None = None) -> TurnResult:
+        """Answer one user message, running tools as the model asks, at most MAX_TOOL_ROUNDS rounds.
+
+        If anything raises (a cap, an API error, an interrupt), the turn is
+        rolled back out of history so the next turn starts clean.
+        """
+        ev = events or Events()
+        mark = len(self.history)
+        self.history.append({"role": "user", "content": text})
+        try:
+            rounds = 0
+            while True:
+                ev.call_start()
+                reply, reading = metered_call(
+                    self.ds, self.meter, self.cfg, self.session_id, self.messages(), TOOLS,
+                    on_reading=ev.reading, on_delta=ev.delta,
+                )
+                ev.call_done(reply, reading)
+                log.info("session %s call: %s", self.session_id, render(reading))
+                self.history.append(reply.message())
+                calls = reply.ordered_tool_calls()
+                if not calls:
+                    return TurnResult(reply.content, rounds, False)
+                for call in calls:
+                    outcome = run_tool(self.session, call.name, call.arguments)
+                    log.info("session %s %s %s", self.session_id, tool_label(outcome.name, outcome.args),
+                             "ok" if outcome.ok else f"refused: {outcome.text.splitlines()[0][:200]}")
+                    ev.tool(outcome)
+                    if outcome.schema_errors:
+                        ev.schema_errors(str(outcome.args.get("ref", "")), outcome.schema_errors)
+                    self.history.append({"role": "tool", "tool_call_id": call.id, "content": outcome.text})
+                rounds += 1
+                if rounds >= MAX_TOOL_ROUNDS:
+                    message = (f"Stopped after {MAX_TOOL_ROUNDS} tool rounds without an answer. Ask again more "
+                               "narrowly, or say what to look at.")
+                    ev.stopped(message)
+                    return TurnResult(reply.content, rounds, True)
+        except BaseException:
+            del self.history[mark:]
+            raise

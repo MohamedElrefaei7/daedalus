@@ -387,7 +387,7 @@ def test_refusals_are_not_logged_as_errors(mcp, monkeypatch, caplog) -> None:
     caplog.set_level("DEBUG")
     run(refuse())
     assert [r for r in caplog.records if r.levelname == "ERROR"] == []
-    assert any(r.levelname == "INFO" and "refused propose_note: rule 2" in r.getMessage() for r in caplog.records)
+    assert any(r.levelname == "INFO" and "refused propose_note: Refused by rule 2" in r.getMessage() for r in caplog.records)
 
     caplog.clear()
     monkeypatch.setattr(tools, "list_notes", lambda *a, **k: 1 / 0)

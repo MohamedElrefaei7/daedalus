@@ -21,7 +21,7 @@ Every commit uses these names. Don't invent alternatives.
 daedalus/
 ├── CLAUDE.md                 # this file
 ├── CONTEXT.md                # running log, key decisions, Up Next
-├── pyproject.toml            # hatchling build, src/ layout; runtime deps pyyaml, fastmcp (pinned); dev dep pytest
+├── pyproject.toml            # hatchling build, src/ layout; deps pyyaml, fastmcp (pinned), openai, keyring, prompt_toolkit, rich
 ├── uv.lock
 ├── config/
 │   └── vaults.example.toml   # shape of ~/.config/daedalus/vaults.toml
@@ -29,8 +29,19 @@ daedalus/
 │   └── smoke_read.py         # live read-layer smoke test against the real registry
 ├── src/daedalus/
 │   ├── mcp_server.py         # daedalus-mcp: the stdio MCP server for the Claude desktop app
-│   ├── queue_cli.py          # stopgap approval CLI (list/diff/apply/reject) until commit 5's REPL
+│   ├── toolset.py            # the eight agent tools, shared by daedalus-mcp and the terminal agent
+│   ├── secrets.py            # API keys in the macOS Keychain (`python -m daedalus.secrets set|status`)
+│   ├── queue_cli.py          # debug CLI for the queue (list/diff/apply/reject); the REPL replaces it
 │   ├── state.py              # `python -m daedalus.state` entry point (logic in core/state.py)
+│   ├── terminal/             # `daedalus`: the REPL (commit 5; Textual UI in commit 14)
+│   │   ├── repl.py           # prompt_toolkit input, rich Live output, /commands; main() is the script
+│   │   ├── agent.py          # tool specs, the 12-round tool loop, reasoning_content kept in history
+│   │   ├── deepseek.py       # OpenAI SDK client for DeepSeek: streaming, accumulation, errors, retries
+│   │   ├── meter.py          # token estimates, worst-case cap check, the meter line, interrupted calls
+│   │   ├── ledger.py         # spend ledger (SQLite, WAL): reservations, spent(), caps
+│   │   ├── pricing.py        # the price table, peak windows (UTC), cost(), worst_case()
+│   │   ├── prompts.py        # the byte-stable system prompt
+│   │   └── config.py         # ~/.config/daedalus/config.toml: model, effort, max_tokens, caps
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
 │       ├── registry.py       # vaults.toml loading + validation (RegistryError)
@@ -51,7 +62,8 @@ daedalus/
 └── tests/
     ├── test_templates.py     # template contract test
     ├── core/                 # one file per core part, test_bench.py, test_write_integrity.py
-    └── mcp/                  # daedalus-mcp via FastMCP's in-memory client, plus a stdio subprocess test
+    ├── mcp/                  # daedalus-mcp via FastMCP's in-memory client, plus a stdio subprocess test
+    └── terminal/             # recorded SSE streams through httpx2.MockTransport; no live calls
 ```
 
 Run the tests with `uv run pytest`.
@@ -129,7 +141,7 @@ A refused write leaves every vault's digest, every repo's HEAD, and the queue un
 
 ## daedalus-mcp
 
-The MCP server for the Claude desktop app, in `src/daedalus/mcp_server.py` (FastMCP, pinned in `pyproject.toml`), run over stdio as `daedalus-mcp`. It's a thin layer over `daedalus.core`: every tool goes through the same session, path policy, and queue.
+The MCP server for the Claude desktop app, in `src/daedalus/mcp_server.py` (FastMCP, pinned in `pyproject.toml`), run over stdio as `daedalus-mcp`. It's a thin layer over `daedalus.core`: every tool goes through the same session, path policy, and queue. The tool bodies and descriptions live in `daedalus.toolset`, shared with the terminal agent.
 
 **The exact tool set.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`. Nothing else: never `apply`, `reject`, `propose_edit`, `write_log`, or anything touching queue state. `tests/mcp/test_server.py::test_exact_tool_set` fails if a tool is added or removed.
 
@@ -149,3 +161,37 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 ```
 
 `daedalus-mcp --registry <toml> --state <json> --log-file <path>` overrides the defaults; tests use these.
+
+## The terminal: `daedalus`
+
+`daedalus [project]` sets the active project (like `python -m daedalus.state set-active`), then starts a plain REPL: `prompt_toolkit` input with history, `rich` `Live` output. A DeepSeek agent answers with the daedalus tools. Commands: `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`. `queue_cli` stays as a debug tool. The REPL's session is fixed at start; commit 6 adds `/vault` and `/pull`.
+
+**The API key lives in the macOS Keychain,** through `keyring`: service `daedalus`, account `deepseek`, never in a file. `python -m daedalus.secrets set deepseek` stores it (via `getpass`), and `status` says whether one is present without printing it. `DEEPSEEK_API_KEY` overrides the Keychain, for tests and CI. With no key, `daedalus` exits saying how to set one, before any client exists.
+
+**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
+
+**Pricing** (`terminal/pricing.py`, one table with `checked: 2026-11-25`). USD per 1M tokens, off-peak; peak is double.
+
+| Model | Cache-hit input | Cache-miss input | Output |
+|---|---|---|---|
+| `deepseek-flash` | $0.003 | $0.15 | $0.60 |
+| `deepseek-v4-pro` | $0.022 | $0.66 | $1.98 |
+
+- **Peak** is 01:00–04:00 and 06:00–10:00 UTC, Monday to Friday. Each window is half-open: 04:00:00 is off-peak.
+- **All time math is in UTC.** The daily cap resets at 00:00 UTC.
+- **Chinese public holidays are off-peak** in DeepSeek's billing, but they can't be known here. A weekday in a peak window is always priced as peak, which overestimates on holidays: the safe direction for a cap.
+- **A call is priced at its start time.** Reasoning tokens are part of `completion_tokens` and bill as output.
+
+**Requests.** OpenAI SDK, `base_url="https://api.deepseek.com"`, `stream=True` with `stream_options={"include_usage": True}`. `max_tokens` (default 8,000) and `reasoning_effort` (default `low`) are set on every request, never left to the API defaults (64K and `high`). `thinking` is enabled explicitly, and `tool_choice` is `auto` (`required` is a 400 in thinking mode). 429 and 5xx retry twice with backoff; 400, 401, 402, and 422 surface as clear messages. **`reasoning_content` is passed back:** every assistant message in history keeps it, because DeepSeek returns 400 on a tools request without it. That passed-back reasoning bills as input on every later call, which is why the default effort is `low`.
+
+**Caps** (`~/.config/daedalus/config.toml`, defaults `session_cap_usd = 1.00`, `daily_cap_usd = 3.00`; an unknown key is an error). **Worst case before every call:**
+- The worst case assumes every input token is a cache miss and the full `max_tokens` is used, at the current period's rate. Input is estimated at 3.0 characters per token, then calibrated from the last call's billed `prompt_tokens`.
+- If `spent_session + worst_case > session_cap` or `spent_today + worst_case > daily_cap`, the call is refused before any network I/O, and the message names the cap.
+- The check and a worst-case reservation row are one SQLite transaction in `~/.local/state/daedalus/ledger.sqlite`. The ledger is the single source of truth, so two terminals share the daily cap.
+- The row then settles to the billed usage (`estimated = 0`), or is deleted if DeepSeek never answered with a stream (nothing was billed).
+
+**Interrupted streams are recorded as estimated.** On Ctrl-C, a dropped connection, or a stream with no usage chunk, the row settles to an estimate (`estimated = 1`): input all cache-miss, output from the streamed characters. It counts toward the caps: a stopped stream may still have been billed. A process killed mid-call leaves the worst-case reservation in place.
+
+**The meter.** While streaming, the line is an estimate (leading `~`), with reasoning shown separately. On the final chunk it snaps to the billed numbers, for example `↑ 12,480 (9,100 cached)   ↓ 312 (reasoning 180)   $0.0021 this call   $0.21 today   off-peak`.
+
+**The system prompt is byte-identical across calls:** a fixed preamble, then the shared vault's `AGENTS.md`, then the active project's. There are no timestamps or set iteration in it, because identical prefixes are what DeepSeek's cache hits on. A test compares it across processes with different hash seeds.
