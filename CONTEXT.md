@@ -246,8 +246,39 @@
   - an `ambiguous_link` row in the integrity table (40 rows).
   - Three commit-8 tests were updated for the new names.
 
+### 2026-11-26 — Commit 9: uploads via /add
+
+- **Dependency:** `markitdown[docx,pdf,pptx,xlsx]==0.1.9`, pinned exactly. Never `[all]`. Dev gained `reportlab` and `python-docx` to build fixtures at test time; no binaries are in the repo.
+- **`core/ingest.py`, `ingest(session, src_path) -> SourceNote`:**
+  1. Validate the path (realpath; a regular file; outside every vault, any `.git`, and the state folder; an allowed extension; at most 25 MB; never a URL) before any converter sees it.
+  2. Hash it (SHA-256). A `sources/` note already recording that hash is a refusal naming it.
+  3. Convert in memory: MarkItDown for .pdf/.docx/.pptx/.xlsx, a UTF-8 copy for .md/.txt. Hash again; a change meanwhile is a refusal.
+  4. Refuse under 50 non-whitespace characters ("no text layer — likely a scanned document; OCR isn't enabled") and over 2 MB of markdown.
+  5. Frontmatter is exactly `schema.SOURCE_KEYS`. The stem is the slugged title, with -2, -3… until it's unique across every registered vault.
+  6. One commit, `add: <original_name>`, as `USER_ACTION` into `sources/` through `apply_changes`.
+- **REPL `/add <file>`** (quoted, escaped, or plain paths with spaces) prints `→ added <ref> (N chars, from <name>)`, then "Agents can read this, and anything they read is sent to DeepSeek."
+- **Tests:** 782, 29 new (753 before): ingest 24, integrity rows +4 (`add_oversized`, `add_corrupt`, `add_scanned`, `add_duplicate`; 44 rows), REPL 1.
+- **Proved red three ways:**
+  1. Accepting empty conversions failed `test_scanned_pdf_is_refused_with_no_text_layer` ("DID NOT RAISE IngestError") and the `add_scanned` row.
+  2. Skipping the hash check failed `test_the_same_file_is_refused_the_second_time_even_renamed` ("DID NOT RAISE IngestError"), the `add_duplicate` row, and the REPL test.
+  3. Copying the original into `sources/` failed `test_the_original_never_enters_git` ("originals entered git: ['vault/sources/settings.xlsx', …, 'vault/sources/orig.pdf']"), 8 failures in all.
+- **MarkItDown 0.1.9, as found:**
+  - The constructor makes a `requests.Session` (unused for local paths) and auto-detects `exiftool` on PATH (not installed; only images and audio use it).
+  - Magika runs local ONNX type detection; the first converter takes about 0.9 s to build, so it's a lazy singleton.
+  - PDF output has no headings. pptx adds `<!-- Slide number: N -->`. xlsx gives a `## <sheet>` heading per sheet, escapes underscores, and prints integers as floats (365.0).
+  - A scanned PDF converts to empty text without error; a corrupt one raises `FileConversionException`. `result.title` is None.
+  - Icon-font glyphs come out as `(cid:N)` (pdfminer's unmapped-glyph marker): seen live.
+- **Live check** (scratch2): `/add` of a real two-page PDF (a résumé) committed `9d8c92b add: <name>.pdf`, one path, `vault/sources/<slug>.md`, 103 lines. With no heading in the PDF, the title fell back to the file stem. "Summarize this source and propose a concept note from it" gave a pending `inbox/` concept draft (`source: deepseek`) whose `related` cites the source by its bare stem. A second `/add` of the same file added nothing; the hash check names the existing note.
+
 ## Key decisions
 
+- ★ **Only the converted markdown enters git, never the original.** The SHA-256 and byte count identify it without storing it, and a test checks `git log --all` for any non-markdown path in `sources/`.
+- ★ **No converter sees an unvalidated path.** Realpath first; vaults, `.git`, the state folder, non-regular files, URLs, oversized files, and other extensions are refused before MarkItDown is built. MarkItDown runs with built-in local converters only: no plugins, no `llm_client`, no Document Intelligence, no URLs.
+- ★ **An empty conversion is a refusal, not a note.** A scanned PDF has no text layer, and an empty note would look like success. Markdown over 2 MB is refused, never truncated.
+- ★ **The same bytes are added once.** The duplicate check is by hash, so a renamed copy is refused too, naming the existing note. The file is hashed again after conversion, so a file changed meanwhile is refused.
+- ★ **`/add` writes through `apply_changes`, not a queue proposal.** It's a human action (`USER_ACTION`), and proposal content is capped at 256 KB, under the 2 MB markdown cap. It keeps every apply guarantee: the write lock, a stale check, a recorded change set, a path-limited commit, rollback, and reconciliation.
+- **Source stems are unique across every registered vault,** so a bare `[[stem]]` to a source can't be ambiguous (the commit-8 fix's link rule would refuse it).
+- **Source notes:** the title is the first markdown heading, else the file stem (`result.title` is ignored; it's None). .md and .txt are copied byte-for-byte after a UTF-8 check, with converter `copy`, and a .md file's own frontmatter is kept as body.
 - ★ **No design choice goes ahead without precedent or the human's answer.** Precedent is an accepted, schema-valid note in the active `decisions/` or the shared `practices/`, and nothing else: no drafts or proposed notes, no other folders, no pulled projects' decisions (promote those to a shared practice).
 - ★ **The four design categories are single-sourced** in `DESIGN_CATEGORIES`, and every `AGENTS.md`, template and live, is tested against them.
 - ★ **`ask_user` ends the agent's turn.** No model call follows it that turn. Other calls in the same reply get a "Not run" tool result, so the history stays a valid tool exchange. A refused `ask_user` doesn't end the turn.
@@ -341,10 +372,6 @@
 
 ## Up Next
 
-Commit 9: uploads via /add.
+Commit 10: coding loop on a git worktree (with rule 6 and 7 integrity rows and the pinned-program fix for rule 7).
 
 When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).
-
-Commit 10: rule 7 must refuse program paths containing / and pin allowed programs to resolved locations; basename matching lets /tmp/evil/pytest through.
-
-Commit 10: integrity-table rows for rules 6 and 7.

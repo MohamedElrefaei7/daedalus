@@ -28,6 +28,10 @@ SCHEMA = {
 # Every AGENTS.md names exactly these in its "Design choices" section; tests/test_templates.py checks.
 DESIGN_CATEGORIES = ("schema", "dependency", "interface", "data_source")
 
+# The frontmatter /add writes on a source note, in this order. sources/ is exempt from the typed schema
+# (a source is a converted document, not a note an agent writes), but ingest must write exactly these keys.
+SOURCE_KEYS = ("title", "original_name", "original_sha256", "original_bytes", "converter", "added", "source")
+
 # Frontmatter keys that hold lists of quoted wikilinks.
 LINK_KEYS = ("related", "shared_refs", "project_refs")
 

@@ -2,8 +2,8 @@
 
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
-Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /answer, /promote, /end, /cost, /pending, /diff,
-/approve, /reject, /help, /quit.
+Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /add, /answer, /promote, /end, /cost, /pending,
+/diff, /approve, /reject, /help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
@@ -26,6 +26,7 @@ from rich.text import Text
 from daedalus import secrets
 from daedalus.core import accept, queue
 from daedalus.core.apply import apply, diff, pending, reject
+from daedalus.core.ingest import ingest
 from daedalus.core.lifecycle import LifecycleError, new_project
 from daedalus.core.policy import Op, PolicyError, authorize
 from daedalus.core.registry import RegistryError, load_registry
@@ -51,6 +52,7 @@ HELP = """\
 /pull <name>           read another project too (read-only); /drop <name> stops
 /open <note>           show a note in Obsidian (vault:path/to/note.md, or a wikilink target)
 /here                  attach the note open in Obsidian to your next message
+/add <file>            convert a local .pdf/.docx/.pptx/.xlsx (or .md/.txt) into sources/ and commit it
 /answer <id> <n|text>  answer a design question: its option number, or your own answer in quotes
 /promote <note> [dir]  accept an inbox draft into the folder its type maps to (e.g. components/)
 /end                   propose a CONTEXT.md log entry for this session, review proposals, exit
@@ -281,6 +283,8 @@ class Repl:
                 self.console.print(f"opened {opened.vault}:{opened.rel_path} in Obsidian")
             elif name == "/here":
                 self.here()
+            elif name == "/add":
+                self.add(rest)
             elif name == "/answer":
                 change_id, _, answer = rest.partition(" ")
                 if not change_id or not answer.strip():
@@ -352,6 +356,22 @@ class Repl:
         self.attached = None  # a fresh conversation starts with nothing attached
         self.console.print(Text(f"Switched to {name}. Fresh conversation: history cleared, system prompt rebuilt "
                                 f"from {name}'s AGENTS.md and CONTEXT.md.", style="bold"))
+
+    # Sources ----------------------------------------------------------------------------
+
+    def add(self, rest: str) -> None:
+        """/add <file>: no model call. Quote or backslash-escape spaces; a dragged-in path works as is."""
+        if not rest:
+            raise ValueError("usage: /add <file>")
+        try:
+            words = shlex.split(rest)
+        except ValueError:
+            words = [rest]
+        path = words[0] if len(words) == 1 else rest  # an unquoted path with spaces
+        done = ingest(self.session, path)
+        self.console.print(Text(f"→ added {done.ref} ({done.chars:,} chars, from {done.original_name})",
+                                style="green"))
+        self.console.print(Text("Agents can read this, and anything they read is sent to DeepSeek.", style="yellow"))
 
     # Obsidian ---------------------------------------------------------------------------
 

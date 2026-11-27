@@ -2,7 +2,8 @@
 
 Every refusal path through a public write function (propose_note,
 propose_edit, propose_lesson, write_log, apply, reject, and since commit 8
-gate.propose_with_basis, answer_question, promote) is a row below. For
+gate.propose_with_basis, answer_question, promote, and since commit 9 ingest)
+is a row below. For
 each row, all four hold:
   1. the right error is raised;
   2. every vault's digest is unchanged (all files except .git/ and ignored files);
@@ -27,6 +28,7 @@ from test_apply import install_hook
 from daedalus.core import queue
 from daedalus.core.accept import PromoteError, answer_question, promote
 from daedalus.core.gate import GateRefused, propose_with_basis
+from daedalus.core.ingest import IngestError, ingest
 from daedalus.core.apply import apply, reject
 from daedalus.core.policy import PolicyError
 from daedalus.core.queue import (
@@ -259,6 +261,41 @@ def answer_unknown_question(w):
     return Case(lambda: answer_question(w.session, "0000000000zzzz", "1"), UnknownProposal)
 
 
+def _docs(w):
+    d = w.root / "docs"  # outside every vault
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def add_oversized(w):
+    import doc_fixtures
+
+    src = doc_fixtures.make_big(_docs(w) / "huge.pdf", 26 * 1024 * 1024)
+    return Case(lambda: ingest(w.session, src), IngestError)
+
+
+def add_corrupt(w):
+    import doc_fixtures
+
+    src = doc_fixtures.make_corrupt_pdf(_docs(w) / "broken.pdf")
+    return Case(lambda: ingest(w.session, src), IngestError)
+
+
+def add_scanned(w):
+    import doc_fixtures
+
+    src = doc_fixtures.make_scanned_pdf(_docs(w) / "scan.pdf")
+    return Case(lambda: ingest(w.session, src), IngestError)
+
+
+def add_duplicate(w):
+    import doc_fixtures
+
+    src = doc_fixtures.make_docx(_docs(w) / "design.docx")
+    ingest(w.session, src)  # the first add is setup
+    return Case(lambda: ingest(w.session, src), IngestError)
+
+
 CASES = [
     rule1_traversal_into_repo, rule1_traversal_outside, rule1_unpulled_vault, rule1_unregistered_vault,
     rule1_symlink_escape, rule1_reauth_unregistered_on_apply,
@@ -272,6 +309,7 @@ CASES = [
     create_over_existing, edit_missing, forged_trailer_summary,
     reject_without_reason,
     non_precedent_basis_in_proposal, promote_type_mismatch, answer_unknown_question,
+    add_oversized, add_corrupt, add_scanned, add_duplicate,
 ]
 
 

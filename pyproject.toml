@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastmcp==4.2.6",
     "keyring>=25.7.0",
+    "markitdown[docx,pdf,pptx,xlsx]==0.1.9",
     "openai>=3.59.0",
     "prompt-toolkit>=3.0.53",
     "pyyaml",
@@ -18,7 +19,7 @@ daedalus = "daedalus.terminal.repl:main"
 daedalus-mcp = "daedalus.mcp_server:main"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "reportlab", "python-docx"]
 
 [build-system]
 requires = ["hatchling"]

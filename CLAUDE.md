@@ -21,7 +21,7 @@ Every commit uses these names. Don't invent alternatives.
 daedalus/
 ├── CLAUDE.md                 # this file
 ├── CONTEXT.md                # running log, key decisions, Up Next
-├── pyproject.toml            # hatchling build, src/ layout; deps pyyaml, fastmcp (pinned), openai, keyring, prompt_toolkit, rich
+├── pyproject.toml            # hatchling build, src/ layout; deps pyyaml, fastmcp (pinned), openai, keyring, prompt_toolkit, rich, markitdown (pinned, 4 local extras)
 ├── uv.lock
 ├── config/
 │   └── vaults.example.toml   # shape of ~/.config/daedalus/vaults.toml
@@ -59,6 +59,7 @@ daedalus/
 │       ├── apply.py          # apply, apply_changes (several paths, one commit), reject, pending, diff
 │       ├── gate.py           # the design-decision gate: check_basis, find_precedent, propose_with_basis
 │       ├── accept.py         # ask_user's question, /answer, /promote
+│       ├── ingest.py         # /add: local documents into sources/ as markdown (MarkItDown)
 │       └── tools.py          # note read tools; list_files/read_code; propose_note/edit/lesson; write_log
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
@@ -173,7 +174,7 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 
 `daedalus [project]` sets the active project (like `python -m daedalus.state set-active`), then starts a plain REPL: `prompt_toolkit` input with history, `rich` `Live` output. A DeepSeek agent answers with the daedalus tools. Commands:
 - `/new <name> --repo <path>`, `/vaults`, `/vault <name>`, `/pull <name>`, `/drop <name>`, `/end`;
-- `/open <note>`, `/here`;
+- `/open <note>`, `/here`, `/add <file>`;
 - `/answer <question-id> <option-number | "free text">`, `/promote <inbox-note> [folder]`;
 - `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
 
@@ -361,3 +362,42 @@ The inbox deletion is authorized as `PROPOSE` (inbox is where drafts live), and 
    - otherwise every path still holding our content is restored, and a path changed since is left alone.
 
 Plan approval in commit 12 will reuse this to write several decision notes at once.
+
+## Uploads: `/add`
+
+`/add <file>` (`daedalus.core.ingest.ingest`) converts a local document to markdown, saves it as `sources/<slug>.md` in the active vault, and commits it as `add: <original_name>`. It calls no model; the agent reads the note with `read_note` like any other. The REPL prints `→ added <vault>:sources/<slug>.md (N chars, from <name>)`, then the data rule: "Agents can read this, and anything they read is sent to DeepSeek."
+
+**Allowed extensions:** `.pdf`, `.docx`, `.pptx`, `.xlsx` are converted, and `.md` and `.txt` are copied as-is after a UTF-8 check. Anything else is refused before conversion.
+
+**Local-only conversion.**
+- **The package:** `markitdown[pdf,docx,pptx,xlsx]==0.1.9`, pinned, and never `[all]`: the other extras (Document Intelligence, audio and YouTube transcription, …) reach web services.
+- **The converter:** one `MarkItDown(enable_plugins=False)`, created on first use. It's called only as `convert_local(path)`, reading `result.markdown`. It never gets a URL, an `llm_client`, or a `docintel_endpoint`.
+- **Path checks first.** MarkItDown does I/O with this process's privileges, and its README warns against passing untrusted input to it directly, so the path is checked before the converter ever sees it:
+  - it resolves with `realpath`;
+  - it's a regular file, not a directory, device, or FIFO;
+  - it's outside every registered vault, any `.git`, and `~/.local/state/daedalus`;
+  - it's at most 25 MB;
+  - a `scheme://` URL is refused.
+- **Hashed twice.** The file is hashed before and after conversion, and refused if it changed in between.
+
+**The checks, in order:**
+1. **Duplicates.** The original's SHA-256 is checked against the `original_sha256` of every note in the active `sources/`. A match is refused and named, so renaming a file doesn't get it in twice.
+2. **No text layer.** A result with fewer than 50 non-whitespace characters is refused: "no text layer — likely a scanned document; OCR isn't enabled". A scanned PDF converts to empty text with no error, and an empty note would look like success.
+3. **Size.** Markdown over 2 MB is refused, never truncated.
+
+**`SOURCE_KEYS`** (`daedalus.core.schema`) are exactly the frontmatter `/add` writes, in this order:
+- `title`: the first markdown heading, else the filename stem;
+- `original_name`
+- `original_sha256`
+- `original_bytes`
+- `converter`: `markitdown <version>`, or `copy` for `.md` and `.txt`;
+- `added`: today's local date, quoted;
+- `source: human`
+
+`sources/` stays exempt from the typed schema and the link rule.
+
+**The original never enters git.** Only the converted markdown is committed; the hash identifies the original without storing it, so PDFs and decks don't bloat every clone.
+
+**Names.** The stem is the slugged title, with `-2`, `-3` … until it matches no note stem in any registered vault, so a bare link to it is never ambiguous.
+
+**The write** is one path through `apply.apply_changes`, as `USER_ACTION` into `sources/`, so it carries apply's guarantees: the lock, the stale check, the atomic write, the path-limited commit, rollback, and crash reconciliation. It uses `apply_changes` rather than a queue proposal because a proposal's content is capped at 256 KB, and `/add` is a direct human action.
