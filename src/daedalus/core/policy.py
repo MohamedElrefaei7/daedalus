@@ -12,7 +12,8 @@ Rules (the number is PolicyError.rule):
      and anything inside <worktree>/vault/.
   5. Active vault writes, per op (see ACTIVE_VAULT_ALLOW). Never AGENTS.md or templates/.
   6. WRITE_CODE only in the worktree, never in your own checkout.
-  7. Commands: argv[0]'s basename must be on the allowlist.
+  7. Commands: argv[0] is a bare name on the project's allow list, and runs only
+     as <venv>/bin/<name>; the host's PATH never matters.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Protocol
 
 from .session import Area, Session
 
@@ -170,15 +171,48 @@ def _check_area(area: Area, op: Op, rel: str, raw: str, real: str) -> None:
     raise PolicyError(1, real, f"no rule allows {op.name} in {area.value}")
 
 
-def authorize_command(argv: list[str], allowlist: set[str]) -> None:
-    """Rule 7: allow ``argv`` only if its program's basename is allowlisted."""
-    if isinstance(argv, (str, bytes)) or not argv:
-        raise PolicyError(7, "", "command must be a non-empty argv list")
-    prog = argv[0]
-    if not isinstance(prog, str) or not prog:
-        raise PolicyError(7, str(prog), "argv[0] must be a non-empty string")
-    base = os.path.basename(prog)
-    if base not in allowlist:
-        has_sep = os.sep in prog or (os.altsep is not None and os.altsep in prog)
-        what = "a path to a command" if has_sep else "command"
-        raise PolicyError(7, prog, f"{what} {base!r} is not on the allowlist ({', '.join(sorted(allowlist)) or 'empty'})")
+class CommandConfig(Protocol):
+    """What rule 7 needs from a project's daedalus.toml (daedalus.sandbox.config.ProjectConfig)."""
+
+    @property
+    def allow(self) -> Iterable[str]: ...
+
+
+def check_argv(argv: object, config: CommandConfig) -> str:
+    """Rule 7's checks that need no venv: the argv's shape, and the program's name. Returns the name."""
+    if isinstance(argv, (str, bytes)) or not isinstance(argv, (list, tuple)):
+        raise PolicyError(7, "", "a command must be an argv list, never a string for a shell")
+    if not argv:
+        raise PolicyError(7, "", "a command must be a non-empty argv list")
+    for i, arg in enumerate(argv):
+        if not isinstance(arg, str):
+            raise PolicyError(7, repr(arg), f"argv[{i}] is a {type(arg).__name__}, not a string")
+        if "\0" in arg:
+            raise PolicyError(7, arg.replace("\0", "\\0"), f"argv[{i}] contains a NUL byte")
+    name = argv[0]
+    allow = sorted(set(config.allow))
+    if not name:
+        raise PolicyError(7, "", "argv[0] must name a program")
+    if "/" in name or (os.altsep is not None and os.altsep in name):
+        raise PolicyError(7, name, "argv[0] must be a bare program name, not a path; allowed programs run "
+                                   f"only from the project venv ({', '.join(allow) or 'none allowed'})")
+    if name not in allow:
+        raise PolicyError(7, name, f"program {name!r} isn't in this project's daedalus.toml allow list "
+                                   f"({', '.join(allow) or 'empty'})")
+    return name
+
+
+def authorize_command(argv: object, config: CommandConfig, venv: str | os.PathLike[str]) -> Path:
+    """Rule 7: ``argv`` may run only as the pinned program ``<venv>/bin/<argv[0]>``, which is returned.
+
+    The name must be bare and allowed. It resolves only inside the venv, so the
+    host's PATH never matters and /tmp/evil/pytest is unreachable. The path is
+    returned unresolved: a venv's bin/python is a symlink, and Python finds its
+    venv from the path it was started as.
+    """
+    name = check_argv(argv, config)
+    pinned = Path(venv) / "bin" / name
+    if not (pinned.is_file() and os.access(pinned, os.X_OK)):
+        raise PolicyError(7, pinned, f"{name!r} is allowed but isn't installed in the project venv ({venv}); "
+                                     "add it to the project's dependencies and uv.lock")
+    return pinned

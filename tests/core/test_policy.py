@@ -7,6 +7,7 @@ import os
 import pytest
 
 from daedalus.core.policy import Op, PolicyError, authorize, authorize_command
+from daedalus.sandbox.config import ProjectConfig
 from daedalus.core.session import Area, Session
 
 WRITE_OPS = [op for op in Op if op is not Op.READ]
@@ -219,23 +220,68 @@ def test_rule6_write_code_in_active_vault(world) -> None:
 
 
 # Rule 7: commands -----------------------------------------------------------------------
+# Since commit 10a: argv[0] is a bare name on the project's allow list, pinned to <venv>/bin/<name>.
 
-def test_rule7_command_not_allowlisted() -> None:
+ALLOW = ProjectConfig(allow=("pytest",))
+
+
+@pytest.fixture
+def venv_dir(tmp_path) -> Path:
+    v = tmp_path / "venv"
+    (v / "bin").mkdir(parents=True)
+    for name in ("pytest", "rm"):
+        (v / "bin" / name).write_text("#!/bin/sh\n")
+        (v / "bin" / name).chmod(0o755)
+    return v
+
+
+def test_rule7_command_not_allowlisted(venv_dir) -> None:
     with pytest.raises(PolicyError) as exc:
-        authorize_command(["rm", "-rf", ".."], {"pytest"})
+        authorize_command(["rm", "-rf", ".."], ALLOW, venv_dir)  # installed in the venv, but not allowed
+    assert exc.value.rule == 7 and "isn't in this project's daedalus.toml allow list" in exc.value.reason
+
+
+@pytest.mark.parametrize("argv", [[], "pytest", b"pytest", None, ["/bin/rm", "x"], ["./rm"], [""],
+                                  ["pytest/"], [os.path.join("", ".venv", "bin", "pytest")], ["/tmp/evil/pytest"],
+                                  [b"pytest"], ["pytest", 3], ["pytest", None], ["pytest\0"], ["pytest", "-k", "a\0b"]],
+                         ids=["empty", "string", "bytes", "none", "abs-path", "dot-slash", "blank", "trailing-slash",
+                              "venv-path", "evil-path", "bytes-arg0", "int-arg", "none-arg", "nul-arg0", "nul-arg"])
+def test_rule7_refusals(argv, venv_dir) -> None:
+    with pytest.raises(PolicyError) as exc:
+        authorize_command(argv, ALLOW, venv_dir)
     assert exc.value.rule == 7
 
 
-@pytest.mark.parametrize("argv", [[], "pytest", ["/bin/rm", "x"], ["./rm"], [""], ["pytest/"]])
-def test_rule7_refusals(argv) -> None:
+def test_rule7_allowed_but_not_installed(tmp_path) -> None:
+    (tmp_path / "bin").mkdir()
     with pytest.raises(PolicyError) as exc:
-        authorize_command(argv, {"pytest"})
-    assert exc.value.rule == 7
+        authorize_command(["pytest"], ALLOW, tmp_path)
+    assert exc.value.rule == 7 and "isn't installed in the project venv" in exc.value.reason
 
 
-@pytest.mark.parametrize("argv", [["pytest", "-q"], [os.path.join("", ".venv", "bin", "pytest")]])
-def test_rule7_allowed(argv) -> None:
-    authorize_command(argv, {"pytest"})
+def test_rule7_not_executable(venv_dir) -> None:
+    (venv_dir / "bin" / "pytest").chmod(0o644)
+    with pytest.raises(PolicyError):
+        authorize_command(["pytest"], ALLOW, venv_dir)
+
+
+def test_rule7_pins_the_program_whatever_path_says(venv_dir, tmp_path, monkeypatch) -> None:
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "pytest").write_text("#!/bin/sh\n")
+    (evil / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{evil}:{os.environ['PATH']}")
+    assert authorize_command(["pytest", "-q"], ALLOW, venv_dir) == venv_dir / "bin" / "pytest"
+
+
+def test_rule7_returns_the_unresolved_venv_path(venv_dir, tmp_path) -> None:
+    """bin/python is a symlink; Python finds its venv from the path it was started as."""
+    target = tmp_path / "base-python"
+    target.write_text("#!/bin/sh\n")
+    target.chmod(0o755)
+    (venv_dir / "bin" / "python").symlink_to(target)
+    cfg = ProjectConfig(allow=("python",))
+    assert authorize_command(["python", "-c", "pass"], cfg, venv_dir) == venv_dir / "bin" / "python"
 
 
 # Performance and contract -----------------------------------------------------------------

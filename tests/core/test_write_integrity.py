@@ -4,16 +4,18 @@ Every refusal path through a public write function (propose_note,
 propose_edit, propose_lesson, write_log, apply, reject, and since commit 8
 gate.propose_with_basis, answer_question, promote, and since commit 9 ingest)
 is a row below. For
-each row, all four hold:
+each row, all of these hold:
   1. the right error is raised;
   2. every vault's digest is unchanged (all files except .git/ and ignored files);
   3. every repo's HEAD is unchanged;
   4. no queue record was created, and existing records changed status only
      where the row says so (a stale apply marks its proposal stale).
+  5. any extra check the row carries (for commands: no process was spawned).
 
-Rules 6 and 7 have no row: no public write function does WRITE_CODE or runs a
-command yet. They are covered in test_policy.py and get rows when their
-writers land.
+Since commit 10a, sandbox.runner.run has rows for rule 7. A refused command
+must also spawn no process: each row's injected executor records every spawn
+(the preflight, `uv sync`, `uv python dir`, the command) and must stay empty.
+Rule 6 has no row yet: no public function does WRITE_CODE until 10b's edit_code.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ class Case:
     error: type[Exception]
     rule: int | None = None
     status_changes: dict[str, str] = field(default_factory=dict)
+    after: Callable[[], None] | None = None  # an extra check once the call is refused
 
 
 def note(w, vault: str, rel: str, content: str = HELLO) -> Callable[[], object]:
@@ -296,6 +299,55 @@ def add_duplicate(w):
     return Case(lambda: ingest(w.session, src), IngestError)
 
 
+class NoSpawn:
+    """An executor that records every spawn it's asked for, and runs nothing."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **_kwargs):
+        self.calls.append(list(argv))
+        raise AssertionError(f"a refused command spawned {argv}")
+
+    def check(self) -> None:
+        assert self.calls == [], f"a refused command spawned processes: {self.calls}"
+
+
+def _command(w, argv):
+    from daedalus.sandbox import runner, venv
+
+    (w.alpha_repo / "daedalus.toml").write_text('[sandbox]\nallow = ["pytest", "ruff"]\n')
+    (w.alpha_repo / "uv.lock").write_text("version = 1\n")
+    built = venv.venv_path("alpha", w.alpha_repo)  # built, with pytest but not ruff
+    (built / "bin").mkdir(parents=True)
+    (built / "bin" / "pytest").write_text("#!/bin/sh\n")
+    (built / "bin" / "pytest").chmod(0o755)
+    (built / venv.READY).write_text("x\n")
+    spawns = NoSpawn()
+    return Case(lambda: runner.run(w.session, argv, w.worktree, executor=spawns), PolicyError, rule=7,
+                after=spawns.check)
+
+
+def rule7_slash_in_program(w):
+    return _command(w, ["/tmp/evil/pytest", "-q"])
+
+
+def rule7_program_not_allowed(w):
+    return _command(w, ["rm", "-rf", "vault"])
+
+
+def rule7_allowed_but_missing_from_venv(w):
+    return _command(w, ["ruff", "check"])
+
+
+def rule7_empty_argv(w):
+    return _command(w, [])
+
+
+def rule7_nul_byte(w):
+    return _command(w, ["pytest", "-k", "a\0b"])
+
+
 CASES = [
     rule1_traversal_into_repo, rule1_traversal_outside, rule1_unpulled_vault, rule1_unregistered_vault,
     rule1_symlink_escape, rule1_reauth_unregistered_on_apply,
@@ -310,7 +362,19 @@ CASES = [
     reject_without_reason,
     non_precedent_basis_in_proposal, promote_type_mismatch, answer_unknown_question,
     add_oversized, add_corrupt, add_scanned, add_duplicate,
+    rule7_slash_in_program, rule7_program_not_allowed, rule7_allowed_but_missing_from_venv, rule7_empty_argv,
+    rule7_nul_byte,
 ]
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_state(tmp_path, monkeypatch):
+    """Command rows build their venv under tmp_path, and start with no cached preflight."""
+    from daedalus.sandbox import runner, venv
+
+    monkeypatch.setattr(venv, "VENV_ROOT", tmp_path / "venvs")
+    monkeypatch.setattr(runner, "_preflight", None)
+    monkeypatch.setattr(runner, "_uv_python_dir", None)
 
 
 @pytest.mark.parametrize("build", CASES, ids=[c.__name__ for c in CASES])
@@ -331,3 +395,6 @@ def test_refused_write_leaves_everything_unchanged(gworld, build) -> None:
     assert after["heads"] == before["heads"], "a refused write moved a HEAD"
     # 4. The queue: no new record, and only the expected status changes.
     assert after["queue"] == {**before["queue"], **case.status_changes}
+    # 5. Anything else the row checks (for commands: no process was spawned).
+    if case.after is not None:
+        case.after()

@@ -279,8 +279,37 @@
 - **Tests:** 785, 3 new: glyphs stripped from a PDF (fixture string through a fake converter), markers kept in a `.md`, and the no-network test.
 - The scratch2 source note from commit 9's live check still holds the markers; it wasn't rewritten.
 
+### 2026-11-26 — Commit 10a: Seatbelt sandbox runner, rule 7 rewrite
+
+- **`daedalus.sandbox`:** `runner.run(session, argv, worktree) -> RunResult` runs every agent-triggered command under `/usr/bin/sandbox-exec`, failing closed. `profile.py` holds the SBPL profile, `exec.py` the one spawn point (own session, killpg, rlimits, 200 KB tails), `venv.py` the venv, `config.py` `daedalus.toml`, and `python -m daedalus.sandbox run --project <name> -- <argv>` the CLI.
+- **The profile:** allow-default, then deny the network (DNS's mach services too), every write but the run's `tmp/` and a few `/dev` nodes, reads under home but the worktree, the venv, uv's Python folder, and the run's `tmp/`, the worktree's `vault/` and `.git`, and securityd's mach services. Every path is a realpath `-D` parameter; the text never holds one.
+- **Rule 7** is now `authorize_command(argv, project_config, venv) -> Path`: a bare name in `allow`, pinned to `<venv>/bin/<name>`. The basename matching is gone; `.venv/bin/pytest`, allowed before, is now refused.
+- **The venv:** `~/.cache/daedalus/venvs/<project>-<sha12 of uv.lock>/`, built unsandboxed with `uv sync --frozen --no-install-project` from your checkout, once per lock hash.
+- **scratch2** became a minimal Python project in `97b17c8 chore: minimal python project for sandbox check`: `pyproject.toml` (dev group `pytest`, plus `keyring` for the live Keychain test), `uv.lock`, `.python-version` 3.13, `tests/test_smoke.py`, and the default `daedalus.toml`. uv chose `/opt/anaconda3/bin/python3` 3.13.5, the same binary as daedalus's venv and the one granted "Always Allow".
+- **Tests:** 847 by default, 62 new (785 before): runner 40, executor 6, rule 7 policy +11, integrity rows +5 (`rule7_slash_in_program`, `rule7_program_not_allowed`, `rule7_allowed_but_missing_from_venv`, `rule7_empty_argv`, `rule7_nul_byte`; 49 rows), each also checking that the injected executor was never called. Plus 10 live tests marked `sandbox` (`uv run pytest -m sandbox`), deselected by default. Moving the preflight ahead of the checks failed every rule 7 row with "a refused command spawned ['/usr/bin/sandbox-exec', '-p', …]".
+- **Proved red four ways** (live tests):
+  1. No `(deny network*)`: `test_no_network_and_no_dns` failed with "a sandboxed run reached 1.1.1.1" (and the localhost test).
+  2. No home read denial: `test_no_reads_in_home` failed with `{'probe': 'READ', 'state': 'READ', 'note': 'READ', 'list_home': 'READ', …, 'xattr': 'READ'}`.
+  3. No securityd mach denials: `test_no_keychain` **still passed**: the home read denial alone blocks the Keychain. Removing the home read denial instead, keeping the mach denials, also passed. With both removed it failed with `{'keyring': 'GOT A VALUE', …}`. The probe puts `HOME` back to the real home first, because the clean environment's `HOME` alone also hides the Keychain, and a run could undo that.
+  4. Worktree writes allowed: `test_no_writes_outside_the_run_folder` failed with "a run wrote into the worktree".
+- **sandbox-exec, as found:** a profile error and a missing `-D` parameter both exit 65 with a `sandbox-exec:` message, and an exec failure exits 71. A denied `stat` is `EPERM`, which made pytest fail (`Path.is_file()` raises on it) in any worktree under home or with a `vault/` or `.git`, so file metadata is re-allowed there. Contents, listings, and xattrs stay denied. `uv python dir` names `~/.local/share/uv/python`, which doesn't exist: uv manages no Pythons here.
+- **Live check:** `uv run pytest -m sandbox`: 10 passed. `python -m daedalus.sandbox run --project scratch2 -- pytest -q`: `1 passed`, `— sandboxed: exit 0 in 0.36 s` (0.50 s wall with `uv run`). Overhead, median of 5 `pytest -q`: sandboxed 370 ms, unsandboxed 312 ms, +57 ms. No Keychain prompt appeared. Nothing new in `~` except `~/.cache/daedalus/venvs/`.
+- **Not done:** superseded venvs aren't pruned.
+
 ## Key decisions
 
+- ★ **Every agent-triggered command runs sandboxed, or not at all.** `sandbox-exec` missing, a failed preflight, or a profile that doesn't load is a refusal; there's no unsandboxed fallback.
+- ★ **The profile starts from allow-default and denies the four things that matter** (network with DNS, writes, reads under home, the Keychain). Easier to get right than deny-default, and still strong because those denies are the protection.
+- ★ **Every path in the profile is a realpath `-D` parameter.** `/tmp` and `/var` are symlinks into `/private`, and Seatbelt matches real paths.
+- ★ **The worktree and the venv are read-only to the run;** only the run's own `tmp/` is writable.
+- ★ **The child's environment is built from scratch** (six keys). Nothing is inherited.
+- ★ **Rule 7 pins the program to `<venv>/bin/<name>`;** the host's `PATH` never matters.
+- ★ **The venv lives outside the worktree, keyed by `uv.lock`'s hash.** Dependency install is unsandboxed, and trusted only because the lockfile is approved (the gate's `dependency` category) and frozen.
+- ★ **No memory cap is claimed;** macOS doesn't enforce one reliably. The timeout and the CPU limit are the protection.
+- ★ **`daedalus.toml` and `uv.lock` are read from your checkout, never the worktree,** so an agent's edits can't widen what it may run or what gets installed.
+- **File metadata stays readable where reads are denied** (home, the worktree's `vault/` and `.git`): pytest needs `stat` to answer `ENOENT`, not `EPERM`. Contents, listings, and xattrs stay denied.
+- **Both Keychain layers stay** (the mach denial and the home read denial), since each blocks on its own.
+- **Every refusal comes before any spawn it can stop,** and the whole group is SIGKILLed after every run, so nothing outlives it.
 - ★ **Only the converted markdown enters git, never the original.** The SHA-256 and byte count identify it without storing it, and a test checks `git log --all` for any non-markdown path in `sources/`.
 - ★ **No converter sees an unvalidated path.** Realpath first; vaults, `.git`, the state folder, non-regular files, URLs, oversized files, and other extensions are refused before MarkItDown is built. MarkItDown runs with built-in local converters only: no plugins, no `llm_client`, no Document Intelligence, no URLs.
 - ★ **An empty conversion is a refusal, not a note.** A scanned PDF has no text layer, and an empty note would look like success. Markdown over 2 MB is refused, never truncated.
@@ -383,6 +412,6 @@
 
 ## Up Next
 
-Commit 10: coding loop on a git worktree (with rule 6 and 7 integrity rows and the pinned-program fix for rule 7).
+Commit 10b: worktree lifecycle, read_code/edit_code in the worktree, rule 6 integrity rows.
 
 When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).

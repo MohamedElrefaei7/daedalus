@@ -33,6 +33,13 @@ daedalus/
 │   ├── secrets.py            # API keys in the macOS Keychain (`python -m daedalus.secrets set|status`)
 │   ├── queue_cli.py          # debug CLI for the queue (list/diff/apply/reject); the REPL replaces it
 │   ├── state.py              # `python -m daedalus.state` entry point (logic in core/state.py)
+│   ├── sandbox/              # every command an agent triggers runs here, under Seatbelt (commit 10a)
+│   │   ├── runner.py         # run(session, argv, worktree) -> RunResult: checks, preflight, venv, execute
+│   │   ├── profile.py        # the SBPL profile; every path a realpath passed with -D
+│   │   ├── exec.py           # the one place a process is spawned: own session, killpg, rlimits, output tails
+│   │   ├── venv.py           # ~/.cache/daedalus/venvs/<project>-<sha12 of uv.lock>, via uv sync --frozen
+│   │   ├── config.py         # daedalus.toml ([sandbox] allow, timeout_s, allow_localhost)
+│   │   └── __main__.py       # python -m daedalus.sandbox run --project <name> -- <argv>
 │   ├── terminal/             # `daedalus`: the REPL (commit 5; Textual UI in commit 14)
 │   │   ├── repl.py           # prompt_toolkit input, rich Live output, /commands; main() is the script
 │   │   ├── agent.py          # tool specs, the 12-round tool loop, reasoning_content kept in history
@@ -49,7 +56,7 @@ daedalus/
 │       ├── session.py        # Session dataclass, Area enum
 │       ├── state.py          # state.json -> Session (load_session, save_state, set_active/pull/drop) + CLI
 │       ├── lifecycle.py      # /new: vault from template, path-limited init commit, register; full rollback
-│       ├── policy.py         # Op enum, authorize(), authorize_command(): the seven rules
+│       ├── policy.py         # Op enum, authorize(), authorize_command() (rule 7, pinned to the venv): the seven rules
 │       ├── notes.py          # frontmatter parsing + schema validation (NoteSchemaError)
 │       ├── links.py          # wikilink extraction + Obsidian-style resolution
 │       ├── index.py          # SQLite FTS5 search index
@@ -68,13 +75,14 @@ daedalus/
     ├── test_templates.py     # template contract test
     ├── core/                 # one file per core part, test_bench.py, test_write_integrity.py
     ├── mcp/                  # daedalus-mcp via FastMCP's in-memory client, plus a stdio subprocess test
+    ├── sandbox/              # runner unit tests (fake executor); test_live.py is marked `sandbox`
     └── terminal/             # recorded SSE streams through httpx2.MockTransport; no live calls
 
 Test helpers live in plain modules (`tests/terminal/fakes.py`, `tests/mcp/mcp_helpers.py`), not in conftest:
 pytest binds `conftest` to whichever folder's it imported last. Every conftest re-exports the core helpers.
 ```
 
-Run the tests with `uv run pytest`; `--durations=10` is in the default addopts, so the ten slowest tests always print.
+Run the tests with `uv run pytest`; `--durations=10` is in the default addopts, so the ten slowest tests always print. The default addopts also deselect the live sandbox tests: run them on purpose with `uv run pytest -m sandbox`. They run the real `sandbox-exec` with scratch2's real venv, and **fail, never skip**, if the sandbox is unavailable.
 
 ## Templates are the source of truth
 
@@ -94,7 +102,7 @@ Every read and write goes through `daedalus.core.policy.authorize(path, op, sess
 4. **Off limits for every op.** Any `.obsidian` or `.git` component (case-folded), and anything in `<worktree>/vault/`.
 5. **Active vault writes.** `PROPOSE`: `inbox/`, `questions/`, `CONTEXT.md`. `CREATE_LOG`: new files in `logs/`. `WRITE_PLAN`: `plans/`. `USER_ACTION`: `goals/`, `sources/`, `decisions/`, `components/`, `experiments/`, `concepts/`, `questions/` (since commit 8, so `/answer` can mark a question answered), `CONTEXT.md`. Never `AGENTS.md` or `templates/`. Agents still can't write `decisions/`: `PROPOSE` is refused there.
 6. **Code.** `WRITE_CODE` only in the worktree, never in your own checkout.
-7. **Commands.** `authorize_command(argv, allowlist)`: `argv[0]`'s basename must be allowlisted.
+7. **Commands.** `authorize_command(argv, project_config, venv) -> Path`. `argv` is a non-empty list of strings with no NUL bytes; `argv[0]` is a bare name (no `/`) in `daedalus.toml`'s `allow`; and it runs **only** as `<venv>/bin/<name>`, which must exist and be executable. The host's `PATH` never matters, so `/tmp/evil/pytest` is unreachable. The pinned path is returned unresolved, because a venv's `bin/python` is a symlink and Python finds its venv from the path it was started as.
 
 The `Session` is passed in explicitly to every core function. Only `daedalus.core.state` reads `~/.config/daedalus/state.json` (`{"active": "scratch", "pulled": []}`), and only front ends call it: `load_session()` builds a Session or raises `StateError` saying how to fix it; `save_state()` validates against the registry, then writes atomically. `python -m daedalus.state show | set-active <name> | pull <name> | drop <name>` is the stopgap until commit 6's `/vault` and `/pull`.
 
@@ -403,3 +411,50 @@ Plan approval in commit 12 will reuse this to write several decision notes at on
 **Names.** The stem is the slugged title, with `-2`, `-3` … until it matches no note stem in any registered vault, so a bare link to it is never ambiguous.
 
 **The write** is one path through `apply.apply_changes`, as `USER_ACTION` into `sources/`, so it carries apply's guarantees: the lock, the stale check, the atomic write, the path-limited commit, rollback, and crash reconciliation. It uses `apply_changes` rather than a queue proposal because a proposal's content is capped at 256 KB, and `/add` is a direct human action.
+
+## The sandbox: running commands
+
+Once a program runs, the path policy no longer applies: it can do anything your user account can. So **every command an agent triggers runs through `daedalus.sandbox.runner.run`**, under macOS's built-in Seatbelt (`/usr/bin/sandbox-exec`), the mechanism Anthropic's sandbox-runtime uses for Claude Code on macOS. Nothing is installed and nothing runs in the background.
+
+★ **Fail closed.** At first use per process, the runner runs `sandbox-exec -p "(version 1)(allow default)" /usr/bin/true`. If that fails, or `sandbox-exec` is missing, this run and every later one refuse with "sandbox unavailable — Daedalus won't run commands unsandboxed". A profile that doesn't load (exit 65 or 71 with a `sandbox-exec:` message, which is how a missing `-D` parameter shows up too) is the same refusal, never a result. There is no unsandboxed fallback.
+
+**`run(session, argv, worktree) -> RunResult(exit_code, stdout_tail, stderr_tail, duration_s, timed_out)`**, in an order where every refusal comes before any spawn it can stop:
+1. `daedalus.toml` from your checkout of the project repo, never the worktree, so code an agent edits can't widen what it may run.
+2. Rule 7's shape and name checks.
+3. The worktree must be the session's worktree or the active repo, and not the home folder or above it.
+4. The venv for the current `uv.lock` (below).
+5. Rule 7's pin.
+6. The preflight.
+7. A fresh run folder (`mkdtemp`, then `realpath`) holding the profile and `tmp/`.
+8. `/usr/bin/sandbox-exec -f <profile> -D KEY=<realpath> ... -- <venv>/bin/<name> <args>`, in exec form (no shell), with `cwd=<worktree>`, in its own session.
+9. The last 200 KB of stdout and stderr are kept, and the run folder is deleted, even if the run made parts of it read-only.
+
+**The profile** (`sandbox/profile.py`) starts from `(version 1) (allow default)` and denies the four things that matter. In SBPL the later rule wins, so each deny comes before its exceptions.
+- ★ **Why allow-default, not `(deny default)`:** allow-everything-then-deny is far easier to get right (a deny-default profile has to list every mach service, sysctl, and file Python touches, and breaks quietly when macOS changes), and it's still strong here, because the denies cover the four things that matter: network, writes, reads in the home folder, and the Keychain.
+- **Network:** `(deny network*)`, Unix sockets included. DNS also goes over mach, so `com.apple.dnssd.service` and `com.apple.mDNSResponder` are denied as well. `allow_localhost = true` re-allows only `localhost:*` bind, inbound, and outbound (by address: name lookup stays off, so use `127.0.0.1`).
+- **Writes:** `(deny file-write*)`, then only the run's `tmp/` (also `HOME` and `TMPDIR`), `/dev/null`, `/dev/zero`, `/dev/tty*`, and `/dev/fd`. ★ **The worktree is read-only to the run,** so tests can't modify the code they test; code changes go only through 10b's policy-checked `edit_code`. The venv is read-only too, so a run can't plant code for the next one.
+- **Reads:** `(deny file-read*)` under the real home folder, then re-allowed for the worktree, the venv, uv's Python folder (`uv python dir`, realpath'd), the venv's base Python if it lives under home, and the run's `tmp/`. That keeps `~/.ssh`, `~/.aws`, `~/.config`, `~/.local/state/daedalus`, every vault, other repos, `~/Library/Keychains`, and the Claude desktop config unreadable. The worktree's `vault/` and `.git` are denied again (rule 4). System paths outside home stay readable; Python needs them.
+- ★ **Metadata stays readable** under home and in the worktree's `vault/` and `.git`. pytest walks up from its rootdir looking for config files and stats every entry it collects, Seatbelt answers a denied `stat` with `EPERM`, and Python's `Path.is_file()` raises on `EPERM` rather than returning False, so `deny file-read*` alone breaks pytest in any worktree under home or with a `vault/`. `file-read-metadata` gives a path's existence, size, mode, and times. It never gives its contents, a directory listing (`readdir` is `file-read-data`), or its xattrs (`file-read-xattr`), and the live test checks all three.
+- **The Keychain:** `com.apple.SecurityServer` and `com.apple.securityd` are denied over mach, since securityd isn't reached through files. Each layer (the mach denial, the home read denial) blocks the Keychain on its own, even when the run puts `HOME` back to the real home folder; with both removed, the scratch2 venv's interpreter, the one granted "Always Allow", reads the key silently. That's why both stay.
+
+★ **The realpath rule.** Every path goes in as a `-D` parameter, resolved with `realpath` first, and the profile text names only `(param "KEY")`, never a path. On macOS `/tmp` and `/var` are symlinks into `/private`, and Seatbelt matches real paths: a profile allowing `/tmp/run123` allows nothing.
+
+★ **A clean environment.** The child's whole environment is built from scratch, never inherited: `PATH=<venv>/bin:/usr/bin:/bin`, `HOME=<run tmp>`, `TMPDIR=<run tmp>`, `LANG=en_US.UTF-8`, `PYTHONDONTWRITEBYTECODE=1`, `PYTEST_ADDOPTS=-p no:cacheprovider`. Nothing else, so `DEEPSEEK_API_KEY` and `SSH_AUTH_SOCK` never reach it.
+
+**Limits and the timeout** (`sandbox/exec.py`). The child gets `RLIMIT_CPU = timeout_s`, at most 1,024 open files, a 512 MB file-size cap, and no core files. On timeout the whole process group gets SIGTERM, 2 s to exit, then SIGKILL. Whatever the outcome, the group is SIGKILLed once the leader is done, so no background child outlives its run, and the runner confirms the group is gone. ★ **There's no memory cap:** macOS doesn't reliably enforce memory rlimits, so none is claimed. The timeout and the CPU limit are the real protection. A process that calls `setsid()` leaves the group and escapes the kill, but keeps its CPU limit and its sandbox: no network, no writes outside its (deleted) run folder.
+
+**The venv** (`sandbox/venv.py`). ★ It lives outside the worktree, at `~/.cache/daedalus/venvs/<project>-<sha12 of uv.lock>/`, built from your checkout with `UV_PROJECT_ENVIRONMENT=<that path> uv sync --frozen --no-install-project`. `--no-install-project` keeps the project itself out: an editable install would point at your checkout, and tests must import the worktree's code. A venv counts only once `.daedalus-ready` exists, so a sync that died halfway is removed and redone; an flock stops two terminals building the same one. Old venvs aren't pruned yet.
+- ★ **Dependency install is unsandboxed, and trusted only because the lockfile is approved and frozen.** `uv sync` needs the network, so it runs outside the sandbox, and only when the lock's hash is new. The lockfile is its only input. A dependency change is a design decision in the `dependency` category, so the gate puts it in front of you before it can ever reach `uv.lock`.
+
+**`daedalus.toml`**, committed at the project repo root:
+
+```toml
+[sandbox]
+allow = ["pytest", "ruff"]   # programs agents may run: bare names, looked up only in the venv's bin/
+timeout_s = 300              # 1 to 3600; also the CPU-seconds limit
+allow_localhost = false      # true only if tests need to bind local sockets
+```
+
+No file means the project can't run commands, and the refusal shows how to add one. Unknown tables or keys are errors, and so are an `allow` entry with a `/`, a non-integer timeout, and a non-boolean `allow_localhost`.
+
+**`python -m daedalus.sandbox run --project <name> [--worktree <path>] -- <program> [args]`** runs one command for a registered project without touching `state.json`. The worktree defaults to your checkout, which the run can read but never write. It prints the output tails and `— sandboxed: exit N in S s`, and exits with the command's code (124 on timeout, 2 if refused).

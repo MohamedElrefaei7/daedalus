@@ -30,4 +30,5 @@ packages = ["src/daedalus"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--durations=10"  # the ten slowest tests always print
+addopts = "--durations=10 -m 'not sandbox'"  # the ten slowest always print; live sandbox tests only on request
+markers = ["sandbox: live tests that run the real sandbox-exec (run with -m sandbox; they fail, never skip)"]
