@@ -1,7 +1,10 @@
 """The DeepSeek agent: the daedalus tools and the tool-calling loop for one user turn.
 
-* Exactly the twelve tools in daedalus.toolset.AGENT_NAMES: daedalus-mcp's nine
-  plus propose_edit and propose_lesson, which /end needs, and ask_user. None
+* Two profiles. "chat": exactly the twelve tools in daedalus.toolset.AGENT_NAMES
+  (daedalus-mcp's nine plus propose_edit and propose_lesson, which /end needs,
+  and ask_user). "coder" (/code <slug>): exactly the fourteen in CODER_NAMES,
+  the eight read and propose tools plus edit_code, write_code, delete_code,
+  run, find_precedent, and ask_user, working in the session's worktree. None
   takes a source: proposals are made with source="deepseek" here, never by
   the model.
 * A successful ask_user ENDS THE TURN: no further model call is made, and
@@ -23,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from daedalus import toolset
+from daedalus.core import tools
 from daedalus.core.schema import DESIGN_CATEGORIES
 from daedalus.core.session import Session
 
@@ -91,6 +95,22 @@ PARAMETERS: dict[str, dict[str, Any]] = {
         "summary": {**_STR, "description": "one line, at most 200 characters"},
         "vault": {**_OPT_STR, "description": "'shared' for the shared inbox; omit for the active project"},
     }, "required": ["rel_path", "content", "summary"]},
+    "edit_code": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "worktree-relative file path"},
+        "old": {**_STR, "description": "the exact text to replace; must occur exactly once"},
+        "new": {**_STR, "description": "the replacement text"},
+    }, "required": ["rel_path", "old", "new"]},
+    "write_code": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "worktree-relative file path"},
+        "content": {**_STR, "description": "the whole file, at most 64 KB"},
+    }, "required": ["rel_path", "content"]},
+    "delete_code": {"type": "object", "properties": {
+        "rel_path": {**_STR, "description": "worktree-relative file path"},
+    }, "required": ["rel_path"]},
+    "run": {"type": "object", "properties": {
+        "argv": {"type": "array", "items": _STR, "minItems": 1,
+                 "description": "the command as a list, e.g. [\"pytest\", \"-q\"]"},
+    }, "required": ["argv"]},
     "propose_lesson": {"type": "object", "properties": {
         "rel_path": {**_STR, "description": "file name in the shared inbox/, e.g. 'git-hooks-path.md'"},
         "content": {**_STR, "description": "the whole lesson note"},
@@ -100,20 +120,31 @@ PARAMETERS: dict[str, dict[str, Any]] = {
 for _schema in PARAMETERS.values():
     _schema["additionalProperties"] = False
 
-# The tools array, built once in a fixed order: it's part of the cached prefix.
-TOOLS: list[dict[str, Any]] = [
-    {"type": "function", "function": {
-        "name": name, "description": toolset.description(name, SOURCE), "parameters": PARAMETERS[name],
-    }}
-    for name in toolset.AGENT_NAMES
-]
+PROFILES: dict[str, tuple[str, ...]] = {"chat": toolset.AGENT_NAMES, "coder": toolset.CODER_NAMES}
+
+
+def tools_for(profile: str) -> list[dict[str, Any]]:
+    return [
+        {"type": "function", "function": {
+            "name": name, "description": toolset.description(name, SOURCE, profile), "parameters": PARAMETERS[name],
+        }}
+        for name in PROFILES[profile]
+    ]
+
+
+# The tools arrays, built once in a fixed order: they're part of the cached prefix.
+TOOLSETS: dict[str, list[dict[str, Any]]] = {profile: tools_for(profile) for profile in PROFILES}
+TOOLS = TOOLSETS["chat"]
 PROPOSING = ("propose_note", "propose_edit", "propose_lesson", "ask_user")
 ENDS_TURN = "ask_user"
 NOT_RUN = "Not run: ask_user ended this turn. Wait for Mohamed's answer."
 
 
-def call_tool(session: Session, name: str, args: dict[str, Any]) -> dict[str, Any]:
+def call_tool(session: Session, name: str, args: dict[str, Any],
+              edit_log: tools.EditLog | None = None) -> dict[str, Any]:
     """Run one tool. source is fixed here; the model can't pass it (the schemas refuse extras)."""
+    if name in ("edit_code", "write_code", "delete_code"):
+        return getattr(toolset, name)(session, **args, edit_log=edit_log)
     if name in ("propose_note", "propose_edit"):
         fn = getattr(toolset, name)
         return fn(session, SOURCE, args["rel_path"], args["content"], args["summary"], args.get("vault"))
@@ -144,10 +175,12 @@ class ToolOutcome:
     result: dict[str, Any] | None = None
 
 
-def run_tool(session: Session, name: str, raw_args: str) -> ToolOutcome:
+def run_tool(session: Session, name: str, raw_args: str, profile: str = "chat",
+             edit_log: tools.EditLog | None = None) -> ToolOutcome:
     """Execute one model tool call; every failure becomes a tool result, never an exception."""
-    if name not in toolset.AGENT_NAMES:
-        return ToolOutcome(name, {}, False, f"Unknown tool {name!r}. Tools: {', '.join(toolset.AGENT_NAMES)}.")
+    names = PROFILES[profile]
+    if name not in names:
+        return ToolOutcome(name, {}, False, f"Unknown tool {name!r}. Tools: {', '.join(names)}.")
     try:
         args = json.loads(raw_args or "{}")
         if not isinstance(args, dict):
@@ -166,7 +199,7 @@ def run_tool(session: Session, name: str, raw_args: str) -> ToolOutcome:
             parts.append(f"missing {', '.join(missing)}")
         return ToolOutcome(name, args, False, f"{name}: {'; '.join(parts)}. Allowed: {', '.join(sorted(allowed))}.")
     try:
-        result = call_tool(session, name, args)
+        result = call_tool(session, name, args, edit_log)
     except Exception as e:
         text = toolset.error_text(e)
         if text is None:
@@ -180,7 +213,11 @@ def run_tool(session: Session, name: str, raw_args: str) -> ToolOutcome:
 def tool_label(name: str, args: dict[str, Any]) -> str:
     """The one-line form shown in the terminal: → read_note shared:practices/red-test-first.md"""
     main = {"read_note": "ref", "backlinks": "ref", "search": "query", "list_files": "subdir",
-            "read_code": "rel_path", "list_notes": "folder"}.get(name)
+            "read_code": "rel_path", "list_notes": "folder", "edit_code": "rel_path", "write_code": "rel_path",
+            "delete_code": "rel_path"}.get(name)
+    if name == "run":
+        argv = args.get("argv") or []
+        return f"→ run {' '.join(str(a) for a in argv)}".rstrip()
     if name in ("propose_note", "propose_edit"):
         target = f"{args.get('vault') or ''}:{args.get('rel_path', '')}".lstrip(":")
         return f"→ {name} {target}"
@@ -215,21 +252,37 @@ class Agent:
     """A conversation: the fixed system prompt, history, and the metered calls."""
 
     def __init__(self, session: Session, ds: DeepSeek, cfg: Config, session_id: str,
-                 meter: Meter | None = None) -> None:
+                 meter: Meter | None = None, profile: str = "chat") -> None:
+        if profile not in PROFILES:
+            raise ValueError(f"unknown agent profile {profile!r}")
+        if profile == "coder" and session.worktree is None:
+            raise ValueError("the coder profile needs a session with a worktree")
         self.session = session
         self.ds = ds
         self.cfg = cfg
         self.session_id = session_id
         self.meter = meter or Meter()
-        self.system = system_prompt(session)
+        self.profile = profile
+        self.tools = TOOLSETS[profile]
+        self.system = system_prompt(session, profile)
         self.history: list[dict[str, Any]] = []
         self.tool_calls = 0  # tools run this conversation
         self.proposals: list[str] = []  # ids of proposals made this conversation, in order
+        self.edit_log = tools.EditLog()  # this conversation's code edits (coder mode)
+        self.runs: list[dict[str, Any]] = []  # this conversation's run results: exit code, duration, timed out
 
     def rebuild(self, session: Session) -> None:
         """Point at a new session (a /pull or /drop) and rebuild the system prompt; history is kept."""
         self.session = session
-        self.system = system_prompt(session)
+        self.system = system_prompt(session, self.profile)
+
+    def one_shot(self, system: str, user: str) -> str:
+        """One metered call outside the conversation, with no tools: it can't act, and history is untouched."""
+        reply, reading = metered_call(self.ds, self.meter, self.cfg, self.session_id,
+                                      [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                      None)
+        log.info("session %s one-shot call: %s", self.session_id, render(reading))
+        return reply.content.strip()
 
     def messages(self) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.system}, *self.history]
@@ -248,7 +301,7 @@ class Agent:
             while True:
                 ev.call_start()
                 reply, reading = metered_call(
-                    self.ds, self.meter, self.cfg, self.session_id, self.messages(), TOOLS,
+                    self.ds, self.meter, self.cfg, self.session_id, self.messages(), self.tools,
                     on_reading=ev.reading, on_delta=ev.delta,
                 )
                 ev.call_done(reply, reading)
@@ -262,7 +315,10 @@ class Agent:
                     if asked is not None:  # ask_user ended the turn; every call still needs a tool result
                         self.history.append({"role": "tool", "tool_call_id": call.id, "content": NOT_RUN})
                         continue
-                    outcome = run_tool(self.session, call.name, call.arguments)
+                    outcome = run_tool(self.session, call.name, call.arguments, self.profile, self.edit_log)
+                    if outcome.ok and outcome.name == "run" and outcome.result:
+                        self.runs.append({k: outcome.result[k] for k in ("exit_code", "duration_s", "timed_out")}
+                                         | {"argv": outcome.args.get("argv")})
                     log.info("session %s %s %s", self.session_id, tool_label(outcome.name, outcome.args),
                              "ok" if outcome.ok else f"refused: {outcome.text.splitlines()[0][:200]}")
                     ev.tool(outcome)

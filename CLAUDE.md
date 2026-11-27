@@ -29,7 +29,7 @@ daedalus/
 │   └── smoke_read.py         # live read-layer smoke test against the real registry
 ├── src/daedalus/
 │   ├── mcp_server.py         # daedalus-mcp: the stdio MCP server for the Claude desktop app
-│   ├── toolset.py            # the agent tools, shared by daedalus-mcp (nine) and the terminal agent (twelve)
+│   ├── toolset.py            # the agent tools: daedalus-mcp (nine), the terminal agent (twelve; fourteen in coder mode)
 │   ├── secrets.py            # API keys in the macOS Keychain (`python -m daedalus.secrets set|status`)
 │   ├── queue_cli.py          # debug CLI for the queue (list/diff/apply/reject); the REPL replaces it
 │   ├── state.py              # `python -m daedalus.state` entry point (logic in core/state.py)
@@ -67,7 +67,8 @@ daedalus/
 │       ├── gate.py           # the design-decision gate: check_basis, find_precedent, propose_with_basis
 │       ├── accept.py         # ask_user's question, /answer, /promote
 │       ├── ingest.py         # /add: local documents into sources/ as markdown (MarkItDown)
-│       └── tools.py          # note read tools; list_files/read_code; propose_note/edit/lesson; write_log
+│       ├── worktree.py       # agent worktrees: create, list, diff, commit, merge (yours), drop
+│       └── tools.py          # note read tools; list_files/read_code; propose_*; write_log; edit/write/delete_code
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
 │   └── shared-vault/         # copied to create ~/daedalus/shared/
@@ -184,6 +185,7 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 - `/new <name> --repo <path>`, `/vaults`, `/vault <name>`, `/pull <name>`, `/drop <name>`, `/end`;
 - `/open <note>`, `/here`, `/add <file>`;
 - `/answer <question-id> <option-number | "free text">`, `/promote <inbox-note> [folder]`;
+- `/wt new <slug>`, `/wt list`, `/wt diff <slug>`, `/wt merge <slug>`, `/wt drop <slug> [--force]`, `/code <slug>`, `/code off`;
 - `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
 
 `queue_cli` stays as a debug tool. The REPL changes the session only through its own commands, which write `state.json` through `daedalus.core.state`; `daedalus-mcp` follows on its next call.
@@ -210,7 +212,7 @@ Any failure rolls back in reverse. Each undo is armed before its step and tolera
 
 **The API key lives in the macOS Keychain,** through `keyring`: service `daedalus`, account `deepseek`, never in a file. `python -m daedalus.secrets set deepseek` stores it (via `getpass`), and `status` says whether one is present without printing it. `DEEPSEEK_API_KEY` overrides the Keychain, for tests and CI. With no key, `daedalus` exits saying how to set one, before any client exists.
 
-**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus `propose_edit` and `propose_lesson` for `/end`, and `ask_user`: twelve. daedalus-mcp keeps the first nine. The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
+**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus `propose_edit` and `propose_lesson` for `/end`, and `ask_user`: twelve. daedalus-mcp keeps the first nine. Coder mode has its own fourteen (below). The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
 
 **Pricing** (`terminal/pricing.py`, one table with `checked: 2026-11-25`). USD per 1M tokens, off-peak; peak is double.
 
@@ -458,3 +460,32 @@ allow_localhost = false      # true only if tests need to bind local sockets
 No file means the project can't run commands, and the refusal shows how to add one. Unknown tables or keys are errors, and so are an `allow` entry with a `/`, a non-integer timeout, and a non-boolean `allow_localhost`.
 
 **`python -m daedalus.sandbox run --project <name> [--worktree <path>] -- <program> [args]`** runs one command for a registered project without touching `state.json`. The worktree defaults to your checkout, which the run can read but never write. It prints the output tails and `— sandboxed: exit N in S s`, and exits with the command's code (124 on timeout, 2 if refused).
+
+## Worktrees and coder mode
+
+★ **Agents write code only in worktrees, and only you merge.** Your checkout is never written by an agent: rule 6 confines `WRITE_CODE` to the session's worktree, and merging is a REPL command, never a tool.
+
+**Where.** ★ Each worktree lives at `~/.cache/daedalus/worktrees/<project>/<slug>-<6 hex>/`, not beside the repo, so `~/code` stays clean, on branch `agent/<slug>`. Slugs follow the registry's project-name rules. `daedalus.core.worktree` records what it creates in `~/.local/state/daedalus/worktrees.json`. `Session.worktree` is set only while coder mode is on; `state.json` never holds it, so daedalus-mcp's sessions never have one.
+
+**The lifecycle** (`daedalus.core.worktree`; create, merge, and drop hold the vault write lock, since apply commits into the same repo):
+- `create(session, slug)`: `git worktree add -b agent/<slug> <path> HEAD` from your checkout. Refused if the slug, branch, or path is taken. If your checkout has uncommitted changes, it warns that the worktree starts from HEAD and won't see them.
+- `list_worktrees(registry, project)`: slug, branch, path, commits ahead of your HEAD, and uncommitted changes, merged with `git worktree list --porcelain`. A worktree git knows but daedalus didn't create is reported as unrecorded; a recorded one that's gone, as missing.
+- `diff(registry, project, slug)`: `git diff HEAD...agent/<slug>`, the branch against its merge base.
+- `commit(session, message)`: `git add -A` in the worktree, then commit with the trailer `Daedalus-Worktree: <slug>`. ★ `git add -A` is safe here, unlike in your checkout: only the edit tools write the worktree (sandboxed runs can't), and its `vault/` and `.git` are unwritable. It still checks after staging that no staged path is under `vault/`, and if one is, unstages everything and aborts.
+- `merge(registry, project, slug)`, **your action only**: refused if your checkout has uncommitted changes (untracked files included), if the branch has nothing to merge, or if it touches `vault/`. Then `git merge --no-ff agent/<slug>` (subject `merge: agent/<slug>`, same trailer), so the merge shows in history. On a conflict it runs `git merge --abort`, confirms HEAD and `git status` are as before, and names the conflicting files.
+- `drop(registry, project, slug, force=False)`: `git worktree remove`, then deletes the branch. ★ **Drop protection:** refused if `agent/<slug>` has commits not merged into HEAD, or the worktree has uncommitted changes, unless `force`. Unmerged agent work is never thrown away by accident.
+
+**Code tools** (`daedalus.core.tools`, for the agent in coder mode):
+- **Reads follow the worktree.** With a worktree active, `read_code` and `list_files` read it, so the agent sees its own edits; without one, your checkout, as before.
+- ★ **`edit_code(rel_path, old, new)`** is the default editing tool: an exact replacement, far cheaper in output tokens than rewriting a file. **`old` must occur exactly once**; zero or several matches are refused with the count, and the file is left alone.
+- **`write_code(rel_path, content)`** creates a file (making missing folders) or replaces one whole, at most 64 KB before and after. **`delete_code(rel_path)`** deletes one.
+- Each authorizes `Op.WRITE_CODE` (rules 1, 4, 6; an absolute path is left to the policy, so one into your checkout is rule 6 by name), writes atomically through an `O_NOFOLLOW` directory fd, and re-checks the realpath afterwards, restoring the file if it moved, as apply does. Binary (a NUL byte) and non-UTF-8 content is refused, and an edit keeps the file's mode. Every edit lands in the conversation's in-memory `EditLog`, for 10c's summaries.
+- **`run(argv)`** is 10a's sandboxed runner in the session's worktree. It returns the exit code, duration, timed-out flag, and the last 20,000 characters of stdout and 8,000 of stderr. `repl.log` gets metadata only: the program, the argument count, exit, duration, and output sizes; never the arguments' text or the output.
+
+**The coder profile.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `edit_code`, `write_code`, `delete_code`, `run`, `find_precedent`, `ask_user`: fourteen, with its own preamble (block 1 of the system prompt) and its own wording for `read_code` and `list_files`. The chat profile's twelve and daedalus-mcp's nine are unchanged; each set has an exact-set test.
+
+**Coder mode in the REPL.**
+- `/code <slug>` sets `Session.worktree`, switches to the coder profile, starts a fresh conversation, and shows `[coding <project> · agent/<slug>] › ` as the prompt. Each `run` prints its exit code, its time, and the last 12 lines of its output.
+- `/code off` offers to commit the worktree's uncommitted changes. The default message is written by a separate, tool-less one-shot call (metered and capped like any other, outside the conversation, so it can't act); Enter accepts it. Declining leaves the changes in the worktree. Then it's back to the chat profile, with a fresh conversation.
+- `/end` in coder mode does the same, then the usual `CONTEXT.md` proposal, written by a chat-profile agent (coder mode has no `propose_edit`) from a summary of the coding session: the branch, the edits, the runs, and the commit.
+- `/vault` in coder mode leaves coder mode first. `/pull` and `/drop` keep it. `/wt drop` of the worktree you're coding in is refused.

@@ -15,15 +15,20 @@ it at once; logs are records, not decisions, so they need no approval.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import os
 import re
+import stat
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import NamedTuple
 
 from . import index, notes, queue
 from .apply import repo_for, vault_root
 from .vaultio import (
-    check_still_authorized, commit_path, git, open_dir_nofollow, restore_at, unstage, write_lock,
+    atomic_write_at, check_still_authorized, commit_path, git, open_dir_nofollow, read_at, restore_at, unstage,
+    write_lock,
 )
 from .links import Catalog, Match, link_scope, parse_link, resolve
 from .policy import Op, PolicyError, authorize
@@ -203,23 +208,33 @@ def _in_vault(rel: str, vault_rel: str) -> bool:
     return rel == vault_rel or rel.startswith(vault_rel + "/")
 
 
+def code_root(session: Session) -> tuple[Path, Area]:
+    """Where the code tools read: the worktree while one is active (the agent must see its own edits), else
+    the active repo."""
+    if session.worktree is not None:
+        return session.worktree, Area.WORKTREE
+    return session.active_repo, Area.ACTIVE_REPO
+
+
 def _repo_target(session: Session, rel_path: str, what: str):
-    """Authorize READ of ``rel_path`` in the active repo, refusing paths that land in a vault."""
+    """Authorize READ of ``rel_path`` in the code root, refusing paths that land in a vault."""
     if not isinstance(rel_path, str) or os.path.isabs(rel_path):
         raise ReadError(f"{what} {rel_path!r} must be a path relative to the repo root")
-    auth = authorize(session.active_repo / rel_path, Op.READ, session)
-    if auth.area is not Area.ACTIVE_REPO:
+    root, area = code_root(session)
+    auth = authorize(root / rel_path, Op.READ, session)
+    if auth.area is not area:
         where = f"the {auth.vault} vault" if auth.vault else auth.area.value
         raise ReadError(f"{rel_path!r} is in {where}; vault notes are read with read_note and list_notes")
     return auth
 
 
 def list_files(session: Session, subdir: str = "") -> FileList:
-    """The active repo's files, as git sees them: tracked plus untracked, minus .gitignore'd, minus vault/.
+    """The code root's files (the worktree's while one is active, else the active repo's), as git sees them:
+    tracked plus untracked, minus .gitignore'd, minus vault/.
 
     At most MAX_FILES paths; ``truncated`` says the list was cut short.
     """
-    repo = session.active_repo
+    repo, _ = code_root(session)
     subdir = (subdir or "").strip()
     pathspec: list[str] = []
     if subdir not in ("", ".", "/"):
@@ -246,7 +261,8 @@ def list_files(session: Session, subdir: str = "") -> FileList:
 
 def read_code(session: Session, rel_path: str, start_line: int | None = None,
               end_line: int | None = None) -> CodeChunk:
-    """Lines ``start_line``..``end_line`` (1-based, inclusive) of a text file in the active repo.
+    """Lines ``start_line``..``end_line`` (1-based, inclusive) of a text file in the code root: the
+    worktree while one is active, else the active repo.
 
     At most MAX_LINES lines and MAX_CHARS characters per call; page with
     ``next_start_line``. Binary files (a NUL byte in the first 8 KB) are refused.
@@ -473,3 +489,162 @@ def write_log(session: Session, run_id: str, body: str, source: str) -> str:
                 raise
         finally:
             os.close(dirfd)
+
+
+# Code edits ---------------------------------------------------------------------------
+# Only in the worktree (rule 6: WRITE_CODE is allowed nowhere else), written atomically with the same
+# realpath re-check as apply. edit_code is the default: a replacement costs far fewer output tokens than a
+# rewrite. Every edit lands in the session's EditLog, which commit 10c's summaries use.
+
+MAX_WRITE_BYTES = 64 * 1024
+NEW_FILE_MODE = 0o644
+
+
+class CodeEditError(Exception):
+    """A code edit was refused: no match, several matches, binary or non-UTF-8 content, too large, missing."""
+
+
+@dataclass(frozen=True)
+class Edit:
+    op: str  # "edit", "write", "create", "delete"
+    rel_path: str  # worktree-relative
+    before_sha256: str | None
+    after_sha256: str | None
+    bytes_before: int
+    bytes_after: int
+    at: str  # UTC, ISO 8601
+
+
+@dataclass
+class EditLog:
+    """This conversation's edits, in order. In memory only."""
+
+    edits: list[Edit] = field(default_factory=list)
+
+    def add(self, edit: Edit) -> Edit:
+        self.edits.append(edit)
+        return edit
+
+    def paths(self) -> list[str]:
+        return list(dict.fromkeys(e.rel_path for e in self.edits))
+
+
+def _sha(data: bytes | None) -> str | None:
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def _code_target(session: Session, rel_path: str):
+    """Authorize WRITE_CODE on ``rel_path`` in the active worktree (rules 1, 4, and 6)."""
+    if session.worktree is None:
+        raise PolicyError(6, str(rel_path), "no worktree is active, and code is written only in a worktree "
+                                            "(/wt new <slug>, then /code <slug>)")
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        raise CodeEditError(f"rel_path {rel_path!r} must be a path relative to the worktree root")
+    # An absolute path is left to the policy, so one into your checkout is refused by rule 6, by name.
+    return authorize(session.worktree / rel_path, Op.WRITE_CODE, session)
+
+
+def _text(data: bytes, what: str) -> str:
+    if b"\0" in data:
+        raise CodeEditError(f"{what} contains a NUL byte; binary content isn't written")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise CodeEditError(f"{what} isn't valid UTF-8 (byte {e.start}); only UTF-8 text is written") from None
+
+
+def _check_new_text(content: str, what: str) -> bytes:
+    if not isinstance(content, str):
+        raise CodeEditError(f"{what} must be a string")
+    if "\0" in content:
+        raise CodeEditError(f"{what} contains a NUL byte; binary content isn't written")
+    try:
+        return content.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise CodeEditError(f"{what} can't be encoded as UTF-8 ({e.reason})") from None
+
+
+def _write(auth, data: bytes, mode: int | None) -> None:
+    """Atomically write ``data`` at the authorized path, then confirm it still resolves there."""
+    os.makedirs(auth.path.parent, exist_ok=True)  # new folders inside the worktree, for a new file
+    dirfd = open_dir_nofollow(auth.path.parent)
+    try:
+        previous = read_at(dirfd, auth.path.name)
+        atomic_write_at(dirfd, auth.path.name, data, mode)
+        try:
+            check_still_authorized(auth.path)
+        except PolicyError:
+            restore_at(dirfd, auth.path.name, previous)
+            raise
+    finally:
+        os.close(dirfd)
+
+
+def _existing(auth) -> tuple[bytes, int] | None:
+    if not os.path.lexists(auth.path):
+        return None
+    if not stat.S_ISREG(os.lstat(auth.path).st_mode):
+        raise CodeEditError(f"{auth.rel} isn't a regular file")
+    dirfd = open_dir_nofollow(auth.path.parent)
+    try:
+        return read_at(dirfd, auth.path.name)
+    finally:
+        os.close(dirfd)
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def edit_code(session: Session, rel_path: str, old: str, new: str, log: EditLog | None = None) -> Edit:
+    """Replace the one occurrence of ``old`` with ``new`` in a worktree file. ``old`` must occur exactly once."""
+    auth = _code_target(session, rel_path)
+    if not isinstance(old, str) or not old:
+        raise CodeEditError("old must be a non-empty string copied exactly from the file")
+    _check_new_text(new, "new")
+    found = _existing(auth)
+    if found is None:
+        raise CodeEditError(f"{auth.rel} doesn't exist; create it with write_code")
+    data, mode = found
+    text = _text(data, auth.rel)
+    count = text.count(old)
+    if count != 1:
+        how = ("isn't in the file; copy it exactly, whitespace included (read_code shows the current text)"
+               if count == 0 else "matches more than once; include more surrounding lines so it matches once")
+        raise CodeEditError(f"old matches {count} times in {auth.rel}: it {how}")
+    after = text.replace(old, new, 1).encode("utf-8")
+    _write(auth, after, mode)
+    edit = Edit("edit", auth.rel, _sha(data), _sha(after), len(data), len(after), _now())
+    return log.add(edit) if log is not None else edit
+
+
+def write_code(session: Session, rel_path: str, content: str, log: EditLog | None = None) -> Edit:
+    """Create a worktree file, or replace a small one (at most 64 KB, before and after)."""
+    auth = _code_target(session, rel_path)
+    data = _check_new_text(content, "content")
+    if len(data) > MAX_WRITE_BYTES:
+        raise CodeEditError(f"content is {len(data):,} bytes; write_code takes at most {MAX_WRITE_BYTES:,}. Write a "
+                            "smaller file, or change an existing one with edit_code")
+    found = _existing(auth)
+    if found is not None and len(found[0]) > MAX_WRITE_BYTES:
+        raise CodeEditError(f"{auth.rel} is {len(found[0]):,} bytes, too large to replace whole; change it with "
+                            "edit_code")
+    _write(auth, data, found[1] if found is not None else NEW_FILE_MODE)
+    edit = Edit("write" if found is not None else "create", auth.rel, _sha(found[0]) if found else None, _sha(data),
+                len(found[0]) if found else 0, len(data), _now())
+    return log.add(edit) if log is not None else edit
+
+
+def delete_code(session: Session, rel_path: str, log: EditLog | None = None) -> Edit:
+    """Delete a file in the worktree."""
+    auth = _code_target(session, rel_path)
+    found = _existing(auth)
+    if found is None:
+        raise CodeEditError(f"{auth.rel} doesn't exist")
+    dirfd = open_dir_nofollow(auth.path.parent)
+    try:
+        os.unlink(auth.path.name, dir_fd=dirfd)
+    finally:
+        os.close(dirfd)
+    edit = Edit("delete", auth.rel, _sha(found[0]), None, len(found[0]), 0, _now())
+    return log.add(edit) if log is not None else edit

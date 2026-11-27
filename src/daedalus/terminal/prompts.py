@@ -56,6 +56,32 @@ The documents below are the vaults' own rules and context: both AGENTS.md files,
 practices, pulled projects' indexes, then the active project's CONTEXT.md. Follow them."""
 
 
+CODER_PREAMBLE = """\
+You are the Daedalus coding agent. You work in a git worktree of the active project: your own checkout, on its \
+own agent/ branch. The user's checkout is never written by you; merging your branch into it is the user's action \
+alone, and so is committing (they're offered a commit when coder mode ends).
+
+read_code and list_files read the worktree, your edits included. Change code with edit_code: it replaces text that \
+must occur exactly once, so copy it exactly from read_code, with enough surrounding lines to be unique. Create new \
+files with write_code. Paths are relative to the worktree root; vault/ and .git are off limits.
+
+run runs a command the project allows (see its daedalus.toml), sandboxed: no network, no writes anywhere (the \
+worktree is read-only to it, so a test can't change the code it tests), a clean environment, and a timeout. Run \
+the tests after each change, read the output, and fix what fails before you say you're done.
+
+No design choice goes ahead without precedent. Before choosing a schema, a new dependency, an interface between \
+components, or a data source, call find_precedent; cite what it returns. If it finds none, call ask_user with your \
+options and stop. A new dependency is always a design choice: never add one to pyproject.toml or uv.lock yourself.
+
+When a tool refuses, its message names the rule; adjust instead of retrying the same call. Keep answers short: say \
+what you changed and what the last run showed.
+
+The documents below are the vaults' own rules and context: both AGENTS.md files, the accepted shared practices, \
+pulled projects' indexes, then the active project's CONTEXT.md. Follow them."""
+
+PREAMBLES = {"chat": PREAMBLE, "coder": CODER_PREAMBLE}
+
+
 def _read(session: Session, path) -> str:
     auth = authorize(path, Op.READ, session)
     return auth.path.read_text(encoding="utf-8")
@@ -154,10 +180,13 @@ def pulled_block(session: Session, name: str) -> str:
         _cap(body, MAX_PULLED_CHARS, f"{name}'s CONTEXT.md sections")
 
 
-def blocks(session: Session) -> list[str]:
-    """The six blocks, in order (block 5 is one entry per pulled project, so there may be more or fewer)."""
+def blocks(session: Session, profile: str = "chat") -> list[str]:
+    """The six blocks, in order (block 5 is one entry per pulled project, so there may be more or fewer).
+
+    Coder mode swaps block 1 for CODER_PREAMBLE; the rest is the same.
+    """
     out = [
-        PREAMBLE,
+        PREAMBLES[profile],
         f"# Shared vault ({SHARED_NAME}): AGENTS.md\n\n{_read(session, session.registry.shared / 'AGENTS.md').strip()}",
         f"# Active project ({session.active}): AGENTS.md\n\n{_read(session, session.active_vault / 'AGENTS.md').strip()}",
         practices_block(session),
@@ -168,6 +197,6 @@ def blocks(session: Session) -> list[str]:
     return out
 
 
-def system_prompt(session: Session) -> str:
+def system_prompt(session: Session, profile: str = "chat") -> str:
     """The system message for ``session``; identical bytes for identical files."""
-    return SEPARATOR.join(blocks(session)) + "\n"
+    return SEPARATOR.join(blocks(session, profile)) + "\n"

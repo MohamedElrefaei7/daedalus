@@ -179,7 +179,8 @@ def test_bad_arguments_go_back_too(agent, fake) -> None:
 
 
 def test_tool_results_capped_at_60000_chars(agent, fake, gworld) -> None:
-    write_raw(gworld.alpha_repo, "big.txt", ("y" * 99 + "\n") * 2000)  # 200,000 chars: read_code's own cap
+    # 200,000 chars: read_code's own cap. The world's session has a worktree, so that's where read_code reads.
+    write_raw(gworld.worktree, "big.txt", ("y" * 99 + "\n") * 2000)
     fake.responses += [tool_reply("read_code", {"rel_path": "big.txt"}), reply_chunks("big")]
     rec = Recorder()
     agent.turn("read it", rec)

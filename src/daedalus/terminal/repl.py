@@ -2,14 +2,15 @@
 
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
-Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /add, /answer, /promote, /end, /cost, /pending,
-/diff, /approve, /reject, /help, /quit.
+Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /add, /answer, /promote, /wt, /code, /end, /cost,
+/pending, /diff, /approve, /reject, /help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import logging
 import secrets as _stdlib_secrets
@@ -24,7 +25,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from daedalus import secrets
-from daedalus.core import accept, queue
+from daedalus.core import accept, queue, worktree
 from daedalus.core.apply import apply, diff, pending, reject
 from daedalus.core.ingest import ingest
 from daedalus.core.lifecycle import LifecycleError, new_project
@@ -33,6 +34,7 @@ from daedalus.core.registry import RegistryError, load_registry
 from daedalus.core.session import Session
 from daedalus.core.state import StateError, drop, load_session, pull, set_active
 from daedalus.core.tools import RefError
+from daedalus.sandbox.errors import SandboxError
 
 from . import ledger, obsidian
 from daedalus.toolset import refusal
@@ -55,6 +57,13 @@ HELP = """\
 /add <file>            convert a local .pdf/.docx/.pptx/.xlsx (or .md/.txt) into sources/ and commit it
 /answer <id> <n|text>  answer a design question: its option number, or your own answer in quotes
 /promote <note> [dir]  accept an inbox draft into the folder its type maps to (e.g. components/)
+/wt new <slug>         a git worktree for the agent, on branch agent/<slug>, from your checkout's HEAD
+/wt list               worktrees: branch, commits ahead, uncommitted changes
+/wt diff <slug>        what agent/<slug> changes, against its merge base with HEAD
+/wt merge <slug>       merge agent/<slug> into your checkout (--no-ff); refused if your checkout is dirty
+/wt drop <slug> [--force]  remove the worktree and its branch; unmerged work needs --force
+/code <slug>           coder mode: the agent edits and runs checks in that worktree (fresh conversation)
+/code off              leave coder mode, offering to commit the worktree's changes
 /end                   propose a CONTEXT.md log entry for this session, review proposals, exit
 /cost                  calls, tokens, and dollars for this session and today, plus the DeepSeek balance
 /pending               proposals waiting for you
@@ -66,6 +75,10 @@ HELP = """\
 Ctrl-C stops a streaming answer; the call is recorded as an estimate."""
 
 REASONING_TAIL = 6  # lines of reasoning shown while it streams
+RUN_TAIL_LINES = 12  # lines of a run's output shown in the terminal
+
+COMMIT_SYSTEM = ("You write git commit messages. Reply with exactly one line: imperative mood, at most 72 "
+                 "characters, no quotes, no trailing period.")
 
 
 class LiveView(Events):
@@ -141,7 +154,15 @@ class LiveView(Events):
 
     def tool(self, outcome: ToolOutcome) -> None:
         label = tool_label(outcome.name, outcome.args)
-        if outcome.ok:
+        if outcome.ok and outcome.name == "run" and outcome.result:
+            r = outcome.result
+            state = "timed out" if r.get("timed_out") else f"exit {r.get('exit_code')}"
+            style = "green" if r.get("exit_code") == 0 and not r.get("timed_out") else "yellow"
+            self.console.print(Text(f"{label}  · sandboxed · {state} in {r.get('duration_s', 0):.2f} s", style=style))
+            lines = (r.get("stdout_tail") or "").rstrip("\n").splitlines()[-RUN_TAIL_LINES:]
+            for line in lines:
+                self.console.print(Text(f"  │ {line}", style="dim"))
+        elif outcome.ok:
             self.console.print(Text(label, style="green"))
         else:
             first = outcome.text.splitlines()[0] if outcome.text else "refused"
@@ -204,6 +225,15 @@ class Repl:
         # prefix DeepSeek caches. One at a time: a second /here replaces it.
         self.attached: obsidian.Here | None = None
         self.read_line: Callable[..., str] = lambda prompt="› ": input(prompt)
+        self.coding: worktree.Record | None = None  # set in coder mode (/code <slug>)
+        # What coder mode did this terminal session, for /end: each stint's summary, and its proposals.
+        self.coded: list[str] = []
+        self.carried_proposals: list[str] = []
+
+    def prompt(self) -> str:
+        if self.coding is not None:
+            return f"[coding {self.session.active} · {self.coding.branch}] › "
+        return "› "
 
     # The loop -------------------------------------------------------------------------
 
@@ -215,7 +245,7 @@ class Repl:
             f"${self.cfg.daily_cap_usd:.2f}/day · /help", style="bold"))
         while True:
             try:
-                line = read_line("› ")
+                line = read_line(self.prompt())
             except KeyboardInterrupt:
                 continue
             except EOFError:
@@ -263,7 +293,11 @@ class Repl:
             if name == "/end":
                 self.end()
                 return "quit"
-            if name == "/new":
+            if name == "/wt":
+                self.wt(rest)
+            elif name == "/code":
+                self.code(rest)
+            elif name == "/new":
                 self.new(rest)
             elif name == "/vaults":
                 self.vaults()
@@ -272,6 +306,8 @@ class Repl:
             elif name in ("/pull", "/drop"):
                 change = pull if name == "/pull" else drop
                 self.session = change(self._id(rest, f"{name} <name>"), self.registry_path, self.state_path)
+                if self.coding is not None:  # state.json never holds the worktree; keep coding in it
+                    self.session = dataclasses.replace(self.session, worktree=Path(self.coding.path))
                 self.agent.rebuild(self.session)
                 if self.attached is not None and self.attached.vault not in {v for v, _ in self.session.scope}:
                     self.console.print(f"dropped the /here attachment {self.attached.ref}: its vault left the session.")
@@ -322,8 +358,12 @@ class Repl:
                 self.console.print(Text(f"unknown command {name}; /help lists them", style="yellow"))
         except PolicyError as e:
             self.console.print(Text(f"error: {refusal(e)}", style="red"))
+        except worktree.MergeConflict as e:
+            self.console.print(Text(f"error: {e}", style="red"))
+            for f in e.files:
+                self.console.print(Text(f"  conflict: {f}", style="red"))
         except (queue.ProposalError, StateError, RegistryError, LifecycleError, KeyError, ValueError, RefError,
-                obsidian.ObsidianError) as e:
+                obsidian.ObsidianError, worktree.WorktreeError, SandboxError) as e:
             self.console.print(Text(f"error: {e}", style="red"))
         return None
 
@@ -349,6 +389,8 @@ class Repl:
         if name == self.session.active:
             self.console.print(f"{name} is already the active project.")
             return
+        if self.coding is not None:
+            self.leave_coding()
         self.session = set_active(name, self.registry_path, self.state_path)
         # A fresh conversation: history about the old project mustn't carry into this one. Same session id,
         # so the session spend cap carries over: it belongs to this terminal, not to a project.
@@ -356,6 +398,130 @@ class Repl:
         self.attached = None  # a fresh conversation starts with nothing attached
         self.console.print(Text(f"Switched to {name}. Fresh conversation: history cleared, system prompt rebuilt "
                                 f"from {name}'s AGENTS.md and CONTEXT.md.", style="bold"))
+
+    # Worktrees and coder mode ---------------------------------------------------------
+
+    def wt(self, rest: str) -> None:
+        words = shlex.split(rest)
+        sub, args = (words[0], words[1:]) if words else ("", [])
+        registry, project = self.session.registry, self.session.active
+        if sub == "new" and len(args) == 1:
+            made = worktree.create(self.session, args[0])
+            r = made.record
+            self.console.print(f"created {r.path}")
+            self.console.print(f"  branch {r.branch}, from {project}'s HEAD ({r.base[:7]}). Next: /code {r.slug}")
+            if made.warning:
+                self.console.print(Text(f"  ⚠ {made.warning}", style="yellow"))
+        elif sub == "list" and not args:
+            rows = worktree.list_worktrees(registry, project)
+            for w in rows:
+                if w.state == "unrecorded":
+                    self.console.print(Text(f"? {w.branch or '(detached)'}  {w.path}  (git knows this worktree; "
+                                            "daedalus didn't create it)", style="yellow"))
+                elif w.state == "missing":
+                    self.console.print(Text(f"! {w.slug:16} {w.branch}  missing: {w.path}", style="yellow"))
+                else:
+                    mark = "*" if self.coding is not None and self.coding.slug == w.slug else " "
+                    changes = "uncommitted changes" if w.dirty else "clean"
+                    self.console.print(f"{mark} {w.slug:16} {w.branch:24} {w.ahead} ahead  {changes:19}  {w.path}")
+            if not rows:
+                self.console.print(f"no worktrees for {project}; /wt new <slug> makes one")
+        elif sub == "diff" and len(args) == 1:
+            text = worktree.diff(registry, project, args[0])
+            self.console.print(Text(text) if text.strip() else f"agent/{args[0]} has no committed changes yet.")
+            if worktree.changes(project, args[0]):
+                self.console.print(Text("  (the worktree also has uncommitted changes, not shown)", style="dim"))
+        elif sub == "merge" and len(args) == 1:
+            sha = worktree.merge(registry, project, args[0])
+            self.console.print(f"merged agent/{args[0]} into {self.session.active_repo} as {sha[:7]} (--no-ff)")
+            self.console.print(Text(f"  /wt drop {args[0]} removes the worktree and its branch.", style="dim"))
+        elif sub == "drop" and len(args) in (1, 2) and (len(args) == 1 or args[1] == "--force"):
+            if self.coding is not None and self.coding.slug == args[0]:
+                raise ValueError(f"you're coding in {args[0]}; /code off first")
+            r = worktree.drop(registry, project, args[0], force=len(args) == 2)
+            self.console.print(f"dropped {r.path} and {r.branch}")
+        else:
+            raise ValueError("usage: /wt new <slug> | /wt list | /wt diff <slug> | /wt merge <slug> | "
+                             "/wt drop <slug> [--force]")
+
+    def code(self, rest: str) -> None:
+        if rest == "off":
+            if self.coding is None:
+                raise ValueError("you're not in coder mode")
+            self.leave_coding()
+            self.console.print(Text("Left coder mode. Fresh conversation, chat tools.", style="bold"))
+            return
+        slug = self._id(rest, "/code <slug> | /code off")
+        if self.coding is not None:
+            raise ValueError(f"already coding in {self.coding.slug}; /code off first")
+        rec = worktree.get(self.session.active, slug)
+        if not Path(rec.path).is_dir():
+            raise ValueError(f"{rec.path} is missing; /wt list shows the worktrees")
+        self.session = dataclasses.replace(self.session, worktree=Path(rec.path))
+        self.agent = Agent(self.session, self.ds, self.cfg, self.session_id, meter=self.agent.meter, profile="coder")
+        self.attached = None
+        self.coding = rec
+        self.console.print(Text(f"Coding {self.session.active} on {rec.branch} in {rec.path}. Fresh conversation; "
+                                "the agent can edit_code, write_code, delete_code, and run checks there, sandboxed. "
+                                "/code off leaves.", style="bold"))
+
+    def commit_message(self, changes: list[str]) -> str:
+        """An agent-written one-line message for the worktree's changes; the edit log's paths if that fails."""
+        edits = self.agent.edit_log.edits
+        fallback = "agent: " + (", ".join(f"{e.op} {e.rel_path}" for e in edits[-4:]) or "update worktree")
+        asks = [m["content"] for m in self.agent.history if m.get("role") == "user"][:3]
+        runs = [f"{' '.join(r['argv'] or [])} → exit {r['exit_code']}" for r in self.agent.runs[-3:]]
+        user = ("What the user asked:\n" + "\n".join(f"- {a[:300]}" for a in asks) +
+                "\n\nChanged paths (git status --porcelain):\n" + "\n".join(changes[:40]) +
+                "\n\nEdits:\n" + "\n".join(f"- {e.op} {e.rel_path}" for e in edits[-40:]) +
+                ("\n\nLast runs:\n" + "\n".join(runs) if runs else ""))
+        try:
+            line = self.agent.one_shot(COMMIT_SYSTEM, user).splitlines()
+        except (CapExceeded, DeepSeekError, Interrupted, KeyboardInterrupt):
+            return fallback[:72]
+        message = (line[0] if line else "").strip().strip("\"'`").rstrip(".")
+        return message[:72] or fallback[:72]
+
+    def leave_coding(self) -> str:
+        """Offer to commit the worktree's changes, then go back to the chat profile with a fresh conversation.
+
+        Returns a summary of the coding session, for /end's log entry.
+        """
+        rec, coder = self.coding, self.agent
+        assert rec is not None
+        changes = worktree.uncommitted(self.session)
+        committed = None
+        if changes:
+            self.console.print(f"The {rec.slug} worktree has {len(changes)} uncommitted change(s):")
+            for line in changes[:20]:
+                self.console.print(Text(f"  {line}", style="dim"))
+            try:
+                yes = self.read_line(f"commit them to {rec.branch}? [Y/n] ").strip().lower() in ("", "y", "yes")
+            except (EOFError, KeyboardInterrupt):
+                yes = False
+            if yes:
+                default = self.commit_message(changes)
+                try:
+                    message = self.read_line(f"message [{default}]: ").strip() or default
+                except (EOFError, KeyboardInterrupt):
+                    message = default
+                sha = worktree.commit(self.session, message)
+                committed = (sha, message)
+                self.console.print(Text(f"committed {sha[:7]} on {rec.branch}: {message}", style="green"))
+            else:
+                self.console.print(f"Left them uncommitted in the worktree; /code {rec.slug} picks them up again.")
+        self.session = dataclasses.replace(self.session, worktree=None)
+        self.agent = Agent(self.session, self.ds, self.cfg, self.session_id, meter=coder.meter)
+        self.coding = None
+        self.carried_proposals += coder.proposals
+        runs = "; ".join(f"{' '.join(r['argv'] or [])} → exit {r['exit_code']}" for r in coder.runs) or "none"
+        edits = ", ".join(f"{e.op} {e.rel_path}" for e in coder.edit_log.edits) or "none"
+        outcome = (f"committed {committed[0][:7]} \"{committed[1]}\"" if committed else
+                   "uncommitted changes left in the worktree" if changes else "nothing to commit")
+        summary = (f"Coder mode on {rec.branch} ({rec.path}): edits: {edits}. Runs: {runs}. Then: {outcome}. "
+                   "Merging is the user's action (/wt merge).")
+        self.coded.append(summary)
+        return summary
 
     # Sources ----------------------------------------------------------------------------
 
@@ -403,16 +569,27 @@ class Repl:
     # /end -------------------------------------------------------------------------------
 
     def end(self) -> None:
-        """Propose this session's CONTEXT.md log entry (and any lessons), walk the proposals, then exit."""
-        if self.agent.tool_calls == 0 and not self.agent.proposals:
+        """Propose this session's CONTEXT.md log entry (and any lessons), walk the proposals, then exit.
+
+        In coder mode it first leaves coder mode (offering the commit). The log entry is then written by a
+        chat-profile agent, which has propose_edit, from a summary of the coding session.
+        """
+        if self.coding is not None:
+            self.leave_coding()
+        carried = self.carried_proposals
+        if not self.coded and self.agent.tool_calls == 0 and not self.agent.proposals and not carried:
             self.console.print("Nothing happened in this session that needs a log entry. Bye.")
             return
         context = authorize(self.session.active_vault / "CONTEXT.md", Op.READ, self.session).path
         current = context.read_text(encoding="utf-8")
         self.console.print(Text(f"Writing the session summary for {self.session.active}'s CONTEXT.md …", style="bold"))
-        self.ask(END_PROMPT.format(date=dt.date.today().isoformat(), project=self.session.active,
-                                   context=current if current.endswith("\n") else current + "\n"), attach=False)
-        self.review(self.agent.proposals)
+        prompt = END_PROMPT.format(date=dt.date.today().isoformat(), project=self.session.active,
+                                   context=current if current.endswith("\n") else current + "\n")
+        if self.coded:
+            prompt = ("This session included coder mode, which has no propose_edit, so you write its log entry: "
+                      + " ".join(self.coded) + f"\n\n{prompt}")
+        self.ask(prompt, attach=False)
+        self.review(carried + self.agent.proposals)
 
     def review(self, ids: list[str]) -> None:
         """Walk proposals one at a time: approve, reject with a reason, or skip (leave pending)."""

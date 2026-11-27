@@ -215,9 +215,10 @@ class World:
         return {"shared": self.shared, "alpha": self.alpha_repo, "beta": self.beta.parent, "gamma": self.gamma.parent}
 
     def snapshot(self) -> dict[str, Any]:
-        """Every vault's digest, every repo's HEAD, and every queue record's status."""
+        """Every vault's digest, the checkout's and the worktree's, every repo's HEAD, and every queue status."""
         return {
-            "digests": {name: vault_digest(v) for name, v in self.vaults.items()},
+            "digests": {**{name: vault_digest(v) for name, v in self.vaults.items()},
+                        "checkout": vault_digest(self.alpha_repo), "worktree": tree_hash(self.worktree)},
             "heads": {name: head(r) for name, r in self.repos.items()},
             "queue": queue.statuses(),
         }

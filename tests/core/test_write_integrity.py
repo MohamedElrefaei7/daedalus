@@ -15,7 +15,9 @@ each row, all of these hold:
 Since commit 10a, sandbox.runner.run has rows for rule 7. A refused command
 must also spawn no process: each row's injected executor records every spawn
 (the preflight, `uv sync`, `uv python dir`, the command) and must stay empty.
-Rule 6 has no row yet: no public function does WRITE_CODE until 10b's edit_code.
+Since commit 10b, edit_code has rows for rules 1, 4, and 6, and for its
+exactly-once rule. The snapshot covers the checkout's digest (and the
+worktree's) as well as every vault's.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from daedalus.core.queue import (
 )
 from daedalus.core.registry import load_registry
 from daedalus.core.session import Session
-from daedalus.core.tools import propose_edit, propose_lesson, propose_note, write_log
+from daedalus.core.tools import CodeEditError, edit_code, propose_edit, propose_lesson, propose_note, write_log
 
 HELLO = "# Hello\n"
 
@@ -348,6 +350,53 @@ def rule7_nul_byte(w):
     return _command(w, ["pytest", "-k", "a\0b"])
 
 
+def _edit(w, rel, old="print('hi')", new="print('bye')", session=None):
+    return lambda: edit_code(session or w.session, rel, old, new)
+
+
+def rule6_edit_in_checkout(w):
+    write_raw(w.alpha_repo, "src/app.py", "print('hi')\n")
+    return Case(_edit(w, str(w.alpha_repo / "src" / "app.py")), PolicyError, rule=6)
+
+
+def rule6_edit_into_checkout_by_dotdot(w):
+    write_raw(w.alpha_repo, "src/app.py", "print('hi')\n")
+    return Case(_edit(w, "../alpha/src/app.py"), PolicyError, rule=6)
+
+
+def rule4_edit_worktree_vault(w):
+    return Case(_edit(w, "vault/inbox/copy.md", old="a vault copy", new="changed"), PolicyError, rule=4)
+
+
+def rule4_edit_worktree_git(w):
+    return Case(_edit(w, ".git/config", old="x", new="y"), PolicyError, rule=4)
+
+
+def rule1_dotdot_escape_from_worktree(w):
+    write_raw(w.root, "outside.py", "print('hi')\n")
+    return Case(_edit(w, "../outside.py"), PolicyError, rule=1)
+
+
+def rule6_symlink_in_worktree_to_checkout(w):
+    write_raw(w.alpha_repo, "src/app.py", "print('hi')\n")
+    (w.worktree / "checkout").symlink_to(w.alpha_repo)
+    return Case(_edit(w, "checkout/src/app.py"), PolicyError, rule=6)
+
+
+def rule6_edit_with_no_worktree(w):
+    session = Session(w.registry, "alpha", pulled=("beta",))
+    return Case(_edit(w, "src/main.py", session=session), PolicyError, rule=6)
+
+
+def edit_old_matches_zero_times(w):
+    return Case(_edit(w, "src/main.py", old="print('nope')"), CodeEditError)
+
+
+def edit_old_matches_twice(w):
+    write_raw(w.worktree, "src/twice.py", "x = 1\nx = 1\n")
+    return Case(_edit(w, "src/twice.py", old="x = 1", new="x = 2"), CodeEditError)
+
+
 CASES = [
     rule1_traversal_into_repo, rule1_traversal_outside, rule1_unpulled_vault, rule1_unregistered_vault,
     rule1_symlink_escape, rule1_reauth_unregistered_on_apply,
@@ -364,6 +413,9 @@ CASES = [
     add_oversized, add_corrupt, add_scanned, add_duplicate,
     rule7_slash_in_program, rule7_program_not_allowed, rule7_allowed_but_missing_from_venv, rule7_empty_argv,
     rule7_nul_byte,
+    rule6_edit_in_checkout, rule6_edit_into_checkout_by_dotdot, rule4_edit_worktree_vault, rule4_edit_worktree_git,
+    rule1_dotdot_escape_from_worktree, rule6_symlink_in_worktree_to_checkout, rule6_edit_with_no_worktree,
+    edit_old_matches_zero_times, edit_old_matches_twice,
 ]
 
 

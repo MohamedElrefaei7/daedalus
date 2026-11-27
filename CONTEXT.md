@@ -306,8 +306,37 @@
   - test 8 now also requires `stat` on its probe to be denied.
 - **Re-run:** `uv run pytest -m sandbox`: 12 passed; `python -m daedalus.sandbox run --project scratch2 -- pytest -q`: `1 passed`, exit 0 in 0.40 s.
 
+### 2026-11-27 — Commit 10b: worktrees, code tools, coder mode
+
+- **`core/worktree.py`:** `create`, `list_worktrees`, `diff`, `commit`, `merge` (yours only), `drop`. Worktrees live at `~/.cache/daedalus/worktrees/<project>/<slug>-<6 hex>/` on `agent/<slug>`, recorded in `~/.local/state/daedalus/worktrees.json`. `commit` is `git add -A` with a `vault/` check after staging and the trailer `Daedalus-Worktree: <slug>`. `merge` is `--no-ff`, refused on a dirty checkout or a branch touching `vault/`, and aborted on conflict, naming the files. `drop` refuses unmerged commits and uncommitted changes without `--force`.
+- **Code tools** (`core/tools.py`): `read_code` and `list_files` follow the worktree; `edit_code` (old must occur exactly once), `write_code` (64 KB), `delete_code`, each `Op.WRITE_CODE`, atomic, realpath re-checked, mode kept, logged in an in-memory `EditLog`. `toolset.run` wraps the sandbox runner; `repl.log` gets metadata only.
+- **The coder profile:** fourteen tools (`CODER_NAMES`), its own preamble and `read_code`/`list_files` wording. The chat profile's twelve and daedalus-mcp's nine are unchanged.
+- **REPL:** `/wt new|list|diff|merge|drop`, `/code <slug>`, `/code off` (commit offer, default message from a tool-less one-shot call), `/end` and `/vault` leave coder mode first.
+- **Tests:** 887 by default, 38 new (849 before): worktree lifecycle 11, code tools 11, coder mode in the REPL 8, integrity rows +9 (58 rows; the snapshot now includes the checkout's and the worktree's digests). The sandbox's 12 live tests still pass.
+- **Proved red four ways:**
+  1. `drop` deleting unmerged branches failed `test_drop_refuses_unmerged_commits_and_force_removes_them` ("DID NOT RAISE WorktreeError").
+  2. `edit_code` taking the first of several matches failed `test_zero_and_two_matches_are_refused_and_the_file_is_unchanged` ("DID NOT RAISE CodeEditError").
+  3. `read_code` reading the checkout with a worktree active failed `test_read_code_returns_the_worktrees_edit_and_the_checkouts_without_one` (`"print('checkout')\n" == "print('edited')\n"`).
+  4. No `vault/` check in `commit` failed `test_commit_aborts_if_a_vault_path_is_staged` ("DID NOT RAISE WorktreeError").
+- **Live check** (scratch2; the meter said peak, so it began before 04:00 UTC; about $0.006 in all):
+  1. `/wt new hello` made `hello-3bf18a` from `97b17c8`; `/code hello` showed `[coding scratch2 · agent/hello] ›`.
+  2. "Add add(a, b) in src/scratch2/mathx.py with a test": DeepSeek ran `get_scope`, `list_files`, read `pyproject.toml`, `daedalus.toml`, and the smoke test, then `find_precedent`, and cited `red-test-first` on its own. It wrote the test first, added `pythonpath = ["src"]` to pytest's config with `edit_code` (scratch2 is `package = false`), ran pytest red (`ModuleNotFoundError: No module named 'scratch2'`), wrote the module, ran green (2 passed), then, unasked, broke `add` to `a - b` (`assert -1 == 5`) and restored it.
+  3. Asked to break and fix: `edit_code` to `a * b`, run exit 1 (`assert 6 == 5`), `edit_code` back, run exit 0, and a summary naming both runs.
+  4. `/code off` listed the three changes; the suggested message "Add mathx add function with tests" was accepted: `5d3bc4d`. `/wt diff hello` showed the three files; `/wt merge hello` made `194799d`.
+  5. `/wt drop hello` succeeded without `--force`. `git worktree list` in scratch2 shows only the main checkout, and `~/.cache/daedalus/worktrees/scratch2/` is empty.
+- **Found:** nothing broken. The agent changed `pyproject.toml`'s pytest config by itself; that isn't a dependency, so the gate didn't apply, but 10c may want config files called out in its summaries.
+
 ## Key decisions
 
+- ★ **Agents write code only in worktrees, and only you merge.** Merging is a REPL command, never a tool; your checkout is never written by an agent.
+- ★ **Worktrees live in `~/.cache/daedalus/worktrees/<project>/`,** not beside the repo, so `~/code` stays clean; each on `agent/<slug>`.
+- ★ **`git add -A` is safe in a worktree** (only the edit tools write there; sandboxed runs can't; `vault/` and `.git` are unwritable), and `commit` still aborts if a staged path is under `vault/`.
+- ★ **Drop protection:** unmerged commits or uncommitted changes need `--force`.
+- ★ **`edit_code` is the default edit, and `old` must occur exactly once.**
+- ★ **Reads follow the worktree,** so the agent sees its own edits.
+- **Merge refuses a dirty checkout, untracked files included, and any branch that touches `vault/`;** a conflict is aborted and verified clean.
+- **The default commit message comes from a tool-less one-shot call,** outside the conversation, so it can't act or change history; the edit log's paths are the fallback.
+- **`/end` in coder mode writes its log entry with a chat-profile agent** (coder mode has no `propose_edit`), from a summary of the edits, runs, and commit.
 - ★ **Every agent-triggered command runs sandboxed, or not at all.** `sandbox-exec` missing, a failed preflight, or a profile that doesn't load is a refusal; there's no unsandboxed fallback.
 - ★ **The profile starts from allow-default and denies the four things that matter** (network with DNS, writes, reads under home, the Keychain). Easier to get right than deny-default, and still strong because those denies are the protection.
 - ★ **Every path in the profile is a realpath `-D` parameter.** `/tmp` and `/var` are symlinks into `/private`, and Seatbelt matches real paths.
@@ -422,7 +451,7 @@
 
 ## Up Next
 
-Commit 10b: worktree lifecycle, read_code/edit_code in the worktree, rule 6 integrity rows.
+Commit 10c: the coding loop — goal notes, plan/edit/run/summarize iterations, caps, check-ins, lessons.
 
 detached processes can outlive a run (sandboxed, low risk).
 
