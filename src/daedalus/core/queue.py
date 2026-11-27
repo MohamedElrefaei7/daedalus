@@ -17,6 +17,10 @@ plan approval later). apply.apply_changes records one "applying" change set
 with every path's prior and new content before it writes anything, so
 reconciliation can restore all of them, or mark it applied if the commit
 carrying its Daedalus-Change trailer landed.
+
+Superseded (schema v4, commit 11): revising a plan marks its previous version
+"superseded" if that version is still pending, in the same transaction that
+inserts the revision. Nothing is ever deleted; every version stays readable.
 """
 
 from __future__ import annotations
@@ -33,16 +37,16 @@ from typing import Iterable
 
 from . import vaultio
 from .errors import (  # re-exported: callers import these from daedalus.core.queue
-    CommitFailed, DraftInvalid, LockBusy, NotPending, ProposalError, ProposalTooLarge, StaleProposal,
-    UnknownProposal,
+    CommitFailed, DraftInvalid, LockBusy, NotPending, PlanApprovalNotYet, ProposalError, ProposalTooLarge,
+    StaleProposal, UnknownProposal,
 )
 
 STATE_ROOT = Path("~/.local/state/daedalus").expanduser()
 MAX_CONTENT_BYTES = 256 * 1024
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 KINDS = ("create", "edit")
-STATUSES = ("pending", "applying", "applied", "rejected", "stale", "failed")
+STATUSES = ("pending", "applying", "applied", "rejected", "stale", "failed", "superseded")
 
 _TABLE = """
 CREATE TABLE {name} (
@@ -58,7 +62,8 @@ CREATE TABLE {name} (
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
     status        TEXT NOT NULL
-                  CHECK (status IN ('pending', 'applying', 'applied', 'rejected', 'stale', 'failed')),
+                  CHECK (status IN ('pending', 'applying', 'applied', 'rejected', 'stale', 'failed',
+                                    'superseded')),
     status_reason TEXT,
     commit_sha    TEXT,
     target_path   TEXT,  -- set when applying: the authorized real path
@@ -142,21 +147,24 @@ def connect() -> sqlite3.Connection:
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
-    """Create the tables, or migrate in place: v1 had no 'applying' status, v2 no change sets."""
+    """Create the tables, or migrate in place: v1 had no 'applying' status, v2 no change sets, v3 no
+    'superseded' status. A status CHECK can't be altered in SQLite, so v1 and v3 rebuild the table, rows kept."""
     if con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
         return
     con.execute("BEGIN IMMEDIATE")
     try:
         version = con.execute("PRAGMA user_version").fetchone()[0]  # re-check under the lock
-        if version < 2:
+        if version < SCHEMA_VERSION:
+            # One rebuild into the current definition covers every older status CHECK.
             exists = con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'proposals'").fetchone()
-            con.execute(_TABLE.format(name="proposals_v2"))
+            con.execute("DROP TABLE IF EXISTS proposals_new")
+            con.execute(_TABLE.format(name="proposals_new"))
             if exists:
-                cols = ", ".join(_V1_COLUMNS)
-                con.execute(f"INSERT INTO proposals_v2 ({cols}) SELECT {cols} FROM proposals")
+                cols = ", ".join(_V1_COLUMNS if version < 2 else _COLUMNS)
+                con.execute(f"INSERT INTO proposals_new ({cols}) SELECT {cols} FROM proposals")
                 con.execute("DROP TABLE proposals")
-            con.execute("ALTER TABLE proposals_v2 RENAME TO proposals")
-            con.execute("CREATE INDEX proposals_by_status ON proposals (status, vault, id)")
+            con.execute("ALTER TABLE proposals_new RENAME TO proposals")
+            con.execute("CREATE INDEX IF NOT EXISTS proposals_by_status ON proposals (status, vault, id)")
         if version < 3:
             for ddl in _CHANGESETS:
                 con.execute(ddl)
@@ -211,8 +219,10 @@ def _row(row: tuple) -> Proposal:
 
 def insert(
     *, vault: str, rel_path: str, kind: str, content: str, source: str, summary: str,
-    base_sha256: str | None = None, base_content: str | None = None,
+    base_sha256: str | None = None, base_content: str | None = None, supersede: str | None = None,
 ) -> Proposal:
+    """Insert a pending proposal. With ``supersede``, that proposal is marked superseded in the same
+    transaction if it's still pending (a plan revision); any other status is left as it is."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     size = len(content.encode("utf-8"))
@@ -222,15 +232,24 @@ def insert(
     with closing(connect()) as con:
         for _ in range(10):  # an id collision needs the same millisecond and 25 random bits
             pid = new_id()
+            con.execute("BEGIN IMMEDIATE")
             try:
                 con.execute(
                     f"INSERT INTO proposals ({', '.join(_V1_COLUMNS)}) VALUES ({', '.join('?' * len(_V1_COLUMNS))})",
                     (pid, vault, rel_path, kind, content, base_sha256, base_content, source, summary,
                      now, now, "pending", None, None),
                 )
-                return get(pid, con)
+                if supersede is not None:
+                    con.execute("UPDATE proposals SET status = 'superseded', status_reason = ?, updated_at = ? "
+                                "WHERE id = ? AND status = 'pending'", (f"superseded by {pid}", now, supersede))
+                con.execute("COMMIT")
             except sqlite3.IntegrityError:
+                con.execute("ROLLBACK")
                 continue
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            return get(pid, con)
     raise ProposalError("could not allocate a unique proposal id")
 
 

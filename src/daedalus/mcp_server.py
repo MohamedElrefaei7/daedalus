@@ -1,8 +1,9 @@
 """daedalus-mcp: the MCP server the Claude desktop app talks to, over stdio.
 
 A thin layer over daedalus.core. Claude can read the session's vaults and the
-active project's code, and propose new notes. It can't approve, apply,
-reject, edit, or write logs: those tools are never registered here.
+active project's code, propose new notes, and submit and revise plans (into
+the queue, never the vault). It can't approve, apply, reject, edit, or write
+logs: those tools are never registered here.
 
 The tool bodies live in daedalus.toolset, shared with the terminal agent.
 
@@ -10,8 +11,8 @@ Three rules this file keeps:
   * The session is loaded from state.json on every tool call, never cached,
     so `python -m daedalus.state set-active <name>` takes effect on Claude's
     next call without restarting the app.
-  * propose_note has no source parameter; the server always passes
-    source="claude", so Claude can't file its work as yours.
+  * propose_note, submit_plan, and revise_plan have no source parameter; the
+    server always passes source="claude", so Claude can't file its work as yours.
   * Nothing but protocol messages goes to stdout. Logs go to stderr and to
     ~/.local/state/daedalus/mcp.log.
 """
@@ -31,6 +32,7 @@ from fastmcp.exceptions import ToolError
 from daedalus import toolset
 from daedalus.core import queue
 from daedalus.core.state import load_session
+from daedalus.terminal.config import load_config
 
 SOURCE = "claude"
 
@@ -41,7 +43,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 INSTRUCTIONS = """\
 Daedalus gives you read access to the user's Obsidian project vaults, the shared vault of practices and \
 lessons, and the active project's code. You can't change anything directly: propose_note queues a new note \
-for the user to approve in their terminal. Call get_scope first to see which project is active. Notes are \
+for the user to approve in their terminal, and submit_plan queues a plan written to their spec (revise_plan \
+after a rejection; plan_status tells you why). Call get_scope first to see which project is active. Notes are \
 addressed as vault:path/to/note.md (for example shared:practices/red-test-first.md) or by bare wikilink \
 target (red-test-first)."""
 
@@ -81,8 +84,9 @@ def _brief(kwargs: dict[str, Any]) -> str:
 
 
 def build_server(registry_path: str | os.PathLike[str] | None = None,
-                 state_path: str | os.PathLike[str] | None = None) -> FastMCP:
-    """The server object. Paths default to ~/.config/daedalus/{vaults.toml,state.json}."""
+                 state_path: str | os.PathLike[str] | None = None,
+                 config_path: str | os.PathLike[str] | None = None) -> FastMCP:
+    """The server object. Paths default to ~/.config/daedalus/{vaults.toml,state.json,config.toml}."""
     mcp = FastMCP("daedalus", instructions=INSTRUCTIONS, mask_error_details=False)
 
     def session():
@@ -90,6 +94,9 @@ def build_server(registry_path: str | os.PathLike[str] | None = None,
 
     def describe(name: str) -> str:
         return toolset.description(name, SOURCE)
+
+    def session_cap() -> float:
+        return load_config(config_path).session_cap_usd  # every call, like the session
 
     @mcp.tool(name="get_scope", description=describe("get_scope") + (
         " The scope follows the user's current project, so it can change between calls."))
@@ -137,7 +144,31 @@ def build_server(registry_path: str | os.PathLike[str] | None = None,
     @mcp.tool(name="find_precedent", description=describe("find_precedent"))
     @_tool_errors("find_precedent")
     def find_precedent(topic: str, category: str | None = None) -> dict[str, Any]:
-        return toolset.find_precedent(session(), topic, category)
+        return toolset.find_precedent(session(), topic, category, asker=SOURCE)
+
+    @mcp.tool(name="submit_plan", description=describe("submit_plan"))
+    @_tool_errors("submit_plan")
+    def submit_plan(slug: str, frontmatter: dict[str, Any], body: str) -> dict[str, Any]:
+        result = toolset.submit_plan(session(), SOURCE, slug, frontmatter, body, session_cap())
+        log.info("submit_plan %s: %s", slug, result.get("id") or f"invalid, {len(result.get('errors', []))} errors")
+        return result
+
+    @mcp.tool(name="revise_plan", description=describe("revise_plan"))
+    @_tool_errors("revise_plan")
+    def revise_plan(plan_ref: str, frontmatter: dict[str, Any], body: str) -> dict[str, Any]:
+        result = toolset.revise_plan(session(), SOURCE, plan_ref, frontmatter, body, session_cap())
+        log.info("revise_plan %s: %s", plan_ref, result.get("id") or f"invalid, {len(result.get('errors', []))} errors")
+        return result
+
+    @mcp.tool(name="plan_status", description=describe("plan_status"))
+    @_tool_errors("plan_status")
+    def plan_status(plan_ref: str) -> dict[str, Any]:
+        return toolset.plan_status(session(), plan_ref)
+
+    @mcp.tool(name="list_plans", description=describe("list_plans"))
+    @_tool_errors("list_plans")
+    def list_plans() -> dict[str, Any]:
+        return toolset.list_plans(session())
 
     return mcp
 
@@ -170,10 +201,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--registry", help="vault registry (default ~/.config/daedalus/vaults.toml)")
     parser.add_argument("--state", help="session state (default ~/.config/daedalus/state.json)")
     parser.add_argument("--log-file", help="log file (default ~/.local/state/daedalus/mcp.log)")
+    parser.add_argument("--config", help="caps (default ~/.config/daedalus/config.toml)")
     args = parser.parse_args(argv)
 
     setup_logging(Path(os.path.expanduser(args.log_file)) if args.log_file else default_log_path())
-    server = build_server(args.registry, args.state)
+    server = build_server(args.registry, args.state, args.config)
     log.info("daedalus-mcp starting (pid %d)", os.getpid())
     try:
         server.run(transport="stdio", show_banner=False)

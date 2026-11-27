@@ -10,7 +10,8 @@ from typing import Any
 from fastmcp import Client
 
 TOOLS = {"get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
-         "find_precedent"}
+         "find_precedent", "submit_plan", "revise_plan", "plan_status", "list_plans"}
+PLAN_TOOLS = {"submit_plan", "revise_plan", "plan_status", "list_plans"}
 
 
 def write_state(path: Path, active: str, pulled: list[str] | tuple[str, ...] = ()) -> Path:

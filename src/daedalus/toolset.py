@@ -1,4 +1,4 @@
-"""The agent tools, shared by daedalus-mcp (Claude, nine) and the terminal agent (DeepSeek: twelve in chat,
+"""The agent tools, shared by daedalus-mcp (Claude, thirteen) and the terminal agent (DeepSeek: twelve in chat,
 fourteen in coder mode).
 
 Each function takes the Session first and returns a JSON-ready dict. The
@@ -12,7 +12,7 @@ import datetime as dt
 import logging
 from typing import Any
 
-from daedalus.core import accept, gate, queue, tools
+from daedalus.core import accept, gate, plans, queue, tools
 from daedalus.core.schema import DESIGN_CATEGORIES
 from daedalus.core.notes import NoteSchemaError
 from daedalus.core.policy import PolicyError
@@ -22,10 +22,15 @@ from daedalus.core.state import StateError
 from daedalus.core.worktree import WorktreeError
 from daedalus.sandbox import runner
 from daedalus.sandbox.errors import SandboxError
+from daedalus.terminal.config import ConfigError
 
-# daedalus-mcp's exact tool set (Claude), in order.
+# The nine tools both front ends share, in order.
 NAMES = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
          "find_precedent")
+# Plans are Claude's job: only daedalus-mcp has these four, never the DeepSeek agent.
+PLAN_TOOLS = ("submit_plan", "revise_plan", "plan_status", "list_plans")
+# daedalus-mcp's exact tool set (Claude), in order: thirteen.
+MCP_NAMES = NAMES + PLAN_TOOLS
 # The terminal agent's (DeepSeek) adds the two /end needs (CONTEXT.md and inbox edits, and lessons), and
 # ask_user, which ends its turn. Claude asks in its own chat, so daedalus-mcp has no ask_user.
 AGENT_NAMES = NAMES + ("propose_edit", "propose_lesson", "ask_user")
@@ -45,7 +50,7 @@ MAX_SEARCH = 50
 # Refusals whose message already says what went wrong and how to fix it.
 PASS_THROUGH = (
     NoteSchemaError, StateError, RegistryError, SessionError, queue.ProposalError, tools.RefError, tools.ReadError,
-    tools.CodeEditError, SandboxError, WorktreeError,
+    tools.CodeEditError, SandboxError, WorktreeError, ConfigError,
 )
 
 
@@ -152,12 +157,20 @@ def propose_lesson(s: Session, source: str, rel_path: str, content: str, summary
             "message": "Queued in the shared inbox/. Nothing is written until Mohamed approves it in the terminal."}
 
 
-def find_precedent(s: Session, topic: str, category: str | None = None) -> dict[str, Any]:
+# What to do with no precedent depends on who asks: the agent has ask_user; Claude has plans and its own chat.
+NO_PRECEDENT = {
+    "agent": "No precedent. For a design choice, ask with ask_user and stop; don't decide it.",
+    "claude": ("No precedent. In a plan, give this decision basis \"new\": Mohamed sees every new decision before "
+               "approving, and approval makes it binding. Outside a plan, ask him in this chat before deciding."),
+}
+
+
+def find_precedent(s: Session, topic: str, category: str | None = None, asker: str = "agent") -> dict[str, Any]:
     found = gate.find_precedent(s, topic, category)
     return {
         "precedents": [p._asdict() for p in found],
-        "note": ("Each is accepted precedent: cite one in related (a decision) or shared_refs (a practice)."
-                 if found else "No precedent. For a design choice, ask with ask_user and stop; don't decide it."),
+        "note": ("Each is accepted precedent: cite one in related (a decision) or shared_refs (a practice), or as a "
+                 "plan decision's basis." if found else NO_PRECEDENT[asker]),
     }
 
 
@@ -172,6 +185,47 @@ def ask_user(s: Session, source: str, question: str, category: str, options: lis
                     f"yourself. Mohamed answers with /answer {p.id} <option>; his answer becomes an accepted "
                     "decision you can then find with find_precedent."),
     }
+
+
+def _invalid(e: plans.PlanInvalid, verb: str) -> dict[str, Any]:
+    return {"status": "invalid", "errors": e.errors,
+            "message": f"Nothing was queued. Fix every error listed (there are {len(e.errors)}) and call {verb} again."}
+
+
+def _submitted(r: plans.Submitted) -> dict[str, Any]:
+    p = r.proposal
+    out = {"status": p.status, "id": p.id, "slug": r.slug, "version": r.version, "vault": p.vault,
+           "rel_path": p.rel_path, "source": p.source,
+           "message": (f"Queued as {p.id}. Nothing is written until Mohamed approves it in the terminal "
+                       f"(/plans, /diff {p.id}). Check plan_status later for his decision or his reason for "
+                       "rejecting it.")}
+    if r.superseded:
+        out["superseded"] = r.superseded
+    return out
+
+
+def submit_plan(s: Session, source: str, slug: str, frontmatter: dict[str, Any], body: str,
+                session_cap_usd: float | None = None) -> dict[str, Any]:
+    try:
+        return _submitted(plans.submit(s, source, slug, frontmatter, body, session_cap_usd))
+    except plans.PlanInvalid as e:  # every error, as data: one round trip gives Claude all it must fix
+        return _invalid(e, "submit_plan")
+
+
+def revise_plan(s: Session, source: str, plan_ref: str, frontmatter: dict[str, Any], body: str,
+                session_cap_usd: float | None = None) -> dict[str, Any]:
+    try:
+        return _submitted(plans.revise(s, source, plan_ref, frontmatter, body, session_cap_usd))
+    except plans.PlanInvalid as e:
+        return _invalid(e, "revise_plan")
+
+
+def plan_status(s: Session, plan_ref: str) -> dict[str, Any]:
+    return plans.status(s, plan_ref)
+
+
+def list_plans(s: Session) -> dict[str, Any]:
+    return plans.list_plans(s)
 
 
 def _edit(e: tools.Edit) -> dict[str, Any]:
@@ -304,6 +358,44 @@ DESCRIPTIONS = {
         "run), a clean environment, and a timeout. argv is a list, e.g. [\"pytest\", \"-q\"]; argv[0] must be "
         "a program the project's daedalus.toml allows, and it runs from the project's own venv. Returns exit_code, "
         "duration_s, timed_out, and the end of stdout and stderr. Run the tests after every change."
+    ),
+    "submit_plan": (
+        "Submits a plan you wrote to Mohamed's spec for him to approve in the terminal. It's validated in full; if "
+        "anything is wrong you get EVERY error at once (status 'invalid') and nothing is queued, so fix them all and "
+        "call again. If valid it's queued as plans/<slug>-v1.md; nothing touches the vault until he approves it. "
+        "slug: letters, digits, '-' or '_' (no -v<N>; the server adds the version). body: markdown for the "
+        "'Context and non-obvious decisions' section (the server adds the heading and title). frontmatter takes "
+        "ONLY these keys (type, status, created, source, and supersedes are set by the server; never pass them): "
+        "spec: a wikilink to the spec note in the active vault, e.g. \"[[mathx-cli-spec]]\". "
+        "decisions: a list of {category, choice, basis}, one per design choice the plan makes; category is one of "
+        + ", ".join(DESIGN_CATEGORIES) + "; basis is a wikilink to accepted precedent (find_precedent finds it: "
+        "an accepted note in this project's decisions/ or an accepted shared practice) or \"new\" when there is "
+        "none. Proposed, draft, superseded, ambiguous, missing, and pulled-project notes are refused. Every 'new' "
+        "decision becomes binding when he approves the plan, so he sees them first. "
+        "tasks: a non-empty list of {id, summary, files, red_test, done_when, max_iterations, budget_usd, "
+        "protected?}: id t1, t2, ... unique; summary one line; files a non-empty list of repo-relative paths (never "
+        "under vault/ or .git, never escaping the repo); red_test one line naming the test that fails before the "
+        "change and passes after; done_when the command that proves it (split like a shell, e.g. \"pytest -q "
+        "tests/test_x.py\"; its program must be in the project's daedalus.toml allow list); max_iterations 1 to "
+        "10; budget_usd above 0 and at most the session cap; protected (optional) a list of repo paths that already "
+        "exist and the task may not change. related, shared_refs, project_refs are optional lists of quoted "
+        "wikilinks; the spec is added to related for you."
+    ),
+    "revise_plan": (
+        "Submits the next version of a plan, usually after Mohamed rejected it (plan_status gives his reason). "
+        "plan_ref is the plan's slug, its proposal id, or <slug>-v<N>, and must be the latest version. Takes the "
+        "same complete frontmatter and body as submit_plan (the whole plan, not a diff) and validates it the same "
+        "way. It's queued as plans/<slug>-v<N+1>.md with supersedes: [[<slug>-v<N>]]; if v<N> is still pending it's "
+        "marked superseded. No version is ever deleted."
+    ),
+    "plan_status": (
+        "Read-only. A plan's status (pending, rejected, superseded, applied, ...), Mohamed's reason if he rejected "
+        "it, and its whole version chain, oldest first. plan_ref is the slug (its latest version), a proposal id, "
+        "or <slug>-v<N>. Call it to learn why a plan was rejected before revising it."
+    ),
+    "list_plans": (
+        "Read-only. The active project's plans: pending ones (id, slug, version, task count, each decision marked "
+        "cited or NEW, and the version chain), approved ones, and rejected ones not yet revised (with the reason)."
     ),
     "propose_lesson": (
         "Creates a pending lesson in the shared vault's inbox/ (rel_path is relative to inbox/, e.g. "

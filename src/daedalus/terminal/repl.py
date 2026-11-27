@@ -3,7 +3,7 @@
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
 Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /add, /answer, /promote, /wt, /code, /goal, /review,
-/end, /cost, /pending, /diff, /approve, /reject, /help, /quit.
+/end, /cost, /pending, /plans, /diff, /approve, /reject, /help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
@@ -22,15 +22,16 @@ from typing import Any, Callable
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.table import Table
 from rich.text import Text
 
 from daedalus import secrets
 import yaml
 
-from daedalus.core import accept, notes, queue, worktree
+from daedalus.core import accept, notes, plans, queue, worktree
 from daedalus.core.goals import GoalError
 from daedalus.core.registry import SHARED_NAME
-from daedalus.core.apply import apply, diff, pending, reject
+from daedalus.core.apply import apply, diff, is_plan_proposal, pending, reject
 from daedalus.core.ingest import ingest
 from daedalus.core.lifecycle import LifecycleError, new_project
 from daedalus.core.policy import Op, PolicyError, authorize
@@ -76,7 +77,8 @@ HELP = """\
 /end                   propose a CONTEXT.md log entry for this session, review proposals, exit
 /cost                  calls, tokens, and dollars for this session and today, plus the DeepSeek balance
 /pending               proposals waiting for you
-/diff <id>             what a proposal would change
+/plans                 Claude's plans: pending (with their versions), approved, and rejected
+/diff <id>             what a proposal would change (a plan: its decisions first, then its tasks)
 /approve <id>          apply a proposal and commit it
 /reject <id> <reason>  reject a proposal
 /help                  this list
@@ -359,8 +361,15 @@ class Repl:
                 self.cost()
             elif name == "/pending":
                 self.pending()
+            elif name == "/plans":
+                self.plans()
             elif name == "/diff":
-                self.console.print(Text(diff(self._id(rest, "/diff <id>"))))
+                change_id = self._id(rest, "/diff <id>")
+                rec = queue.get(change_id)
+                if is_plan_proposal(rec):
+                    self.show_plan(rec)
+                else:
+                    self.console.print(Text(diff(change_id)))
             elif name == "/approve":
                 p = apply(self.session, self._id(rest, "/approve <id>"))
                 self.console.print(f"applied {p.id}: {p.vault}:{p.rel_path} in commit {p.commit_sha[:7]}")
@@ -702,6 +711,74 @@ class Repl:
             self.console.print(f"{p.id}  {p.kind:6}  {p.vault}:{p.rel_path}  ({p.source}) {p.summary}")
         if not rows:
             self.console.print("no pending proposals")
+
+    def plans(self) -> None:
+        listed = plans.list_plans(self.session)
+
+        say = lambda text: self.console.print(Text(text))  # noqa: E731  (wikilinks aren't rich markup)
+
+        def marks(entry: dict[str, Any]) -> str:
+            return ", ".join(f"{d['category']} {d['marked']}" for d in entry["decisions"]) or "no decisions"
+
+        self.console.print(Text(f"Pending plans in {listed['project']}:", style="bold"))
+        for e in listed["pending"]:
+            n = e["tasks"]
+            say(f"{e['id']}  {e['slug']} v{e['version']}  {n} task{'s' if n != 1 else ''}  "
+                               f"decisions: {marks(e)}")
+            for v in e["chain"][:-1]:
+                why = f": {v['reason']}" if v["reason"] and v["status"] == "rejected" else ""
+                say(f"    v{v['version']} {v['status']}{why}  ({v['id'] or v['rel_path']})")
+        if not listed["pending"]:
+            say("  none")
+        if listed["rejected"]:
+            self.console.print(Text("Rejected, not yet revised:", style="bold"))
+            for e in listed["rejected"]:
+                say(f"{e['id']}  {e['slug']} v{e['version']}  rejected: {e['rejection_reason']}")
+        self.console.print(Text("Approved plans:", style="bold"))
+        for e in listed["approved"]:
+            version = f" v{e['version']}" if e["version"] else ""
+            say(f"{e['id'] or '-':14}  {e['slug']}{version}  {e['rel_path']}")
+        if not listed["approved"]:
+            say("  none")
+
+    def show_plan(self, rec) -> None:
+        """A plan, readably: the spec, the decisions first (new ones highlighted), the tasks, then the body."""
+        pv = plans.view(rec.content, rec.rel_path)
+        say = lambda text: self.console.print(Text(text))  # noqa: E731  (wikilinks aren't rich markup)
+        self.console.print(Text(f"{rec.id}  plan {pv.slug} v{pv.version}  ({rec.source}, {rec.status})  "
+                                f"{rec.vault}:{rec.rel_path}", style="bold"))
+        say(f"spec: {pv.spec}")
+        if pv.supersedes:
+            say(f"supersedes: {pv.supersedes}")
+        new = sum(d.is_new for d in pv.decisions)
+        table = Table(title=f"Decisions ({len(pv.decisions)}; {new} new)", title_justify="left")
+        for col in ("category", "choice", "basis"):
+            table.add_column(col)
+        for d in pv.decisions:
+            if d.is_new:
+                table.add_row(Text(d.category), Text(d.choice), Text("NEW: binding once approved"),
+                              style="bold yellow")
+            else:
+                table.add_row(Text(d.category), Text(d.choice), Text(f"cited {d.basis}"))
+        if pv.decisions:
+            self.console.print(table)
+            if new:
+                self.console.print(Text(f"Approving this plan makes {new} new decision{'s' if new != 1 else ''} "
+                                        "binding.", style="bold yellow"))
+        else:
+            say("Decisions: none")
+        self.console.print(Text(f"Tasks ({len(pv.tasks)})", style="bold"))
+        for t in pv.tasks:
+            self.console.print(Text(f"{t.id}  {t.summary}", style="bold"))
+            say(f"    files:      {', '.join(t.files)}")
+            say(f"    red test:   {t.red_test}")
+            say(f"    done when:  {t.done_when}")
+            budget = f"${t.budget_usd:.2f}" if isinstance(t.budget_usd, (int, float)) else str(t.budget_usd)
+            say(f"    caps:       {t.max_iterations} iterations, {budget}")
+            if t.protected:
+                say(f"    protected:  {', '.join(t.protected)}")
+        if pv.body:
+            self.console.print(Markdown(pv.body))
 
     def cost(self) -> None:
         now = ledger.utc_now()

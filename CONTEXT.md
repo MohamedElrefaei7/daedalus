@@ -364,7 +364,53 @@
 
 - `types.json` is now written exactly as Obsidian serializes it (`JSON.stringify(data, null, 2)`): 2-space indent, no trailing newline. The three live vaults lost the trailing newline the pinning commits had added (scratch `bb5ad37`, scratch2 `ae33742`, shared `f692542`; each checked to differ by nothing else), and `/new` writes the same bytes (`lifecycle.obsidian_types_json`). The test now compares the written and the committed file byte for byte.
 
+### 2026-11-27 — Commit 11: plans from Claude — schema, submit, revise, list
+
+- **`core/plans.py`:**
+  - `validate_plan(session, text)` returns every error at once, each naming its field and task id: `spec` (resolves, unambiguously, in the active vault); `decisions` (`{category, choice, basis}`; basis `new` or `check_basis` OK); `tasks` (unique `t\d+` ids, one-line summary and red test, `files` never under `vault/` or `.git` and never escaping the repo even through a symlink, `done_when` under rule 7 against the checkout's `daedalus.toml`, `max_iterations` 1–10, `budget_usd` above 0 and at most the session cap, `protected` paths that exist); and the body's `## Context and non-obvious decisions`.
+  - `submit`, `revise`, `status`, `list_plans`, `view`.
+- **The queue, schema v4:** adds a `superseded` status (the table is rebuilt, rows kept). `queue.insert(..., supersede=id)` marks the previous version superseded in the same transaction, only if it's still pending.
+- **`apply` refuses plan proposals** with `PlanApprovalNotYet`: "plan approval arrives in commit 12". Nothing is written.
+- **daedalus-mcp: thirteen tools.** `submit_plan`, `revise_plan`, `plan_status`, and `list_plans` (`toolset.PLAN_TOOLS`, `MCP_NAMES`), none with `source`. An invalid plan returns `{"status": "invalid", "errors": [...]}`. New `--config` flag for the session cap. Neither DeepSeek profile has the plan tools.
+- **REPL:**
+  - `/plans` shows pending plans with their version chains, rejected plans not yet revised, and approved plans.
+  - `/diff <plan-id>` renders the spec, then the decisions table (NEW ones highlighted, with a count of what approval makes binding), then the tasks, then the body.
+- **The plan template:** its "Plan format" now matches (`{category, choice, basis}`, `protected`), and the body heading is `## Context and non-obvious decisions`. The live vaults' `templates/plan.md` copies weren't touched (the live check needed scratch2's vault unchanged).
+- **Tests:** 975 by default, 45 new (930 before):
+  - plans 33: one per validation rule, combined errors, revisions, rejected revisions, latest-only, an invalid revision keeping v1 pending, apply refused, listing, the v3→v4 migration;
+  - daedalus-mcp 6: thirteen tools with no source, no plan tools for DeepSeek, nothing lands, an invalid plan returning every error, a rejection reaching Claude, find_precedent's advice;
+  - REPL 2;
+  - integrity rows +4 (65): an invalid plan, a basis that isn't precedent, an invalid revision, apply on a plan.
+- **Proved red three ways:**
+  1. Accepting a basis that cites a proposed note failed `test_basis_citing_a_proposed_note` ("DID NOT RAISE PlanInvalid") and `test_one_call_returns_every_error` ("missing 'decisions[1].basis:'").
+  2. Stopping at the first error failed 5, `test_one_call_returns_every_error` among them ("missing 'decisions[1].basis:' in [\"decisions[1].category: 'storage' …\"]").
+  3. Writing into `plans/` from `submit` failed `test_nothing_lands_before_approval` ("a plan reached a vault before approval": alpha's and the checkout's digests changed) and `test_apply_refuses_a_plan_and_writes_nothing`.
+- **Live check** (scratch2). Before it: the Claude desktop app was restarted (its daedalus-mcp processes dated from Nov 26 and served nine tools), and the spec was committed (`b50b5ae concept: mathx-cli-spec`).
+  1. Claude ran `find_precedent` twice ("cli interface argparse", "mathx multiply"; none found), then took three `submit_plan` calls:
+     - first: invalid, 1 error, the missing `tasks` key (Claude had sent only the decisions and spec);
+     - second: invalid, 1 error: t2 protected `tests/test_multiply.py`, which t1 creates, so it didn't exist yet;
+     - third: queued, `mathx-cli` v1, `1m8ey6rp863sk7`. Two tasks (multiply; an argparse `add` CLI) and two `interface` decisions, both `new`, as nothing in the vault covered them.
+  2. `/plans` and `/diff` showed it as specified; `/approve` was refused with the commit-12 message; `/reject … make the CLI taks protect a CLI test I'll write`. You then committed `tests/test_cli.py` (`4968e32`).
+  3. "Check the plan status and revise it": `plan_status` (one first try was missing its argument, refused by FastMCP), `list_plans`, then `revise_plan` validated first time, giving v2 `1m8eyfq3f6az2t`.
+     - It protects `tests/test_cli.py` in both tasks and takes it out of t2's `files`.
+     - Its red test is your test, and it moves its own subprocess and bad-input tests to `tests/test_cli_module.py`.
+     - It changes `done_when` to run both files. Decisions unchanged.
+     - `/plans` showed v2 pending with v1 **rejected** under it, not superseded: v1 was rejected before the revision, and only a pending version is marked superseded.
+  4. After it: scratch2's vault was unchanged since `b50b5ae` and `plans/` was empty; the queue held v1 rejected and v2 pending; `git status` was clean in scratch, scratch2, and shared; daedalus-mcp listed 13 tools over stdio.
+- **Found in the live check:**
+  - `find_precedent` told Claude "ask with ask_user and stop", a tool it doesn't have. Claude submitted anyway and said why. Fixed: daedalus-mcp's note now says to give the decision basis `"new"` in a plan, or ask in chat; the agent's note is unchanged (one test).
+  - The live sandbox test `test_real_pytest_in_a_checkout_under_home` now fails (exit 2), because scratch2's checkout holds your red `tests/test_cli.py` (`ImportError: cannot import name 'main'`). It's not a regression: the other 6 tests pass sandboxed, and it goes green when the CLI task lands.
+
 ## Key decisions
+
+- ★ **No unapproved plan touches the vault.** Plans are validated in full and held in the queue (Op.WRITE_PLAN into `plans/`); the generic `apply` refuses them, so approval (commit 12) always writes the plan and its new decisions together.
+- ★ **`validate_plan` returns every error at once,** each naming its field and task id, so one round trip tells Claude everything to fix.
+- ★ **A plan decision's basis is `new` or OK precedent, nothing else.** Proposed, draft, pulled, superseded, ambiguous, or missing bases refuse the whole plan.
+- ★ **`source` (and type, status, created, supersedes) is set by the server, never by Claude;** passing one is an error in the list.
+- ★ **Plans are Claude's job:** the four plan tools are only in daedalus-mcp (thirteen tools); neither DeepSeek profile has them.
+- ★ **Every version is kept.** A revision is `<slug>-v<N+1>` with `supersedes: "[[<slug>-v<N>]]"`; a still-pending v<N> is marked superseded in the same transaction, and a rejected one stays rejected.
+- **`done_when` in a plan is checked against rule 7's allow list from the checkout's `daedalus.toml`, not the venv pin,** since pinning would mean building a venv (network) from a validation call.
+- **Protected paths in a plan must already exist,** as in goal notes, so a test the human will write has to be committed before a plan can protect it.
 
 - **Obsidian's property types are pinned in each vault's `.obsidian/types.json`** (the seven string-list keys as List, `created` as Date), and `/new` writes them, since the templates hold no `.obsidian/`.
 - ★ **List-valued keys must be YAML lists,** never strings or a list typed into one item; the error points at Obsidian's List property type.
@@ -504,7 +550,7 @@
 
 ## Up Next
 
-Commit 11: plan schema, submit_plan, revise_plan, /plans (Claude → terminal handoff).
+Commit 12: plan approval (plan + new decisions in one commit), /run, read_runs.
 
 detached processes can outlive a run (sandboxed, low risk).
 

@@ -58,7 +58,8 @@ from daedalus.mcp_server import build_server  # noqa: E402
 def mworld(gworld):
     """gworld with a state file naming alpha active and beta pulled, and a server pointed at both."""
     gworld.state_path = write_state(gworld.root / "state.json", "alpha", ["beta"])
-    gworld.server = build_server(gworld.registry_path, gworld.state_path)
+    gworld.config_path = gworld.root / "config.toml"  # absent: the default caps ($1.00 a session)
+    gworld.server = build_server(gworld.registry_path, gworld.state_path, gworld.config_path)
     return gworld
 
 

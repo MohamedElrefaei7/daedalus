@@ -95,8 +95,10 @@ def test_exact_agent_tool_set_and_no_source_parameter() -> None:
 
 def test_agent_parameters_match_daedalus_mcp(mcp_schemas) -> None:
     ours = {t["function"]["name"]: set(t["function"]["parameters"]["properties"]) for t in TOOLS}
-    assert set(mcp_schemas) == NINE  # Claude never gets the edit, lesson, and ask_user tools
-    assert {name: ours[name] for name in NINE} == mcp_schemas
+    # Claude never gets the edit, lesson, and ask_user tools; the agent never gets the four plan tools.
+    assert set(mcp_schemas) == NINE | set(toolset.PLAN_TOOLS)
+    assert {name: ours[name] for name in NINE} == {name: mcp_schemas[name] for name in NINE}
+    assert not set(ours) & set(toolset.PLAN_TOOLS)
 
 
 @pytest.fixture

@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from . import queue
-from .errors import CommitFailed, NotPending, ProposalError, StaleProposal
+from .errors import CommitFailed, NotPending, PlanApprovalNotYet, ProposalError, StaleProposal
 from .policy import Op, PolicyError, authorize
 from .queue import Proposal
 from .registry import SHARED_NAME, Registry
@@ -73,6 +73,11 @@ def repo_for(registry: Registry, vault: str) -> Path:
     return registry.repos[vault]
 
 
+def is_plan_proposal(p: Proposal) -> bool:
+    """A proposal into a project's plans/ (rule 5's WRITE_PLAN area)."""
+    return p.vault != SHARED_NAME and p.rel_path.startswith("plans/")
+
+
 def commit_message(p: Proposal) -> list[str]:
     return [f"agent({p.source}): {p.summary}", f"Daedalus-Change: {p.id}"]
 
@@ -86,6 +91,11 @@ def apply(session: Session, change_id: str) -> Proposal:
         rec = queue.get(change_id)
         if rec.status != "pending":
             raise NotPending(f"proposal {change_id} is {rec.status}, not pending")
+        # A plan never goes through the generic path: approving one must also write its new decisions.
+        if is_plan_proposal(rec):
+            raise PlanApprovalNotYet(f"proposal {change_id} is a plan ({rec.vault}:{rec.rel_path}); plan approval "
+                                     "arrives in commit 12. Nothing was written. /reject it with a reason, or leave "
+                                     "it pending.")
 
         # 2. Re-authorize against the session passed in now.
         auth = authorize(vault_root(session.registry, rec.vault) / rec.rel_path, Op.PROPOSE, session)

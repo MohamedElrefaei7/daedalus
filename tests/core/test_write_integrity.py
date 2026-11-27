@@ -17,7 +17,9 @@ must also spawn no process: each row's injected executor records every spawn
 (the preflight, `uv sync`, `uv python dir`, the command) and must stay empty.
 Since commit 10b, edit_code has rows for rules 1, 4, and 6, and for its
 exactly-once rule. The snapshot covers the checkout's digest (and the
-worktree's) as well as every vault's.
+worktree's) as well as every vault's. Since commit 11, plans have rows: an
+invalid plan, a plan whose basis isn't precedent, an invalid revision (its
+pending v1 stays pending), and apply on a plan (refused until commit 12).
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ import pytest
 from conftest import DROP, git, note_text, write_note, write_raw, write_registry
 from test_apply import install_hook
 
-from daedalus.core import queue
+from daedalus.core import plans, queue
+from daedalus.core.errors import PlanApprovalNotYet
 from daedalus.core.accept import PromoteError, answer_question, promote
 from daedalus.core.gate import GateRefused, propose_with_basis
 from daedalus.core.ingest import IngestError, ingest
@@ -416,6 +419,43 @@ def protected_delete_code(w):
     return Case(lambda: delete_code(_guarded(w), "src/main.py"), PolicyError, rule=6)
 
 
+def _plan(w, **task_changes):
+    from test_plans import good, plan_world
+
+    plan_world(w)
+    fm = good()
+    fm["tasks"][0].update(task_changes)
+    return fm
+
+
+def _submit(w, fm):
+    return lambda: plans.submit(w.session, "claude", "mathx", fm, "Why.", session_cap_usd=1.0)
+
+
+def plan_invalid(w):
+    return Case(_submit(w, _plan(w, max_iterations=11, files=["vault/x.md"])), plans.PlanInvalid)
+
+
+def plan_basis_not_precedent(w):
+    fm = _plan(w)
+    fm["decisions"][0]["basis"] = "[[maybe-postgres]]"
+    return Case(_submit(w, fm), plans.PlanInvalid)
+
+
+def plan_invalid_revision(w):
+    fm = _plan(w)
+    plans.submit(w.session, "claude", "mathx", fm, "Why.", session_cap_usd=1.0)
+    bad = {**fm, "tasks": "t1"}
+    return Case(lambda: plans.revise(w.session, "claude", "mathx", bad, "Why.", session_cap_usd=1.0),
+                plans.PlanInvalid)
+
+
+def plan_approve(w):
+    fm = _plan(w)
+    pid = plans.submit(w.session, "claude", "mathx", fm, "Why.", session_cap_usd=1.0).proposal.id
+    return Case(lambda: apply(w.session, pid), PlanApprovalNotYet)
+
+
 CASES = [
     rule1_traversal_into_repo, rule1_traversal_outside, rule1_unpulled_vault, rule1_unregistered_vault,
     rule1_symlink_escape, rule1_reauth_unregistered_on_apply,
@@ -436,6 +476,7 @@ CASES = [
     rule1_dotdot_escape_from_worktree, rule6_symlink_in_worktree_to_checkout, rule6_edit_with_no_worktree,
     edit_old_matches_zero_times, edit_old_matches_twice,
     protected_edit_code, protected_write_code, protected_delete_code,
+    plan_invalid, plan_basis_not_precedent, plan_invalid_revision, plan_approve,
 ]
 
 
