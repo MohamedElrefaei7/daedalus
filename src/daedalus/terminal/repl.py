@@ -738,14 +738,19 @@ class LoopView:
         out = self.repl.console
         self.repl.view.end()
         why = f"config changed: {', '.join(info.config_changed)}" if info.config_changed else "scheduled"
+        total = f"; ${info.total_spent:.4f} in total across {info.batches} batches" if info.batches > 1 else ""
         out.print(Text(f"\n── check-in ({why}) ── iteration {info.iteration} of {info.max_iterations} · spent "
-                       f"${info.spent:.4f} of ${info.budget:.2f}", style="bold magenta"))
+                       f"${info.spent:.4f} of ${info.budget:.2f}{' this batch' if total else ''}{total}",
+                       style="bold magenta"))
         out.print(f"last: {info.last_summary}")
         out.print(Text(info.diff_stat, style="dim"))
         if info.config_diff:
             out.print(Text(info.config_diff.rstrip(), style="yellow"))
         if info.lockfile_note:
             out.print(Text(info.lockfile_note, style="yellow"))
+        if info.tests_modified:
+            out.print(Text(f"existing tests modified: {', '.join(info.tests_modified)}", style="bold yellow"))
+            out.print(Text(info.tests_diff.rstrip(), style="yellow"))
         while True:
             choice = self.repl.read_line("[c]ontinue, [r]edirect, or [s]top? ").strip().lower()
             if choice in ("c", "continue", ""):

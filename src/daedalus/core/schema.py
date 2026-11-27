@@ -34,6 +34,10 @@ SOURCE_KEYS = ("title", "original_name", "original_sha256", "original_bytes", "c
 
 # Frontmatter keys that hold lists of quoted wikilinks.
 LINK_KEYS = ("related", "shared_refs", "project_refs")
+# Every list-valued key: each must be a YAML list, never a string (Obsidian writes a Text property as one).
+LIST_KEYS = LINK_KEYS + ("protected", "code", "options", "applies_to", "decisions", "tasks")
+# Lists whose items are strings (decisions and tasks hold mappings).
+STRING_LIST_KEYS = LINK_KEYS + ("protected", "code", "options", "applies_to")
 
 # Folders whose notes are schema-validated, and the type each one holds.
 # Every other location (root files, inbox/, logs/, sources/, ...) is not.

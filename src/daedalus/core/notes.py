@@ -8,6 +8,7 @@ CONTEXT.md), inbox/, logs/, sources/ and everything else are not validated.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ import yaml
 
 from .links import Link, extract_links
 from .policy import Authorized, Op, authorize
-from .schema import LINK_KEYS, PROJECT_TYPED_FOLDERS, SCHEMA, SHARED_TYPED_FOLDERS
+from .schema import LINK_KEYS, LIST_KEYS, PROJECT_TYPED_FOLDERS, SCHEMA, SHARED_TYPED_FOLDERS, STRING_LIST_KEYS
 from .session import Area, Session
 
 FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)^---[ \t]*(?:\r?\n|\Z)", re.DOTALL | re.MULTILINE)
@@ -92,20 +93,38 @@ def validate(frontmatter: dict[str, Any], note_type: str, folder: str | None = N
     for key, allowed in SCHEMA["enums"].items():
         if key in frontmatter and frontmatter[key] not in allowed:
             errors.append(f"key '{key}' is {frontmatter[key]!r}, expected one of {allowed}")
-    for key in LINK_KEYS:
+    for key in LIST_KEYS:
         if key not in frontmatter:
             continue
         value = frontmatter[key]
         if not isinstance(value, list):
-            errors.append(f"key '{key}' must be a list of quoted wikilinks, got {type(value).__name__}")
+            what = f"a string ({value!r})" if isinstance(value, str) else type(value).__name__
+            errors.append(f"key '{key}' must be a YAML list, not {what}. In Obsidian, set the property's type to "
+                          "List (right-click the property → Property type → List), then add each entry as its own item")
+            continue
+        if key not in STRING_LIST_KEYS:
             continue
         bad = [item for item in value if not isinstance(item, str)]
         if bad:
-            errors.append(
-                f"key '{key}' has non-string item(s) {bad!r}; quote wikilinks in YAML, "
-                f"e.g. {key}: [\"[[name]]\"]"
-            )
+            hint = f"quote wikilinks in YAML, e.g. {key}: [\"[[name]]\"]" if key in LINK_KEYS else "quote each item"
+            errors.append(f"key '{key}' has non-string item(s) {bad!r}; {hint}")
+        typed_in = [item for item in value if isinstance(item, str) and _looks_like_a_list(item)]
+        if typed_in:
+            errors.append(f"key '{key}' has {typed_in[0]!r} as one item: a whole list typed into one item. In "
+                          "Obsidian, set the property's type to List and add each entry as its own item, without "
+                          "brackets or quotes")
     return errors
+
+
+def _looks_like_a_list(item: str) -> bool:
+    """A JSON array written as one string, e.g. '["a.py"]'. A wikilink like '[[x]]' isn't one (x isn't quoted)."""
+    s = item.strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        return False
+    try:
+        return isinstance(json.loads(s), list)
+    except ValueError:
+        return False
 
 
 @overload

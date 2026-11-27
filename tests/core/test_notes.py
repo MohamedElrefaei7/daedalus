@@ -74,7 +74,8 @@ def test_non_string_link_item(world, key) -> None:
 
 def test_link_key_must_be_a_list(world) -> None:
     path = write_note(world.alpha, "concepts/c.md", "concept", related="[[a]]")
-    assert errors_for(world, path) == ["key 'related' must be a list of quoted wikilinks, got str"]
+    (error,) = errors_for(world, path)
+    assert error.startswith("key 'related' must be a YAML list, not a string ('[[a]]')") and "type to List" in error
 
 
 def test_error_names_file_and_every_bad_key(world) -> None:
@@ -131,3 +132,50 @@ def test_typed_folders_match_templates() -> None:
         assert set(folders.values()) == stems, f"templates/{vault}: typed folders {folders} != template types {stems}"
         for folder in folders:
             assert (TEMPLATES / vault / folder).is_dir(), f"templates/{vault}: typed folder '{folder}/' missing"
+
+
+# List-typed keys must be lists (fix after commit 10c) ---------------------------------------
+# What Obsidian's Properties panel wrote for `protected: ["tests/test_divide.py"]` typed into the field:
+OBSIDIAN_PROTECTED = "protected:\n  - '[\"tests/test_divide.py\"]'\n"
+
+
+def _goal(protected_yaml: str) -> str:
+    return ("---\ntype: goal\nstatus: draft\ncreated: \"2026-11-27\"\nrelated: []\nshared_refs: []\n"
+            "project_refs: []\nsource: human\ndone_when: pytest -q\nmax_iterations: 4\nbudget_usd: 0.1\n"
+            f"checkin_every: 2\n{protected_yaml}---\n\n# Divide\n")
+
+
+def _errors(text: str, note_type: str) -> list[str]:
+    from daedalus.core.notes import load_frontmatter, split_frontmatter, validate
+
+    raw, _ = split_frontmatter(text)
+    fm, err = load_frontmatter(raw)
+    assert err is None
+    return validate(fm, note_type)
+
+
+def test_the_exact_obsidian_text_fails_for_protected() -> None:
+    errors = _errors(_goal(OBSIDIAN_PROTECTED), "goal")
+    assert any("'protected'" in e and "whole list typed into one item" in e and "type to List" in e
+               for e in errors), errors
+
+
+def test_a_string_that_looks_like_a_list_fails_for_protected() -> None:
+    errors = _errors(_goal('protected: \'["tests/test_divide.py"]\'\n'), "goal")
+    assert any("key 'protected' must be a YAML list, not a string" in e and "type to List" in e
+               for e in errors), errors
+
+
+def test_the_same_text_fails_for_related() -> None:
+    text = _goal("protected: []\n").replace("related: []", "related:\n  - '[\"tests/test_divide.py\"]'")
+    errors = _errors(text, "goal")
+    assert any("'related'" in e and "whole list typed into one item" in e for e in errors), errors
+    text = _goal("protected: []\n").replace("related: []", "related: '[\"[[storage-engine]]\"]'")
+    assert any("key 'related' must be a YAML list" in e for e in _errors(text, "goal"))
+
+
+def test_a_real_list_passes() -> None:
+    assert _errors(_goal('protected: ["tests/test_divide.py"]\n'), "goal") == []
+    assert _errors(_goal("protected:\n  - tests/test_divide.py\n"), "goal") == []
+    text = _goal("protected: []\n").replace("related: []", 'related: ["[[storage-engine]]"]')
+    assert _errors(text, "goal") == [], "a wikilink item is a list item, not a typed-in list"

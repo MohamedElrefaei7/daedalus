@@ -345,8 +345,20 @@
   3. Lessons: none proposed. In neither run did a loop check fail and a later one pass (both were done at iteration 1; the agents' own red runs happen inside an iteration), so the lessons call was skipped. `/review lessons`: "No pending lessons."
 - **Found in the live check:** Obsidian's Properties panel stored `protected: ["tests/test_divide.py"]`, typed into a list field, as the single string `'["tests/test_divide.py"]'`, which `load` accepted: it would have protected nothing. Fixed in this commit: a protected path that doesn't exist in the checkout refuses the launch, saying how to enter list items (two tests). Also, the subtract note first carried the template's defaults and a capitalized file name, and Obsidian left an untracked `.obsidian/graph.json`; fixed by hand with your OK.
 
+### 2026-11-27 — Fix: list-typed fields must be lists; honest-done tracks test IDs
+
+- **The cause:** in commit 10c's live check, Obsidian's Properties panel wrote `protected` as one item holding the text `["tests/test_divide.py"]`, which validation accepted. And the count guards alone let a failing test be swapped for a trivial passing one.
+- **List keys:** `schema.LIST_KEYS` (`related`, `shared_refs`, `project_refs`, `protected`, `code`, `options`, `applies_to`, `decisions`, `tasks`) must be YAML lists; a string fails, and so does a whole list typed into one item, each saying to set the Obsidian property type to List. No live note failed the new rule.
+- **Node IDs:** the baseline records `pytest --collect-only -q`'s node IDs (sandboxed, with `done_when`'s selection; verbosity flags replaced), the files that failed to collect, and the base's test files. Done now also needs every baseline node ID to still exist; if the baseline had collection errors, every baseline test file too.
+- **Existing tests modified** (edited or deleted, from the base's test files) are listed with their diff in every check-in and in the report; no pause.
+- **Spend across resumes:** each resume of a stopped run is a batch (`state.batches`); check-ins and the report show the batch's spend against `budget_usd` and the total across batches.
+- **Tests:** 929 by default, 9 new (920 before): list keys 4 (the exact Obsidian text for `protected`, the same for `related`, a string, a real list), loop 5 (swap-the-test, collection-error file deletion, existing tests modified ×2, spend across batches); 14 live (+1: node IDs and an import error from a real `--collect-only`). The swap test failed first against the old guards: "deleting a failing test and adding a trivial one counted as done".
+
 ## Key decisions
 
+- ★ **List-valued keys must be YAML lists,** never strings or a list typed into one item; the error points at Obsidian's List property type.
+- ★ **Every test that existed at the start must still exist to be done** (node IDs from `--collect-only`; files when the start had collection errors), on top of the count guards.
+- **Changes to existing tests are always shown, never blocked:** in every check-in and the report, with the diff.
 - ★ **Only you launch goals:** `source: human`, or `status: accepted` after `/promote`. An agent can't start a run from a goal it wrote.
 - ★ **`done_when` passes rule 7 before anything is created;** a goal whose check can't run leaves nothing behind.
 - ★ **The honest-done rule:** exit 0, collected not below the baseline, skipped and xfailed not above it, and no protected path changed. A pass with a failed guard is not done, and says why in words.

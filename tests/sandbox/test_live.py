@@ -298,6 +298,23 @@ def test_pytest_counts_from_a_real_run(live) -> None:
     assert (counts.collected, counts.passed, counts.failed, counts.skipped, counts.xfailed) == (5, 2, 1, 1, 1)
 
 
+def test_node_ids_and_collection_errors_from_a_real_collect_only(live) -> None:
+    """The loop's node-ID baseline, parsed from real sandboxed `pytest --collect-only -q` output."""
+    from daedalus.core.goals import collect_argv, parse_collect
+
+    (live.worktree / "tests" / "test_param.py").write_text(
+        "import pytest\n\n\n@pytest.mark.parametrize('v', [1, 'a b'])\ndef test_p(v):\n    pass\n")
+    clean = parse_collect(live.run(collect_argv(("pytest", "-q"))).stdout_tail)
+    assert clean.errors == ()
+    assert clean.node_ids == ("tests/test_param.py::test_p[1]", "tests/test_param.py::test_p[a b]",
+                              "tests/test_smoke.py::test_smoke")
+    (live.worktree / "tests" / "test_broken.py").write_text("from nowhere import thing\n\n\ndef test_b():\n    pass\n")
+    broken = live.run(collect_argv(("pytest", "-q")))
+    parsed = parse_collect(broken.stdout_tail)
+    assert broken.exit_code == 2 and parsed.errors == ("tests/test_broken.py",), broken.stdout_tail
+    assert "tests/test_smoke.py::test_smoke" in parsed.node_ids
+
+
 # 12. Overhead -----------------------------------------------------------------------------------
 
 def test_overhead_of_the_sandbox(live, capsys) -> None:

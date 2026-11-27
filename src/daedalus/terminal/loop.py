@@ -76,13 +76,36 @@ class LoopUI(Protocol):
 class CheckIn:
     iteration: int
     max_iterations: int
-    spent: float
-    budget: float
+    spent: float  # this batch (since the start, or since the last resume of a stopped run)
+    budget: float  # the goal's budget_usd, per batch
     last_summary: str
     diff_stat: str
     config_changed: list[str]
     config_diff: str
     lockfile_note: str | None
+    tests_modified: list[str] = ()  # test files that existed at the baseline and now differ
+    tests_diff: str = ""
+    total_spent: float = 0.0  # across every batch of this run
+    batches: int = 1
+
+MAX_TESTS_DIFF_CHARS = 6_000
+
+
+def spend(state: dict) -> tuple[float, float, int]:
+    """(this batch's spend, the run's total across every resume, the number of batches)."""
+    total = ledger.spent(run_id=state["run_id"])
+    batches = state.get("batches") or [{"spent_before": 0.0}]
+    return round(total - batches[-1]["spent_before"], 6), total, len(batches)
+
+
+def _spend_text(state: dict) -> str:
+    batch, total, n = spend(state)
+    text = f"spent ${batch:.4f} of ${state['budget_usd']:.2f}"
+    return text + (f" this batch; ${total:.4f} in total across {n} batches" if n > 1 else "")
+
+
+def _capped(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + f"\n[… diff cut at {limit:,} characters]"
 
 
 # Run state -----------------------------------------------------------------------------------
@@ -220,6 +243,7 @@ class Loop:
             "limit_iterations": goal.max_iterations, "limit_budget": goal.budget_usd, "log_offset": offset,
             "iterations": [], "next": 1, "status": "running", "pause": None, "question": None, "redirect": None,
             "last_output": "", "config_changed": [], "stop_reason": None, "done": False, "started": _now(),
+            "batches": [{"started": _now(), "spent_before": 0.0}],
         }
         try:
             self.ui.say(f"Run {run_id}: {goal.ref} in {rec.path} on {rec.branch}. Baseline: `{' '.join(goal.argv)}` …",
@@ -233,7 +257,13 @@ class Loop:
         except BaseException:
             worktree.drop(self.session.registry, self.session.active, rec.slug, force=True)  # nothing in it yet
             raise
-        state["baseline"] = {"exit_code": result.exit_code, "counts": counts.__dict__ if counts else None}
+        state["baseline"] = {"exit_code": result.exit_code, "counts": counts.__dict__ if counts else None,
+                             "node_ids": [], "collection_errors": [], "test_files": []}
+        if goal.is_pytest:
+            listed = goals.parse_collect(self.runner(self.run_session(state), goals.collect_argv(goal.argv),
+                                                     Path(rec.path)).stdout_tail)
+            state["baseline"].update(node_ids=list(listed.node_ids), collection_errors=list(listed.errors),
+                                     test_files=list(goals.base_test_files(rec.path, rec.base)))
         state["last_output"] = result.stdout_tail[-MESSAGE_TAIL_CHARS:]
         save(state)
         base_text = (_counts_text(state["baseline"]["counts"]) if goal.is_pytest else "") + f", exit {result.exit_code}"
@@ -254,7 +284,10 @@ class Loop:
         state = candidates[-1]
         if state["status"] == "stopped":  # another batch: the goal note's iterations and budget again
             state["limit_iterations"] = len(state["iterations"]) + state["max_iterations"]
-            state["limit_budget"] = round(ledger.spent(run_id=state["run_id"]) + state["budget_usd"], 6)
+            total = ledger.spent(run_id=state["run_id"])
+            state["limit_budget"] = round(total + state["budget_usd"], 6)
+            state.setdefault("batches", [{"started": state["started"], "spent_before": 0.0}]).append(
+                {"started": _now(), "spent_before": total})
             state["stop_reason"] = None
         if state["pause"] == "ask_user":
             q = state["question"]
@@ -422,9 +455,16 @@ class Loop:
         goal_like = Goal(state["goal_ref"], state["goal_slug"], None, "", tuple(state["argv"]), 0, 0.0, 1,
                          tuple(state["protected"]))
         b = state["baseline"]
-        baseline = Baseline(b["exit_code"], Counts(**b["counts"]) if b["counts"] else None)
+        baseline = Baseline(b["exit_code"], Counts(**b["counts"]) if b["counts"] else None,
+                            tuple(b.get("node_ids", ())), tuple(b.get("collection_errors", ())),
+                            tuple(b.get("test_files", ())))
         changed = goals.protected_changes(state["wt_path"], state["base"], tuple(state["protected"]))
-        verdict = goals.judge(goal_like, result.exit_code, result.stdout_tail, baseline, changed)
+        now_ids = None
+        if goal_like.is_pytest:
+            listed = self.runner(s, goals.collect_argv(state["argv"]), Path(state["wt_path"]))
+            now_ids = goals.parse_collect(listed.stdout_tail).node_ids
+        verdict = goals.judge(goal_like, result.exit_code, result.stdout_tail, baseline, changed, now_ids,
+                              state["wt_path"])
         counts = goals.parse_pytest(result.stdout_tail) if goal_like.is_pytest else None
         record.update(exit_code=result.exit_code, counts=counts.__dict__ if counts else None,
                       guards=[g.__dict__ for g in verdict.guards], done=verdict.done, verdict=verdict.reason,
@@ -480,9 +520,11 @@ class Loop:
         read_from_checkout = [p for p in last["config"] if os.path.basename(p) in goals.READ_FROM_CHECKOUT]
         note = (f"{', '.join(read_from_checkout)}: daedalus reads these from your checkout, never the worktree, so this "
                 "edit changes nothing that runs or gets installed until you merge." if read_from_checkout else None)
-        info = CheckIn(len(state["iterations"]), state["limit_iterations"], ledger.spent(run_id=state["run_id"]),
-                       state["limit_budget"], last["summary"], goals.diff_stat(wt, state["base"]), last["config"],
-                       config_diff, note)
+        modified, tests_diff = goals.tests_modified(wt, state["base"], state["baseline"].get("test_files", []))
+        batch, total, n = spend(state)
+        info = CheckIn(len(state["iterations"]), state["limit_iterations"], batch, state["budget_usd"], last["summary"],
+                       goals.diff_stat(wt, state["base"]), last["config"], config_diff, note, modified,
+                       _capped(tests_diff, MAX_TESTS_DIFF_CHARS), total, n)
         try:
             choice, text = self.ui.checkin(info)
         except (EOFError, KeyboardInterrupt):
@@ -510,12 +552,10 @@ class Loop:
     def report(self, state: dict) -> str:
         its = state["iterations"]
         last = next((i for i in reversed(its) if i.get("guards")), None)
-        spent = ledger.spent(run_id=state["run_id"])
         b = state["baseline"]
         lines = [f"Run {state['run_id']} ended: {state['stop_reason']}" +
                  (" — the goal is honestly done." if state["done"] else "."),
-                 f"  iterations: {len(its)} of {state['limit_iterations']} · spent ${spent:.4f} of "
-                 f"${state['limit_budget']:.2f}",
+                 f"  iterations: {len(its)} of {state['limit_iterations']} · {_spend_text(state)}",
                  f"  baseline: exit {b['exit_code']}" + (f", {_counts_text(b['counts'])}" if b["counts"] else "")]
         if last is not None:
             lines.append(f"  last check: `{' '.join(state['argv'])}` exit {last['exit_code']}"
@@ -524,6 +564,10 @@ class Loop:
         else:
             lines.append("  no check ran after an edit")
         lines.append(f"  config files changed: {', '.join(state['config_changed']) or 'none'}")
+        modified, tests_diff = goals.tests_modified(state["wt_path"], state["base"], b.get("test_files", []))
+        lines.append(f"  existing tests modified: {', '.join(modified) or 'none'}")
+        if modified:
+            lines += ["    " + line for line in _capped(tests_diff, MAX_TESTS_DIFF_CHARS).rstrip().splitlines()]
         committed = _git(state["wt_path"], "diff", "--stat", f"{state['base']}..HEAD").rstrip()
         lines += [f"  git diff --stat ({state['branch']} against its start):",
                   *("    " + line for line in (committed or "(no committed changes)").splitlines())]

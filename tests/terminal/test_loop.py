@@ -40,13 +40,30 @@ def pytest_out(passed=0, failed=0, skipped=0, xfailed=0, exit_code=None) -> RunR
     return RunResult(code, f"{'F' * failed}{'.' * passed}\n{summary} in 0.01s\n", "", 0.3, False)
 
 
-class Runner:
-    """Answers each sandboxed check with the next scripted result; records what was run, and where."""
+def collected(wt: Path) -> RunResult:
+    """What `pytest --collect-only -q` would list: every test_* function in the worktree's test_*.py files."""
+    import re
 
-    def __init__(self, *results: RunResult) -> None:
+    ids = sorted(f"{f.relative_to(wt).as_posix()}::{name}" for f in Path(wt).rglob("test_*.py")
+                 for name in re.findall(r"^def (test_\w+)", f.read_text(), re.M))
+    return RunResult(0 if ids else 5, "\n".join(ids) + f"\n\n{len(ids)} tests collected in 0.01s\n", "", 0.2, False)
+
+
+class Runner:
+    """Answers each sandboxed check with the next scripted result; records what was run, and where.
+
+    `pytest --collect-only` runs (the node-ID baseline and check) are answered from ``collects`` if scripted,
+    else from the worktree's real files, and recorded apart in ``collect_calls``.
+    """
+
+    def __init__(self, *results: RunResult, collects: list[RunResult] | None = None) -> None:
         self.results, self.calls = list(results), []
+        self.collects, self.collect_calls = list(collects or []), []
 
     def __call__(self, session, argv, wt, **_kw) -> RunResult:
+        if "--collect-only" in argv:
+            self.collect_calls.append(list(argv))
+            return self.collects.pop(0) if self.collects else collected(Path(wt))
         self.calls.append((list(argv), Path(wt), session.protected))
         if not self.results:
             raise AssertionError("an unscripted check ran")
@@ -268,9 +285,41 @@ def failed_guards(state) -> dict:
 def test_deleting_the_failing_test_is_not_done(proj, fake) -> None:
     state = run_one(proj, fake, pytest_out(passed=1), ("delete_code", {"rel_path": "tests/test_x.py"}))
     assert not state["done"] and state["stop_reason"] == "max_iterations"
-    assert failed_guards(state) == {"collected": "1 fewer test was collected than at the start (2 → 1)"}
+    assert failed_guards(state) == {"collected": "1 fewer test was collected than at the start (2 → 1)",
+                                    "node_ids": "1 test from the start no longer exists: tests/test_x.py::test_x"}
     assert "the check passed, but 1 fewer test was collected than at the start" in state["iterations"][-1]["verdict"]
     assert "✗ collected" in state["report"]
+
+
+def test_swapping_the_failing_test_for_a_trivial_one_is_not_done(proj, fake) -> None:
+    """The counts match (2 collected, as at the start), but test_x is gone: not done, naming its node ID."""
+    state = run_one(proj, fake, pytest_out(passed=2), ("delete_code", {"rel_path": "tests/test_x.py"}),
+                    ("write_code", {"rel_path": "tests/test_z.py", "content": "def test_z():\n    assert True\n"}))
+    assert not state["done"], "deleting a failing test and adding a trivial one counted as done"
+    assert failed_guards(state) == {"node_ids": "1 test from the start no longer exists: tests/test_x.py::test_x"}
+    assert "tests/test_x.py::test_x" in state["report"]
+
+
+COLLECTION_ERROR = RunResult(2, "E   ImportError: cannot import name 'x'\nERROR tests/test_x.py\n!!!!! Interrupted: 1 error "
+                                 "during collection !!!!!\n1 error in 0.05s\n", "", 0.2, False)
+COLLECT_WITH_ERROR = RunResult(2, "tests/test_y.py::test_y\n\n==== ERRORS ====\n____ ERROR collecting tests/test_x.py ____\n"
+                                  "ImportError\n==== short test summary info ====\nERROR tests/test_x.py\n"
+                                  "!!!!! Interrupted: 1 error during collection !!!!!\n1 test collected, 1 error in 0.05s\n",
+                               "", 0.2, False)
+
+
+def test_a_collection_error_baseline_whose_test_file_is_deleted_is_not_done(proj, fake) -> None:
+    """At the start test_x.py can't be imported, so it has no node IDs; the file itself is what's checked."""
+    goal(proj, max_iterations=1)
+    fake.responses += [*turn(("delete_code", {"rel_path": "tests/test_x.py"}), done="removed the broken test")]
+    runner = Runner(COLLECTION_ERROR, pytest_out(passed=1), collects=[COLLECT_WITH_ERROR])
+    state = make_loop(proj, fake, UI(), runner).start("hello")
+    assert state["baseline"]["collection_errors"] == ["tests/test_x.py"]
+    assert state["baseline"]["node_ids"] == ["tests/test_y.py::test_y"]
+    assert not state["done"]
+    assert failed_guards(state) == {"test_files": "1 test file from the start no longer exists: tests/test_x.py "
+                                                  "(the start had collection errors, so files are checked)"}
+    assert [c for c in runner.collect_calls] == [["pytest", "--collect-only", "-q"]] * 2
 
 
 def test_skipping_the_failing_test_is_not_done(proj, fake) -> None:
@@ -308,6 +357,8 @@ def test_a_protected_change_behind_the_tools_back_fails_the_guard(proj, fake) ->
     runner = Runner(pytest_out(passed=1, failed=1))
 
     def check(session, argv, wt, **kw):  # someone else changes the protected file before the check
+        if "--collect-only" in argv:
+            return runner(session, argv, wt)
         if len(runner.calls) == 1:
             (Path(wt) / "tests" / "test_x.py").write_text("def test_x():\n    pass\n")
             runner.calls.append(None)
@@ -348,11 +399,14 @@ def test_an_agents_draft_goal_is_refused_and_launches_once_accepted(proj, fake) 
     assert state["stop_reason"] == "done"
 
 
-@pytest.mark.parametrize("entry", ['["tests/test_x.py"]', "tests/nope.py"])
-def test_a_protected_path_that_doesnt_exist_is_refused_before_any_worktree(proj, fake, entry) -> None:
-    """Obsidian's Properties panel can store '["a.py"]' as one string: that would protect nothing."""
+@pytest.mark.parametrize("entry, match", [
+    ('["tests/test_x.py"]', "a whole list typed into one item"),  # what Obsidian wrote: the schema refuses it
+    ("tests/nope.py", "doesn't exist in .* protects nothing"),
+])
+def test_a_protected_path_that_doesnt_exist_is_refused_before_any_worktree(proj, fake, entry, match) -> None:
+    """Obsidian's Properties panel can store '["a.py"]' as one item: that would protect nothing."""
     goal(proj, protected=[entry])
-    with pytest.raises(GoalError, match="doesn't exist in .* protects nothing"):
+    with pytest.raises(GoalError, match=match):
         make_loop(proj, fake, UI(), Runner()).start("hello")
     assert worktree.list_worktrees(proj.registry, "alpha") == [] and loop.all_runs() == []
 
@@ -441,3 +495,53 @@ def test_goal_is_refused_in_coder_mode(proj, fake) -> None:
     lines = ["/wt new other", "/code other", "/goal hello"]
     repl.run(lambda prompt="": lines.pop(0) if lines else (_ for _ in ()).throw(EOFError))
     assert "leave coder mode (/code off) before running a goal" in buf.getvalue()
+
+
+# Existing tests modified, and spend across resumes (fix after commit 10c) -------------------
+
+def test_edits_to_existing_tests_are_flagged_in_checkins_and_the_report(proj, fake) -> None:
+    goal(proj, checkin_every=1, max_iterations=2)
+    fake.responses += [
+        *turn(("edit_code", {"rel_path": "tests/test_y.py", "old": "assert True", "new": "assert 1 == 1"}),
+              done="reword test_y"),
+        *turn(("write_code", {"rel_path": "tests/test_new.py", "content": "def test_new():\n    pass\n"}),
+              done="add a new test"),
+    ]
+    ui = UI(("continue", None))
+    state = make_loop(proj, fake, ui, Runner(*[pytest_out(passed=1, failed=1)] * 3)).start("hello")
+    (checkin,) = ui.checkins
+    assert checkin.tests_modified == ["tests/test_y.py"], "a new test file isn't an existing test"
+    assert "-    assert True" in checkin.tests_diff and "+    assert 1 == 1" in checkin.tests_diff
+    assert len(state["iterations"]) == 2, "flagging doesn't pause the run"
+    assert "existing tests modified: tests/test_y.py" in state["report"]
+    assert "+    assert 1 == 1" in state["report"]
+
+
+def test_no_existing_tests_modified_says_none(proj, fake) -> None:
+    goal(proj, max_iterations=1)
+    fake.responses += [*turn(done="nothing")]
+    state = make_loop(proj, fake, UI(), Runner(*[pytest_out(passed=1, failed=1)] * 2)).start("hello")
+    assert "existing tests modified: none" in state["report"]
+
+
+def test_resuming_a_stopped_run_shows_the_total_spend_across_batches(proj, fake) -> None:
+    """Each resume of a stopped run is a batch with its own budget; check-ins and the report show the total too."""
+    goal(proj, checkin_every=1, max_iterations=2)
+    fake.responses += [*turn(done="first"), *turn(done="second")]
+    ui1 = UI(("continue", None))
+    first = make_loop(proj, fake, ui1, Runner(*[pytest_out(passed=1, failed=1)] * 3)).start("hello")
+    assert first["stop_reason"] == "max_iterations" and "in total across" not in first["report"]
+    assert ui1.checkins[0].batches == 1
+    after_first = ledger.spent(run_id=first["run_id"])
+
+    fake.responses += [*turn(done="third"), *turn(done="fourth")]
+    ui2 = UI(("continue", None))
+    again = make_loop(proj, fake, ui2, Runner(*[pytest_out(passed=1, failed=1)] * 2)).resume(guidance="try harder")
+    total = ledger.spent(run_id=again["run_id"])
+    (checkin,) = ui2.checkins
+    assert checkin.iteration == 3 and checkin.batches == 2 and checkin.total_spent > after_first
+    assert checkin.spent == pytest.approx(checkin.total_spent - after_first, abs=1e-6)
+    assert again["stop_reason"] == "max_iterations" and len(again["iterations"]) == 4
+    assert "try harder" in fake.bodies()[2]["messages"][-1]["content"], "the guidance reached iteration 3"
+    batch = round(total - after_first, 6)
+    assert f"spent ${batch:.4f} of $0.50 this batch; ${total:.4f} in total across 2 batches" in again["report"]

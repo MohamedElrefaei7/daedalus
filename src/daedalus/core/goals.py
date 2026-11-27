@@ -12,11 +12,15 @@ worktree exists, so a goal whose check can't run leaves nothing behind.
 
 ★ The honest-done rule. A check that exits 0 isn't enough: an agent stuck on a
 failing test can delete it, skip it, xfail it, or change how tests are found.
-The goal is done only if all four hold:
+The goal is done only if all of these hold:
   1. the check exits 0;
   2. for pytest, at least as many tests were collected as at the baseline;
   3. for pytest, no more were skipped, and no more xfailed, than at the baseline;
-  4. no protected path differs from the worktree's base.
+  4. for pytest, every node ID collected at the baseline (`pytest --collect-only
+     -q`, sandboxed) still exists, so a failing test can't be swapped for a
+     trivial one; and if the baseline had collection errors, every test file
+     present at the baseline still exists;
+  5. no protected path differs from the worktree's base.
 """
 
 from __future__ import annotations
@@ -183,6 +187,49 @@ def parse_pytest(output: str) -> Counts | None:
 class Baseline:
     exit_code: int
     counts: Counts | None  # pytest only
+    node_ids: tuple[str, ...] = ()  # pytest only: what --collect-only listed at the start
+    collection_errors: tuple[str, ...] = ()  # files pytest couldn't collect at the start
+    test_files: tuple[str, ...] = ()  # test files in the base commit (the fallback when collection had errors)
+
+
+# pytest --collect-only ----------------------------------------------------------------------
+
+VERBOSITY = {"-q", "-qq", "-qqq", "--quiet", "-v", "-vv", "-vvv", "--verbose"}
+TEST_FILE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$")
+
+
+def collect_argv(argv: tuple[str, ...] | list[str]) -> list[str]:
+    """done_when as a collection run: the same selection, verbosity replaced by one -q (-qq prints per-file counts)."""
+    return [argv[0], *[a for a in argv[1:] if a not in VERBOSITY], "--collect-only", "-q"]
+
+
+@dataclass(frozen=True)
+class Collected:
+    node_ids: tuple[str, ...]
+    errors: tuple[str, ...]  # files that failed to collect
+
+
+def parse_collect(output: str) -> Collected:
+    """`pytest --collect-only -q`: node IDs (one per line, up to the first blank line) and the ERROR'd files."""
+    ids: list[str] = []
+    for line in output.splitlines():
+        if not line.strip():
+            break
+        if "::" in line and not line.startswith(("ERROR", "FAILED", "=", "_", " ")):
+            ids.append(line.rstrip())
+    errors = [m.group(1) for m in re.finditer(r"^ERROR (\S+?)(?: - .*)?$", output, re.M)]
+    if not errors and re.search(r"\b\d+ errors?\b.*\bin [\d.]+s", output):
+        errors = ["(a collection error)"]
+    return Collected(tuple(dict.fromkeys(ids)), tuple(dict.fromkeys(errors)))
+
+
+def base_test_files(wt: Path | str, base: str) -> tuple[str, ...]:
+    return tuple(p for p in _git(wt, "ls-tree", "-r", "--name-only", base).splitlines() if TEST_FILE.search(p))
+
+
+def _listed(items: list[str], limit: int = 5) -> str:
+    shown = ", ".join(items[:limit])
+    return shown + (f", and {len(items) - limit} more" if len(items) > limit else "")
 
 
 # The honest-done rule -------------------------------------------------------------------------
@@ -213,7 +260,8 @@ def _n(k: int, one: str, many: str) -> str:
     return f"{k} {one if k == 1 else many}"
 
 
-def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected_changed: list[str]) -> Verdict:
+def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected_changed: list[str],
+          now_ids: tuple[str, ...] | None = None, wt: Path | str | None = None) -> Verdict:
     guards = [Guard("exit", exit_code == 0, "the check exited 0" if exit_code == 0 else
                     f"the check failed (exit {exit_code})")]
     if goal.is_pytest:
@@ -235,6 +283,21 @@ def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected
                 guards.append(Guard(name, b <= a, f"{b} {word}, no more than the {a} at the start" if b <= a else
                                     f"{_n(b - a, 'more test was', 'more tests were')} {word} than at the start "
                                     f"({a} → {b})"))
+        if now_ids is None:
+            guards.append(Guard("node_ids", False, "the tests couldn't be listed now (pytest --collect-only), so "
+                                                   "the start's tests can't be checked"))
+        else:
+            gone = sorted(set(baseline.node_ids) - set(now_ids))
+            guards.append(Guard("node_ids", not gone,
+                                f"all {len(baseline.node_ids)} tests from the start still exist" if not gone else
+                                f"{_n(len(gone), 'test from the start no longer exists', 'tests from the start no longer exist')}"
+                                f": {_listed(gone)}"))
+        if baseline.collection_errors:
+            missing = [f for f in baseline.test_files if wt is None or not (Path(wt) / f).exists()]
+            guards.append(Guard("test_files", not missing,
+                                f"all {len(baseline.test_files)} test files from the start still exist" if not missing
+                                else f"{_n(len(missing), 'test file from the start no longer exists', 'test files from the start no longer exist')}"
+                                f": {_listed(missing)} (the start had collection errors, so files are checked)"))
     guards.append(Guard("protected", not protected_changed,
                         "no protected path changed" if not protected_changed else
                         f"protected {'path' if len(protected_changed) == 1 else 'paths'} changed: "
@@ -266,6 +329,15 @@ def diff_stat(wt: Path | str, base: str) -> str:
     lines = [stat] if stat else []
     lines += [f" {p} (new, uncommitted)" for p in new]
     return "\n".join(lines) or "(no changes)"
+
+
+def tests_modified(wt: Path | str, base: str, test_files: tuple[str, ...] | list[str]) -> tuple[list[str], str]:
+    """Test files that existed at the base and now differ (edited or deleted): (paths, their diff)."""
+    if not test_files:
+        return [], ""
+    specs = ["--", *test_files]
+    paths = [p for p in _git(wt, "diff", "--name-only", "--no-renames", base, *specs).splitlines() if p]
+    return paths, (_git(wt, "diff", "--no-color", "--no-renames", base, *specs) if paths else "")
 
 
 def is_config(rel: str) -> bool:
