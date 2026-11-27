@@ -379,6 +379,8 @@ Plan approval in commit 12 will reuse this to write several decision notes at on
   - it's at most 25 MB;
   - a `scheme://` URL is refused.
 - **Hashed twice.** The file is hashed before and after conversion, and refused if it changed in between.
+- **Proven network-free.** `test_conversion_never_touches_the_network` blocks `socket.connect`, `connect_ex`, `create_connection`, and `getaddrinfo`, builds the real converter from scratch, and converts every allowed format. Attempts are recorded as well as refused, so a converter that swallows the error still fails the test.
+- **PDF glyph artifacts.** pdfminer writes `(cid:NNN)` for a glyph it can't map to a character, such as a phone or envelope icon. Those markers, and the spaces after them, are stripped from PDF output only; a `.md` or `.txt` file that mentions one keeps it.
 
 **The checks, in order:**
 1. **Duplicates.** The original's SHA-256 is checked against the `original_sha256` of every note in the active `sources/`. A match is refused and named, so renaming a file doesn't get it in twice.

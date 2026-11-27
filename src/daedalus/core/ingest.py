@@ -11,6 +11,8 @@ ingest(session, src_path), in order:
      (local converters only: no plugins, no LLM client, no Document
      Intelligence endpoint); .md and .txt are copied as-is after a UTF-8 check.
      The file is hashed again afterwards; if it changed meanwhile, refuse.
+     PDF text loses pdfminer's "(cid:NNN)" markers for glyphs it couldn't
+     map to characters (icon fonts: a phone or envelope symbol).
   4. Refuse empty results (fewer than 50 non-whitespace characters): a
      scanned PDF has no text layer, and an empty note would look like success.
   5. Refuse markdown over 2 MB; never truncate.
@@ -57,6 +59,7 @@ CONVERTED = (".pdf", ".docx", ".pptx", ".xlsx")
 COPIED = (".md", ".txt")
 ALLOWED = CONVERTED + COPIED
 NO_TEXT = "no text layer — likely a scanned document; OCR isn't enabled"
+_CID = re.compile(r"\(cid:\d+\)[ \t]*")  # pdfminer's marker for a glyph with no character mapping
 _HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.M)
 
 
@@ -191,7 +194,14 @@ def convert(path: Path, conv: Converter | None) -> tuple[str, str]:
     markdown = getattr(result, "markdown", None)
     if not isinstance(markdown, str):
         raise IngestError(f"{path.name}: the converter returned no markdown")
+    if path.suffix.lower() == ".pdf":
+        markdown = strip_glyph_artifacts(markdown)
     return markdown, converter_version()
+
+
+def strip_glyph_artifacts(text: str) -> str:
+    """Drop "(cid:NNN)" markers, and the spaces after them, from PDF text."""
+    return _CID.sub("", text)
 
 
 def check_text(markdown: str, name: str, copied: bool) -> None:

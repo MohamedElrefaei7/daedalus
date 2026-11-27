@@ -270,6 +270,15 @@
   - Icon-font glyphs come out as `(cid:N)` (pdfminer's unmapped-glyph marker): seen live.
 - **Live check** (scratch2): `/add` of a real two-page PDF (a résumé) committed `9d8c92b add: <name>.pdf`, one path, `vault/sources/<slug>.md`, 103 lines. With no heading in the PDF, the title fell back to the file stem. "Summarize this source and propose a concept note from it" gave a pending `inbox/` concept draft (`source: deepseek`) whose `related` cites the source by its bare stem. A second `/add` of the same file added nothing; the hash check names the existing note.
 
+### 2026-11-26 — Fix: /add strips PDF glyph artifacts; conversion proven network-free
+
+- **The cause:** in commit 9's live check, the source note kept pdfminer's `(cid:131)` and `(cid:239)` markers for icon-font glyphs.
+- **`ingest.strip_glyph_artifacts`** removes `(cid:NNN)` and the spaces after it, from PDF output only.
+- **Network-free:** a test blocks `socket.socket.connect` and `connect_ex`, `socket.create_connection`, and `socket.getaddrinfo`, resets the converter singleton so MarkItDown is built under the block, and converts all six formats. Every attempt is recorded and the list must be empty, so a swallowed error still fails.
+- **Proved red twice:** a `urlopen("http://example.invalid/")` in `convert` failed the test with `IngestError: net.docx couldn't be converted (NetworkBlocked: socket.create_connection called during ingest with (('example.invalid', 80), 1, None))`. The same call wrapped in `try/except: pass` failed with "ingest reached for the network: [\"socket.create_connection(('example.invalid', 80), 1, None)\", …]" (four attempts, one per converted format).
+- **Tests:** 785, 3 new: glyphs stripped from a PDF (fixture string through a fake converter), markers kept in a `.md`, and the no-network test.
+- The scratch2 source note from commit 9's live check still holds the markers; it wasn't rewritten.
+
 ## Key decisions
 
 - ★ **Only the converted markdown enters git, never the original.** The SHA-256 and byte count identify it without storing it, and a test checks `git log --all` for any non-markdown path in `sources/`.
@@ -277,6 +286,8 @@
 - ★ **An empty conversion is a refusal, not a note.** A scanned PDF has no text layer, and an empty note would look like success. Markdown over 2 MB is refused, never truncated.
 - ★ **The same bytes are added once.** The duplicate check is by hash, so a renamed copy is refused too, naming the existing note. The file is hashed again after conversion, so a file changed meanwhile is refused.
 - ★ **`/add` writes through `apply_changes`, not a queue proposal.** It's a human action (`USER_ACTION`), and proposal content is capped at 256 KB, under the 2 MB markdown cap. It keeps every apply guarantee: the write lock, a stale check, a recorded change set, a path-limited commit, rollback, and reconciliation.
+- ★ **Conversion is proven network-free by test, not by reading MarkItDown's code.** Connects and DNS lookups are blocked and recorded while every format converts with a freshly built converter.
+- **`(cid:NNN)` is stripped from PDF text only.** Elsewhere it's the author's own text.
 - **Source stems are unique across every registered vault,** so a bare `[[stem]]` to a source can't be ambiguous (the commit-8 fix's link rule would refuse it).
 - **Source notes:** the title is the first markdown heading, else the file stem (`result.title` is ignored; it's None). .md and .txt are copied byte-for-byte after a UTF-8 check, with converter `copy`, and a .md file's own frontmatter is kept as body.
 - ★ **No design choice goes ahead without precedent or the human's answer.** Precedent is an accepted, schema-valid note in the active `decisions/` or the shared `practices/`, and nothing else: no drafts or proposed notes, no other folders, no pulled projects' decisions (promote those to a shared practice).

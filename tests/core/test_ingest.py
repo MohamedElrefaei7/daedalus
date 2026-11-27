@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
+import socket
 from pathlib import Path
 
 import doc_fixtures as docs
@@ -288,3 +290,75 @@ def test_existing_typed_note_in_sources_is_ignored_by_the_hash_check(gworld, doc
     write_note(gworld.alpha, "sources/hand-written.md", None, "# a note I wrote\n")
     done = ingest(gworld.session, docs.make_pdf(docdir / "a.pdf"))
     assert done.rel_path.startswith("sources/")
+
+
+# PDF glyph artifacts --------------------------------------------------------------------------
+
+GLYPHY = ("(cid:131) 555-0100 # jane@example.com (cid:239) example.com/in/jane § github.com/jane\n\n"
+          "Experience(cid:12)(cid:3)\tPlanned the storage layer and the fetcher for the station network.\n")
+
+
+def test_pdf_glyph_artifacts_are_stripped(gworld, docdir) -> None:
+    """pdfminer writes (cid:NNN) for icon-font glyphs it can't map; none reach the note."""
+    src = docs.make_pdf(docdir / "glyphs.pdf")
+    done = ingest(gworld.session, src, conv=FakeConverter(GLYPHY))
+    body = notes.split_frontmatter((gworld.alpha / done.rel_path).read_text())[1]
+    assert "(cid:" not in body
+    assert "555-0100 # jane@example.com example.com/in/jane § github.com/jane\n" in body
+    assert "ExperiencePlanned the storage layer" in body
+    assert done.chars == len(ingest_mod.strip_glyph_artifacts(GLYPHY))
+
+
+def test_glyph_markers_are_kept_outside_pdfs(gworld, docdir) -> None:
+    """Only PDF text has pdfminer's markers; a markdown file that mentions one is copied as-is."""
+    src = docdir / "about-cids.md"
+    src.write_text("# pdfminer markers\n\nA glyph with no mapping shows up as (cid:131) in extracted text.\n")
+    done = ingest(gworld.session, src)
+    assert "as (cid:131) in extracted" in (gworld.alpha / done.rel_path).read_text()
+
+
+# No network -----------------------------------------------------------------------------------
+
+class NetworkBlocked(AssertionError):
+    """A socket connect or DNS lookup happened during ingest."""
+
+
+@contextlib.contextmanager
+def no_network(monkeypatch):
+    """Every socket connect and DNS lookup inside the block raises, and is recorded.
+
+    Recorded as well as raised, so a converter that catches the error and
+    carries on still fails the test.
+    """
+    attempts: list[str] = []
+
+    def refuse(name):
+        def blocked(*args, **kwargs):
+            attempts.append(f"{name}{args!r}")
+            raise NetworkBlocked(f"{name} called during ingest with {args!r}")
+        return blocked
+
+    with monkeypatch.context() as m:
+        m.setattr(socket.socket, "connect", refuse("socket.connect"))
+        m.setattr(socket.socket, "connect_ex", refuse("socket.connect_ex"))
+        m.setattr(socket, "create_connection", refuse("socket.create_connection"))
+        m.setattr(socket, "getaddrinfo", refuse("socket.getaddrinfo"))
+        yield attempts
+
+
+def test_conversion_never_touches_the_network(gworld, docdir, monkeypatch) -> None:
+    """Every format converts, with the real MarkItDown built from scratch, while the network is blocked."""
+    monkeypatch.setattr(ingest_mod, "_converter", None)  # so construction happens under the block too
+    sources = {kind: build(docdir / f"net.{kind}") for kind, (build, _) in BUILDERS.items()}
+    (docdir / "net.md").write_text("# Notes\n\n" + docs.FILLER + "\n")
+    (docdir / "net.txt").write_text(docs.FILLER + "\n")
+    sources |= {"md": docdir / "net.md", "txt": docdir / "net.txt"}
+
+    with no_network(monkeypatch) as attempts:
+        added = {kind: ingest(gworld.session, src) for kind, src in sorted(sources.items())}
+
+    assert attempts == [], f"ingest reached for the network: {attempts}"
+    assert ingest_mod._converter is not None, "the real converter wasn't used"
+    for kind, (_, phrase) in BUILDERS.items():
+        assert phrase in (gworld.alpha / added[kind].rel_path).read_text(), kind
+    assert sorted(added) == ["docx", "md", "pdf", "pptx", "txt", "xlsx"]
