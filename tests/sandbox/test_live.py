@@ -173,10 +173,27 @@ def test_no_reads_in_home(live) -> None:
         """)
     finally:
         probe.unlink()
-    for name in ("probe", "state", "note", "list_home", "worktree_vault", "worktree_git", "xattr"):
+    for name in ("probe", "state", "note", "list_home", "worktree_vault", "worktree_git", "xattr", "stat"):
         assert found[name] != "READ", f"a sandboxed run could read {name}: {found}"
     assert found["worktree"] == "READ", found
-    assert found["stat"] == "READ", "metadata under home is allowed by design (see profile.py)"
+
+
+def test_no_metadata_reads_in_home(live) -> None:
+    """Even stat is denied under home, outside pytest's upward search for its config files."""
+    probe = HOME / ".daedalus-sandbox-meta-probe"
+    probe.write_text("its existence is none of the run's business\n")
+    try:
+        found, _ = live.py(f"""
+            import json, os
+            try:
+                os.stat({str(probe)!r}); out = "STAT OK"
+            except Exception as e:
+                out = type(e).__name__
+            print(json.dumps({{"stat": out}}))
+        """)
+    finally:
+        probe.unlink()
+    assert found["stat"] == "PermissionError", f"a sandboxed run could stat {probe}: {found}"
 
 
 # 9. No Keychain ---------------------------------------------------------------------------------
@@ -244,6 +261,20 @@ def test_real_pytest_passes_and_fails(live) -> None:
     bad = live.run(["pytest", "-q"])
     assert bad.exit_code == 1, bad
     assert "deliberate failure for the sandbox check" in bad.stdout_tail and "1 failed, 1 passed" in bad.stdout_tail
+
+
+def test_real_pytest_in_a_checkout_under_home() -> None:
+    """The throwaway worktrees live outside home; this one is scratch2's own checkout, so pytest's
+    upward config search really walks through home. The checkout is read-only to the run."""
+    registry = load_registry()
+    session = Session(registry, PROJECT)
+    repo = session.active_repo
+    assert HOME in repo.parents
+    before = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
+    result = runner.run(session, ["pytest", "-q"], repo)
+    assert result.exit_code == 0 and "1 passed" in result.stdout_tail, result
+    after = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
+    assert after == before
 
 
 def test_the_child_sees_only_the_allowlisted_environment(live, monkeypatch) -> None:

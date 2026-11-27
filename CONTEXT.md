@@ -296,6 +296,16 @@
 - **Live check:** `uv run pytest -m sandbox`: 10 passed. `python -m daedalus.sandbox run --project scratch2 -- pytest -q`: `1 passed`, `— sandboxed: exit 0 in 0.36 s` (0.50 s wall with `uv run`). Overhead, median of 5 `pytest -q`: sandboxed 370 ms, unsandboxed 312 ms, +57 ms. No Keychain prompt appeared. Nothing new in `~` except `~/.cache/daedalus/venvs/`.
 - **Not done:** superseded venvs aren't pruned.
 
+### 2026-11-26 — Fix: narrow sandbox metadata reads to pytest's upward search
+
+- **The cause:** commit 10a re-allowed `file-read-metadata` under all of home, so a run could `stat` any path there and learn its existence, size, and times.
+- **Now:** metadata is allowed, as `literal` `-D` parameters, only on each ancestor folder of the worktree up to and including home, and on `pytest.ini`, `.pytest.ini`, `pyproject.toml`, `tox.ini`, `setup.cfg`, and `conftest.py` in those folders. For scratch2's checkout that's `~` and `~/code`, 14 paths in all. The worktree's `vault/` and `.git` keep metadata: removed, both live pytest tests failed again.
+- **Tests:** 849 by default (+2: the ancestor parameters, and no rule for a worktree outside home); 12 live (+2):
+  - `test_no_metadata_reads_in_home` stats `~/.daedalus-sandbox-meta-probe`; against 10a's profile it failed with `a sandboxed run could stat /Users/…/.daedalus-sandbox-meta-probe: {'stat': 'STAT OK'}`, and now gets `PermissionError`;
+  - `test_real_pytest_in_a_checkout_under_home` runs `pytest -q` in scratch2's own checkout, since the throwaway worktrees live outside home and never exercise the upward search;
+  - test 8 now also requires `stat` on its probe to be denied.
+- **Re-run:** `uv run pytest -m sandbox`: 12 passed; `python -m daedalus.sandbox run --project scratch2 -- pytest -q`: `1 passed`, exit 0 in 0.40 s.
+
 ## Key decisions
 
 - ★ **Every agent-triggered command runs sandboxed, or not at all.** `sandbox-exec` missing, a failed preflight, or a profile that doesn't load is a refusal; there's no unsandboxed fallback.
@@ -307,7 +317,7 @@
 - ★ **The venv lives outside the worktree, keyed by `uv.lock`'s hash.** Dependency install is unsandboxed, and trusted only because the lockfile is approved (the gate's `dependency` category) and frozen.
 - ★ **No memory cap is claimed;** macOS doesn't enforce one reliably. The timeout and the CPU limit are the protection.
 - ★ **`daedalus.toml` and `uv.lock` are read from your checkout, never the worktree,** so an agent's edits can't widen what it may run or what gets installed.
-- **File metadata stays readable where reads are denied** (home, the worktree's `vault/` and `.git`): pytest needs `stat` to answer `ENOENT`, not `EPERM`. Contents, listings, and xattrs stay denied.
+- ★ **Metadata only where pytest needs it:** the worktree's ancestors up to home and pytest's config filenames in them, by literal path, plus the worktree's `vault/` and `.git`. Elsewhere under home even `stat` is denied.
 - **Both Keychain layers stay** (the mach denial and the home read denial), since each blocks on its own.
 - **Every refusal comes before any spawn it can stop,** and the whole group is SIGKILLed after every run, so nothing outlives it.
 - ★ **Only the converted markdown enters git, never the original.** The SHA-256 and byte count identify it without storing it, and a test checks `git log --all` for any non-markdown path in `sources/`.
@@ -413,5 +423,11 @@
 ## Up Next
 
 Commit 10b: worktree lifecycle, read_code/edit_code in the worktree, rule 6 integrity rows.
+
+detached processes can outlive a run (sandboxed, low risk).
+
+garbage-collect old venvs.
+
+run output is sent to DeepSeek; the read denial, not the network denial, is what protects file contents.
 
 When accepted practices exceed the 12,000-char cap, filter by project tags (registry `tags = [...]`).

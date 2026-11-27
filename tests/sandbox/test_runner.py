@@ -42,7 +42,7 @@ def test_profile_denies_network_dns_writes_home_reads_and_securityd(proj) -> Non
                  '(deny file-read* (subpath (param "HOME")))',
                  '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))',
                  '(deny file-read* (subpath (param "WORKTREE_VAULT")) (subpath (param "WORKTREE_GIT")))',
-                 '(allow file-read-metadata (subpath (param "HOME")))'):
+                 '(allow file-read-metadata (subpath (param "WORKTREE_VAULT")) (subpath (param "WORKTREE_GIT")))'):
         assert rule in text, rule
     assert "localhost" not in text
     # Later rules win: each deny comes before its exceptions, and the worktree is never writable.
@@ -83,6 +83,36 @@ def test_a_worktree_under_tmp_appears_as_private_tmp(world, tmp_path, monkeypatc
         assert call.param("RUN_TMP").startswith(("/private/var/", "/private/tmp/"))
     finally:
         shutil.rmtree(wt)
+
+
+def test_metadata_under_home_is_only_the_worktrees_ancestors_and_pytest_config_names(tmp_path) -> None:
+    home = Path(os.path.realpath(tmp_path)) / "home"
+    wt = home / "code" / "proj"
+    wt.mkdir(parents=True)
+    inputs = profile.ProfileInputs(str(home), str(wt), "/tmp/v", "/tmp/r", ())
+    p = profile.params(inputs)
+    ups = {k: v for k, v in p.items() if k.startswith("UP_")}
+    folders = [str(home), str(home / "code")]
+    expected = {}
+    for i, folder in enumerate(folders):
+        expected[f"UP_{i}"] = folder
+        for name, key in zip(profile.PYTEST_CONFIG_FILES,
+                             ("PYTEST_INI", "DOT_PYTEST_INI", "PYPROJECT_TOML", "TOX_INI", "SETUP_CFG", "CONFTEST_PY")):
+            expected[f"UP_{i}_{key}"] = f"{folder}/{name}"
+    assert ups == expected
+    text = profile.render(inputs)
+    (rule,) = [line for line in text.splitlines() if line.startswith("(allow file-read-metadata (literal")]
+    assert rule.count("(literal (param ") == len(expected) and "subpath" not in rule
+    assert '(allow file-read-metadata (subpath (param "HOME")))' not in text
+    assert text.index('(deny file-read* (subpath (param "HOME")))') < text.index(rule)
+
+
+def test_a_worktree_outside_home_needs_no_metadata_rule(tmp_path) -> None:
+    home = Path(os.path.realpath(tmp_path)) / "home"
+    home.mkdir()
+    inputs = profile.ProfileInputs(str(home), "/tmp", "/tmp/v", "/tmp/r", ())
+    assert not any(k.startswith("UP_") for k in profile.params(inputs))
+    assert "(allow file-read-metadata (literal" not in profile.render(inputs)
 
 
 def test_profile_params_resolve_symlinks() -> None:
