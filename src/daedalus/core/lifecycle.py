@@ -5,7 +5,10 @@ Steps, in order; any failure rolls back every step before it, in reverse:
   1. the name is valid under the registry's rules and not registered yet;
   2. --repo is an existing git repo (its top level), with no .obsidian/ at its root;
   3. <repo>/vault/ doesn't exist, or is empty;
-  4. templates/project-vault/ is copied into <repo>/vault/;
+  4. templates/project-vault/ is copied into <repo>/vault/, and
+     vault/.obsidian/types.json is written, pinning Obsidian's property types
+     (created a Date; the list keys Lists), so the Properties panel writes real
+     YAML lists. The templates hold no .obsidian/ (commit 1), so it's written here;
   5. exactly the new vault/ paths are committed in the project repo, as
      "init: daedalus vault from template", with a path-limited commit:
      anything already staged or modified there stays exactly as it was;
@@ -20,6 +23,7 @@ your own staged work stays staged); remove the copied folder.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -31,6 +35,11 @@ from .registry import PROJECT_NAME, SHARED_NAME, RegistryError, load_registry, o
 from .vaultio import CommitFailed, commit_path, git, head_or_none, write_lock
 
 TEMPLATES = Path(__file__).resolve().parents[3] / "templates"  # the daedalus repo (editable install)
+# Obsidian's property types for a new vault: "multitext" is Obsidian's List type. The list keys that hold strings
+# (schema.STRING_LIST_KEYS); decisions and tasks hold mappings, which Obsidian's list editor can't edit.
+OBSIDIAN_TYPES = {"created": "date", **{key: "multitext" for key in (
+    "related", "shared_refs", "project_refs", "protected", "code", "options", "applies_to")}}
+OBSIDIAN_TYPES_FILE = ".obsidian/types.json"
 INIT_MESSAGE = "init: daedalus vault from template"
 VAULT_DIR = "vault"
 _SKIP = shutil.ignore_patterns(".DS_Store")
@@ -58,8 +67,8 @@ class NewProject:
             f"(the vault/ folder, not {self.repo}). Then, in that vault:\n"
             "  • Settings → Core plugins → turn on Templates; set its template folder location to `templates`.\n"
             "  • Settings → Files and links → Deleted files → Move to system trash.\n"
-            "  • Make `created` a Date property: insert a template once, then in Properties click the icon "
-            "next to `created` → Property type → Date.\n"
+            f"(Property types are already set in {OBSIDIAN_TYPES_FILE}: `created` is a Date, and the list keys "
+            "are Lists.)\n"
             f"Then /vault {self.name} to switch to it."
         )
 
@@ -117,6 +126,14 @@ def _check_vault_dir(vault: Path) -> bool:
 
 def copy_template(vault: Path, templates: Path = TEMPLATES) -> None:
     shutil.copytree(templates / "project-vault", vault, ignore=_SKIP, dirs_exist_ok=True)
+
+
+def write_obsidian_types(vault: Path) -> Path:
+    """vault/.obsidian/types.json, with exactly OBSIDIAN_TYPES."""
+    path = vault / OBSIDIAN_TYPES_FILE
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"types": OBSIDIAN_TYPES}, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def commit_vault(repo: Path) -> str:
@@ -179,6 +196,7 @@ def new_project(name: str, repo_arg: str | os.PathLike[str], registry_path=None,
         try:
             undo.append(("remove the copied vault/", remove_copy))
             copy_template(vault, templates)  # 4
+            write_obsidian_types(vault)
 
             parent = head_or_none(repo)
             undo.append(("undo the init commit", lambda: _undo_commit(repo, parent)))

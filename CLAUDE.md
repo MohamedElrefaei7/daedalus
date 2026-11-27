@@ -203,10 +203,10 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 1. The name is valid under the registry's rules and not registered yet.
 2. `--repo` is an existing git repo's top level, with no `.obsidian/` at its root (refused with the commit-1 message).
 3. `<repo>/vault/` doesn't exist, or is empty.
-4. `templates/project-vault/` is copied into `<repo>/vault/`.
+4. `templates/project-vault/` is copied into `<repo>/vault/`, and `vault/.obsidian/types.json` is written: `created` a Date, and `related`, `shared_refs`, `project_refs`, `protected`, `code`, `options`, `applies_to` Lists (`multitext`), so Obsidian's Properties panel writes real YAML lists. The templates hold no `.obsidian/`, so `/new` writes it.
 5. Exactly `vault/` is committed (`git add -- vault`, then `git commit --only -- vault`) as `init: daedalus vault from template`. Anything else staged or modified in that repo stays as it was.
 6. The project is registered.
-7. The manual Obsidian step is printed: Open folder as vault on `<repo>/vault`, then turn on Templates, set Deleted files to system trash, and make `created` a Date.
+7. The manual Obsidian step is printed: Open folder as vault on `<repo>/vault`, then turn on Templates and set Deleted files to system trash.
 
 Any failure rolls back in reverse. Each undo is armed before its step and tolerates a half-done step:
 - unregister;

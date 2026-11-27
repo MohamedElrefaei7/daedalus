@@ -354,8 +354,15 @@
 - **Spend across resumes:** each resume of a stopped run is a batch (`state.batches`); check-ins and the report show the batch's spend against `budget_usd` and the total across batches.
 - **Tests:** 929 by default, 9 new (920 before): list keys 4 (the exact Obsidian text for `protected`, the same for `related`, a string, a real list), loop 5 (swap-the-test, collection-error file deletion, existing tests modified ×2, spend across batches); 14 live (+1: node IDs and an import error from a real `--collect-only`). The swap test failed first against the old guards: "deleting a failing test and adding a trivial one counted as done".
 
+### 2026-11-27 — Obsidian property types pinned; /new writes a vault types.json
+
+- **Live vaults:** `.obsidian/types.json` now types `related`, `shared_refs`, `project_refs`, `protected`, `code`, `options`, and `applies_to` as `multitext` (Obsidian's List), keeping `created` as `date` and Obsidian's built-ins: scratch `63bdbfc`, scratch2 `687beab`, shared `2dec8b2`, each `obsidian: pin list property types`. Before, none of these was typed, so Obsidian guessed per note, which is how `protected` became one typed-in item.
+- **`/new`** writes `vault/.obsidian/types.json` (`lifecycle.OBSIDIAN_TYPES`: `created` a Date, the seven Lists) after copying the template, inside the same rollback, and the init commit includes it. The printed Obsidian steps no longer say to make `created` a Date. `decisions` and `tasks` stay untyped: they hold mappings, which Obsidian's list editor can't edit.
+- **Tests:** 930 by default (+1: the written file is valid JSON with exactly those types, it's in the init commit, and the steps drop the Date step); the init-commit file list test now expects `vault/.obsidian/types.json` too.
+
 ## Key decisions
 
+- **Obsidian's property types are pinned in each vault's `.obsidian/types.json`** (the seven string-list keys as List, `created` as Date), and `/new` writes them, since the templates hold no `.obsidian/`.
 - ★ **List-valued keys must be YAML lists,** never strings or a list typed into one item; the error points at Obsidian's List property type.
 - ★ **Every test that existed at the start must still exist to be done** (node IDs from `--collect-only`; files when the start had collection errors), on top of the count guards.
 - **Changes to existing tests are always shown, never blocked:** in every check-in and the report, with the diff.

@@ -97,7 +97,7 @@ def test_success_commits_exactly_the_template_and_leaves_your_work_alone(proj) -
     base = head(repo)
     made = new_project("delta", repo, proj.registry_path)
 
-    want = sorted(f"vault/{f}" for f in template_files())
+    want = sorted([*(f"vault/{f}" for f in template_files()), "vault/.obsidian/types.json"])
     assert list(made.files) == want
     assert git(repo, "show", "--name-only", "--format=", "HEAD").split() == want
     assert git(repo, "log", "-1", "--format=%s").strip() == INIT_MESSAGE
@@ -108,6 +108,22 @@ def test_success_commits_exactly_the_template_and_leaves_your_work_alone(proj) -
     assert (repo / "notes.txt").read_text() == "v2, modified and unstaged\n"
     assert load_registry(proj.registry_path).projects["delta"] == repo / "vault"
     assert "Open folder as vault" in made.instructions() and str(repo / "vault") in made.instructions()
+
+
+def test_the_vault_gets_obsidian_property_types_in_the_init_commit(proj) -> None:
+    import json
+
+    repo = proj.extra["repo"]
+    made = new_project("delta", repo, proj.registry_path)
+    written = json.loads((repo / "vault" / ".obsidian" / "types.json").read_text())
+    assert written == {"types": {"created": "date", "related": "multitext", "shared_refs": "multitext",
+                                 "project_refs": "multitext", "protected": "multitext", "code": "multitext",
+                                 "options": "multitext", "applies_to": "multitext"}}
+    committed = json.loads(git(repo, "show", "HEAD:vault/.obsidian/types.json"))
+    assert committed == written
+    steps = made.instructions()
+    assert "Property type → Date" not in steps and "Make `created` a Date" not in steps
+    assert "Turn on Templates".lower() in steps.lower() and "types.json" in steps
 
 
 def test_empty_vault_folder_is_fine(proj) -> None:
