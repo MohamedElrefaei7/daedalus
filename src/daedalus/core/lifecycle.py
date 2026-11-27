@@ -128,11 +128,16 @@ def copy_template(vault: Path, templates: Path = TEMPLATES) -> None:
     shutil.copytree(templates / "project-vault", vault, ignore=_SKIP, dirs_exist_ok=True)
 
 
+def obsidian_types_json() -> bytes:
+    """types.json as Obsidian serializes it (JSON.stringify(data, null, 2)): 2-space indent, no trailing newline."""
+    return json.dumps({"types": OBSIDIAN_TYPES}, indent=2, ensure_ascii=False).encode("utf-8")
+
+
 def write_obsidian_types(vault: Path) -> Path:
-    """vault/.obsidian/types.json, with exactly OBSIDIAN_TYPES."""
+    """vault/.obsidian/types.json, with exactly OBSIDIAN_TYPES, byte for byte as Obsidian would write it."""
     path = vault / OBSIDIAN_TYPES_FILE
     path.parent.mkdir(exist_ok=True)
-    path.write_text(json.dumps({"types": OBSIDIAN_TYPES}, indent=2) + "\n", encoding="utf-8")
+    path.write_bytes(obsidian_types_json())
     return path
 
 

@@ -360,6 +360,10 @@
 - **`/new`** writes `vault/.obsidian/types.json` (`lifecycle.OBSIDIAN_TYPES`: `created` a Date, the seven Lists) after copying the template, inside the same rollback, and the init commit includes it. The printed Obsidian steps no longer say to make `created` a Date. `decisions` and `tasks` stay untyped: they hold mappings, which Obsidian's list editor can't edit.
 - **Tests:** 930 by default (+1: the written file is valid JSON with exactly those types, it's in the init commit, and the steps drop the Date step); the init-commit file list test now expects `vault/.obsidian/types.json` too.
 
+### 2026-11-27 — Fix: match Obsidian's types.json formatting
+
+- `types.json` is now written exactly as Obsidian serializes it (`JSON.stringify(data, null, 2)`): 2-space indent, no trailing newline. The three live vaults lost the trailing newline the pinning commits had added (scratch `bb5ad37`, scratch2 `ae33742`, shared `f692542`; each checked to differ by nothing else), and `/new` writes the same bytes (`lifecycle.obsidian_types_json`). The test now compares the written and the committed file byte for byte.
+
 ## Key decisions
 
 - **Obsidian's property types are pinned in each vault's `.obsidian/types.json`** (the seven string-list keys as List, `created` as Date), and `/new` writes them, since the templates hold no `.obsidian/`.

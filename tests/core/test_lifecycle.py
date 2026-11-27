@@ -110,17 +110,32 @@ def test_success_commits_exactly_the_template_and_leaves_your_work_alone(proj) -
     assert "Open folder as vault" in made.instructions() and str(repo / "vault") in made.instructions()
 
 
+# Byte for byte as Obsidian serializes it: JSON.stringify(data, null, 2), so 2-space indent, no trailing newline.
+OBSIDIAN_TYPES_BYTES = (
+    b'{\n'
+    b'  "types": {\n'
+    b'    "created": "date",\n'
+    b'    "related": "multitext",\n'
+    b'    "shared_refs": "multitext",\n'
+    b'    "project_refs": "multitext",\n'
+    b'    "protected": "multitext",\n'
+    b'    "code": "multitext",\n'
+    b'    "options": "multitext",\n'
+    b'    "applies_to": "multitext"\n'
+    b'  }\n'
+    b'}'
+)
+
+
 def test_the_vault_gets_obsidian_property_types_in_the_init_commit(proj) -> None:
-    import json
+    import subprocess
 
     repo = proj.extra["repo"]
     made = new_project("delta", repo, proj.registry_path)
-    written = json.loads((repo / "vault" / ".obsidian" / "types.json").read_text())
-    assert written == {"types": {"created": "date", "related": "multitext", "shared_refs": "multitext",
-                                 "project_refs": "multitext", "protected": "multitext", "code": "multitext",
-                                 "options": "multitext", "applies_to": "multitext"}}
-    committed = json.loads(git(repo, "show", "HEAD:vault/.obsidian/types.json"))
-    assert committed == written
+    assert (repo / "vault" / ".obsidian" / "types.json").read_bytes() == OBSIDIAN_TYPES_BYTES
+    committed = subprocess.run(["git", "-C", str(repo), "show", "HEAD:vault/.obsidian/types.json"],
+                               capture_output=True, check=True).stdout
+    assert committed == OBSIDIAN_TYPES_BYTES
     steps = made.instructions()
     assert "Property type → Date" not in steps and "Make `created` a Date" not in steps
     assert "Turn on Templates".lower() in steps.lower() and "types.json" in steps
