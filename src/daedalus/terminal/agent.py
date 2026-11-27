@@ -252,7 +252,8 @@ class Agent:
     """A conversation: the fixed system prompt, history, and the metered calls."""
 
     def __init__(self, session: Session, ds: DeepSeek, cfg: Config, session_id: str,
-                 meter: Meter | None = None, profile: str = "chat") -> None:
+                 meter: Meter | None = None, profile: str = "chat", run_id: str | None = None,
+                 run_cap: float | None = None) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown agent profile {profile!r}")
         if profile == "coder" and session.worktree is None:
@@ -263,6 +264,7 @@ class Agent:
         self.session_id = session_id
         self.meter = meter or Meter()
         self.profile = profile
+        self.run_id, self.run_cap = run_id, run_cap  # a goal run's tag and budget, checked before every call
         self.tools = TOOLSETS[profile]
         self.system = system_prompt(session, profile)
         self.history: list[dict[str, Any]] = []
@@ -280,7 +282,7 @@ class Agent:
         """One metered call outside the conversation, with no tools: it can't act, and history is untouched."""
         reply, reading = metered_call(self.ds, self.meter, self.cfg, self.session_id,
                                       [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                      None)
+                                      None, run_id=self.run_id, run_cap=self.run_cap)
         log.info("session %s one-shot call: %s", self.session_id, render(reading))
         return reply.content.strip()
 
@@ -302,7 +304,7 @@ class Agent:
                 ev.call_start()
                 reply, reading = metered_call(
                     self.ds, self.meter, self.cfg, self.session_id, self.messages(), self.tools,
-                    on_reading=ev.reading, on_delta=ev.delta,
+                    on_reading=ev.reading, on_delta=ev.delta, run_id=self.run_id, run_cap=self.run_cap,
                 )
                 ev.call_done(reply, reading)
                 log.info("session %s call: %s", self.session_id, render(reading))

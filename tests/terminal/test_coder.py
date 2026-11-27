@@ -200,3 +200,23 @@ def test_run_is_logged_as_metadata_only(gworld, fake, runs, caplog) -> None:
     lines = [r.getMessage() for r in caplog.records if r.name == "daedalus.code"]
     assert lines == ["run pytest (3 args): exit 0, 0.42 s, timed out False, stdout 21 chars, stderr 0 chars"]
     assert not any("passed" in line or "secret_name" in line for line in lines)
+
+
+# 12. The commit-message call goes through the ledger and the caps ---------------------------
+
+def test_the_commit_message_call_is_ledgered_and_capped(gworld, fake, runs) -> None:
+    from daedalus.terminal import ledger
+
+    repl, _ = make_repl(gworld, fake)
+    repl.run(Script("/wt new hello", "/code hello"))
+    fake.responses += [reply_chunks("Add a thing")]
+    before = len(ledger.rows(repl.session_id))
+    assert repl.commit_message(["?? a.py"]) == "Add a thing"
+    rows = ledger.rows(repl.session_id)
+    assert len(rows) == before + 1 and rows[-1]["estimated"] == 0, "a settled ledger row for the call"
+
+    sent = len(fake.bodies())
+    repl.agent.cfg = Config(session_cap_usd=0.0001)  # below any call's worst case
+    assert repl.commit_message(["?? a.py"]).startswith("agent: "), "refused: the edit log's fallback is used"
+    assert len(fake.bodies()) == sent, "nothing was sent"
+    assert len(ledger.rows(repl.session_id)) == before + 1, "a refused call writes no row"

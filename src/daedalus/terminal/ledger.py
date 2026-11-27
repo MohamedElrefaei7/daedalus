@@ -27,7 +27,7 @@ from daedalus.core.queue import _ensure_wal
 
 from .pricing import Usage
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2 (commit 10c): run_id, so a goal's calls can be summed against its budget
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -41,19 +41,30 @@ CREATE TABLE IF NOT EXISTS calls (
     reasoning         INTEGER NOT NULL,
     cost_usd          REAL    NOT NULL,
     estimated         INTEGER NOT NULL,   -- 1 until billed usage arrives
-    session_id        TEXT    NOT NULL
+    session_id        TEXT    NOT NULL,
+    run_id            TEXT                -- the goal run this call belongs to, or NULL
 );
 CREATE INDEX IF NOT EXISTS calls_ts ON calls (ts_utc);
 CREATE INDEX IF NOT EXISTS calls_session ON calls (session_id);
+CREATE INDEX IF NOT EXISTS calls_run ON calls (run_id);
+"""
+_V1_TO_V2 = """
+ALTER TABLE calls ADD COLUMN run_id TEXT;
+CREATE INDEX IF NOT EXISTS calls_run ON calls (run_id);
 """
 
 
 class CapExceeded(Exception):
     def __init__(self, cap: str, limit: float, spent: float, worst_case: float) -> None:
-        self.cap = cap  # "session" or "daily"
+        self.cap = cap  # "session", "daily", or "goal"
         self.limit = limit
         self.spent = spent
         self.worst_case = worst_case
+        if cap == "goal":
+            super().__init__(
+                f"Not sent: the goal's budget would be crossed. This call could cost up to ${worst_case:.4f}, "
+                f"${spent:.4f} is already spent in this run, and budget_usd is ${limit:.2f}.")
+            return
         key = f"{cap}_cap_usd"
         when = "this session" if cap == "session" else "today (UTC)"
         super().__init__(
@@ -87,11 +98,19 @@ def connect() -> sqlite3.Connection:
     _ensure_wal(con)
     if con.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
         con.execute("BEGIN IMMEDIATE")
-        for statement in _DDL.split(";"):  # not executescript(): it would commit the open transaction
-            if statement.strip():
-                con.execute(statement)
-        con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        con.execute("COMMIT")
+        try:
+            version = con.execute("PRAGMA user_version").fetchone()[0]  # re-read: another process may have won
+            steps = {0: _DDL, 1: _V1_TO_V2}.get(version, "") if version != SCHEMA_VERSION else ""
+            if version not in (0, 1, SCHEMA_VERSION):
+                raise RuntimeError(f"{p}: ledger schema version {version} is newer than this daedalus understands")
+            for statement in steps.split(";"):  # not executescript(): it would commit the open transaction
+                if statement.strip():
+                    con.execute(statement)
+            con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
     return con
 
 
@@ -111,8 +130,11 @@ def _iso(when: dt.datetime) -> str:
     return when.astimezone(dt.timezone.utc).isoformat(timespec="microseconds")
 
 
-def _where(since_utc: dt.datetime | None, session_id: str | None) -> tuple[str, list]:
+def _where(since_utc: dt.datetime | None, session_id: str | None, run_id: str | None = None) -> tuple[str, list]:
     clauses, args = [], []
+    if run_id is not None:
+        clauses.append("run_id = ?")
+        args.append(run_id)
     if since_utc is not None:
         clauses.append("ts_utc >= ?")
         args.append(_iso(since_utc))
@@ -122,15 +144,16 @@ def _where(since_utc: dt.datetime | None, session_id: str | None) -> tuple[str, 
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
 
 
-def _spent(con: sqlite3.Connection, since_utc: dt.datetime | None, session_id: str | None) -> float:
-    where, args = _where(since_utc, session_id)
+def _spent(con: sqlite3.Connection, since_utc: dt.datetime | None, session_id: str | None,
+           run_id: str | None = None) -> float:
+    where, args = _where(since_utc, session_id, run_id)
     return float(con.execute(f"SELECT COALESCE(SUM(cost_usd), 0) FROM calls{where}", args).fetchone()[0])
 
 
-def spent(since_utc: dt.datetime | None = None, session_id: str | None = None) -> float:
-    """USD spent (estimated rows included) since ``since_utc`` and/or in ``session_id``."""
+def spent(since_utc: dt.datetime | None = None, session_id: str | None = None, run_id: str | None = None) -> float:
+    """USD spent (estimated rows included) since ``since_utc`` and/or in ``session_id`` and/or ``run_id``."""
     with closing(connect()) as con:
-        return _spent(con, since_utc, session_id)
+        return _spent(con, since_utc, session_id, run_id)
 
 
 def totals(since_utc: dt.datetime | None = None, session_id: str | None = None) -> Totals:
@@ -151,10 +174,13 @@ def _over(spent_usd: float, worst: float, cap: float) -> bool:
 
 
 def reserve(*, session_id: str, model: str, when: dt.datetime, peak: bool, input_tokens: int, max_tokens: int,
-            worst_case: Decimal, session_cap: float, daily_cap: float) -> int:
-    """Check both caps against the worst case and, in the same transaction, write the reservation row.
+            worst_case: Decimal, session_cap: float, daily_cap: float, run_id: str | None = None,
+            run_cap: float | None = None) -> int:
+    """Check every cap against the worst case and, in the same transaction, write the reservation row.
 
-    Raises CapExceeded (and writes nothing) if either cap would be crossed.
+    The caps are the session's, the day's, and, for a call in a goal run, the
+    goal's budget (``run_cap``, summed over rows tagged ``run_id``). Raises
+    CapExceeded (and writes nothing) if any would be crossed.
     """
     worst = float(worst_case)
     with closing(connect()) as con:
@@ -166,10 +192,14 @@ def reserve(*, session_id: str, model: str, when: dt.datetime, peak: bool, input
             today = _spent(con, start_of_day(when), None)
             if _over(today, worst, daily_cap):
                 raise CapExceeded("daily", daily_cap, today, worst)
+            if run_id is not None and run_cap is not None:
+                in_run = _spent(con, None, None, run_id)
+                if _over(in_run, worst, run_cap):
+                    raise CapExceeded("goal", run_cap, in_run, worst)
             cur = con.execute(
                 "INSERT INTO calls (ts_utc, model, peak, prompt_cache_hit, prompt_cache_miss, completion, reasoning, "
-                "cost_usd, estimated, session_id) VALUES (?, ?, ?, 0, ?, ?, 0, ?, 1, ?)",
-                (_iso(when), model, int(peak), input_tokens, max_tokens, worst, session_id),
+                "cost_usd, estimated, session_id, run_id) VALUES (?, ?, ?, 0, ?, ?, 0, ?, 1, ?, ?)",
+                (_iso(when), model, int(peak), input_tokens, max_tokens, worst, session_id, run_id),
             )
             con.execute("COMMIT")
             return int(cur.lastrowid)

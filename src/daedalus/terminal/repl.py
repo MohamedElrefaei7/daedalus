@@ -2,8 +2,8 @@
 
     daedalus [project]     # set the active project (as `python -m daedalus.state set-active`), then start
 
-Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /add, /answer, /promote, /wt, /code, /end, /cost,
-/pending, /diff, /approve, /reject, /help, /quit.
+Commands: /new, /vaults, /vault, /pull, /drop, /open, /here, /add, /answer, /promote, /wt, /code, /goal, /review,
+/end, /cost, /pending, /diff, /approve, /reject, /help, /quit.
 The Textual interface comes in commit 14; this is the plain REPL.
 """
 
@@ -25,7 +25,11 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from daedalus import secrets
-from daedalus.core import accept, queue, worktree
+import yaml
+
+from daedalus.core import accept, notes, queue, worktree
+from daedalus.core.goals import GoalError
+from daedalus.core.registry import SHARED_NAME
 from daedalus.core.apply import apply, diff, pending, reject
 from daedalus.core.ingest import ingest
 from daedalus.core.lifecycle import LifecycleError, new_project
@@ -39,6 +43,7 @@ from daedalus.sandbox.errors import SandboxError
 from . import ledger, obsidian
 from daedalus.toolset import refusal
 
+from . import loop as goal_loop
 from .agent import Agent, Events, ToolOutcome, tool_label
 from .config import Config, ConfigError, load_config
 from .deepseek import DeepSeek, DeepSeekError, Reply
@@ -64,6 +69,10 @@ HELP = """\
 /wt drop <slug> [--force]  remove the worktree and its branch; unmerged work needs --force
 /code <slug>           coder mode: the agent edits and runs checks in that worktree (fresh conversation)
 /code off              leave coder mode, offering to commit the worktree's changes
+/goal <note>           run the coding loop on a goal note you wrote (goals/<note>.md) in a fresh worktree
+/goal resume [text]    continue a paused or stopped run; text is guidance for the next iteration
+/goal list             goal runs and their state
+/review lessons        walk pending lessons in the shared inbox: approve, reject, or skip
 /end                   propose a CONTEXT.md log entry for this session, review proposals, exit
 /cost                  calls, tokens, and dollars for this session and today, plus the DeepSeek balance
 /pending               proposals waiting for you
@@ -229,6 +238,7 @@ class Repl:
         # What coder mode did this terminal session, for /end: each stint's summary, and its proposals.
         self.coded: list[str] = []
         self.carried_proposals: list[str] = []
+        self.runner = None  # the goal loop's check runner; None is the real sandbox (tests inject a fake)
 
     def prompt(self) -> str:
         if self.coding is not None:
@@ -297,6 +307,10 @@ class Repl:
                 self.wt(rest)
             elif name == "/code":
                 self.code(rest)
+            elif name == "/goal":
+                self.goal(rest)
+            elif name == "/review":
+                self.review_lessons(rest)
             elif name == "/new":
                 self.new(rest)
             elif name == "/vaults":
@@ -363,7 +377,7 @@ class Repl:
             for f in e.files:
                 self.console.print(Text(f"  conflict: {f}", style="red"))
         except (queue.ProposalError, StateError, RegistryError, LifecycleError, KeyError, ValueError, RefError,
-                obsidian.ObsidianError, worktree.WorktreeError, SandboxError) as e:
+                obsidian.ObsidianError, worktree.WorktreeError, SandboxError, GoalError) as e:
             self.console.print(Text(f"error: {e}", style="red"))
         return None
 
@@ -523,6 +537,54 @@ class Repl:
         self.coded.append(summary)
         return summary
 
+    # Goals ------------------------------------------------------------------------------
+
+    def goal(self, rest: str) -> None:
+        if self.coding is not None:
+            raise ValueError("leave coder mode (/code off) before running a goal")
+        sub, _, more = rest.partition(" ")
+        if not sub:
+            raise ValueError("usage: /goal <note> | /goal resume [guidance] | /goal list")
+        if sub == "list":
+            runs = goal_loop.all_runs(self.session.active)
+            for s in runs:
+                state = s["status"] + (f" ({s['pause']})" if s.get("pause") else "") + (
+                    f": {s['stop_reason']}" if s.get("stop_reason") else "")
+                self.console.print(f"{s['run_id']:32} {s['goal_ref']:28} {len(s['iterations'])} iteration(s)  {state}")
+            if not runs:
+                self.console.print(f"no goal runs in {self.session.active}")
+            return
+        run = goal_loop.Loop(self.session, self.ds, self.cfg, self.session_id, LoopView(self), meter=self.agent.meter,
+                             runner=self.runner)
+        try:
+            state = run.resume(guidance=more.strip() or None) if sub == "resume" else run.start(rest.strip())
+        finally:
+            self.carried_proposals += run.proposals
+        if state["status"] == "stopped":
+            self.coded.append(f"Goal run {state['run_id']} ({state['goal_ref']}, {state['branch']}): "
+                              f"{state['stop_reason']} after {len(state['iterations'])} iteration(s).")
+
+    def review_lessons(self, rest: str) -> None:
+        if rest.strip() != "lessons":
+            raise ValueError("usage: /review lessons")
+
+        def is_lesson(p) -> bool:
+            if p.vault != SHARED_NAME or not p.rel_path.startswith("inbox/"):
+                return False
+            raw, _ = notes.split_frontmatter(p.content)
+            try:
+                return (yaml.safe_load(raw or "") or {}).get("type") == "lesson"
+            except yaml.YAMLError:
+                return False
+
+        ids = [p.id for p in pending() if is_lesson(p)]
+        if not ids:
+            self.console.print("No pending lessons.")
+            return
+        self.review(ids, after_approve=lambda p: self.console.print(Text(
+            f"  It's in shared:{p.rel_path} as a draft. To accept it as a lesson: /promote shared:{p.rel_path}",
+            style="dim")))
+
     # Sources ----------------------------------------------------------------------------
 
     def add(self, rest: str) -> None:
@@ -591,7 +653,7 @@ class Repl:
         self.ask(prompt, attach=False)
         self.review(carried + self.agent.proposals)
 
-    def review(self, ids: list[str]) -> None:
+    def review(self, ids: list[str], after_approve: Callable[[Any], None] | None = None) -> None:
         """Walk proposals one at a time: approve, reject with a reason, or skip (leave pending)."""
         waiting = [i for i in dict.fromkeys(ids) if queue.get(i).status == "pending"]
         if not waiting:
@@ -612,6 +674,8 @@ class Repl:
                     if choice in ("a", "approve"):
                         done = apply(self.session, p.id)
                         self.console.print(f"applied {done.id} in commit {done.commit_sha[:7]}")
+                        if after_approve is not None:
+                            after_approve(done)
                     elif choice in ("r", "reject"):
                         reason = ""
                         while not reason:
@@ -657,6 +721,42 @@ class Repl:
             self.console.print(f"balance       {infos or 'unknown'}{ok}")
         except DeepSeekError as e:
             self.console.print(Text(f"balance       unavailable: {e}", style="yellow"))
+
+
+class LoopView:
+    """The goal loop's face in the REPL: its messages, the agent's stream, and check-ins."""
+
+    def __init__(self, repl: "Repl") -> None:
+        self.repl = repl
+        self.events = repl.view
+
+    def say(self, text: str, style: str | None = None) -> None:
+        self.repl.view.end()
+        self.repl.console.print(Text(text, style=style or ""))
+
+    def checkin(self, info: goal_loop.CheckIn) -> tuple[str, str | None]:
+        out = self.repl.console
+        self.repl.view.end()
+        why = f"config changed: {', '.join(info.config_changed)}" if info.config_changed else "scheduled"
+        out.print(Text(f"\n── check-in ({why}) ── iteration {info.iteration} of {info.max_iterations} · spent "
+                       f"${info.spent:.4f} of ${info.budget:.2f}", style="bold magenta"))
+        out.print(f"last: {info.last_summary}")
+        out.print(Text(info.diff_stat, style="dim"))
+        if info.config_diff:
+            out.print(Text(info.config_diff.rstrip(), style="yellow"))
+        if info.lockfile_note:
+            out.print(Text(info.lockfile_note, style="yellow"))
+        while True:
+            choice = self.repl.read_line("[c]ontinue, [r]edirect, or [s]top? ").strip().lower()
+            if choice in ("c", "continue", ""):
+                return "continue", None
+            if choice in ("s", "stop"):
+                return "stop", None
+            if choice in ("r", "redirect"):
+                text = ""
+                while not text:
+                    text = self.repl.read_line("guidance for the next iteration: ").strip()
+                return "redirect", text
 
 
 # Entry point ------------------------------------------------------------------------------

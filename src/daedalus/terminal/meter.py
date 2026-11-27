@@ -95,6 +95,8 @@ def metered_call(
     on_reading: Callable[[Reading], None] = lambda r: None,
     on_delta: Callable[[str, str], None] = lambda kind, text: None,
     now: Callable[[], dt.datetime] = ledger.utc_now,
+    run_id: str | None = None,
+    run_cap: float | None = None,
 ) -> tuple[Reply, Reading]:
     """One capped, metered, ledgered streaming call. Raises CapExceeded, DeepSeekError, or Interrupted."""
     when = now()
@@ -108,6 +110,7 @@ def metered_call(
     row_id = ledger.reserve(
         session_id=session_id, model=cfg.model, when=when, peak=peak, input_tokens=input_tokens,
         max_tokens=cfg.max_tokens, worst_case=worst, session_cap=cfg.session_cap_usd, daily_cap=cfg.daily_cap_usd,
+        run_id=run_id, run_cap=run_cap,
     )
 
     def estimate(reply: Reply) -> tuple[Usage, Decimal, Reading]:

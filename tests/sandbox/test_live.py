@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -272,7 +273,7 @@ def test_real_pytest_in_a_checkout_under_home() -> None:
     assert HOME in repo.parents
     before = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
     result = runner.run(session, ["pytest", "-q"], repo)
-    assert result.exit_code == 0 and "1 passed" in result.stdout_tail, result
+    assert result.exit_code == 0 and re.search(r"\b\d+ passed\b", result.stdout_tail), result  # however many
     after = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
     assert after == before
 
@@ -281,6 +282,20 @@ def test_the_child_sees_only_the_allowlisted_environment(live, monkeypatch) -> N
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-TESTKEY")
     found, _ = live.py("import json, os\nprint(json.dumps({'keys': sorted(os.environ)}))\n")
     assert found["keys"] == sorted(runner.ENV_KEYS)
+
+
+def test_pytest_counts_from_a_real_run(live) -> None:
+    """The loop's baseline: collected, skipped, and xfailed, parsed from real sandboxed pytest output."""
+    from daedalus.core.goals import parse_pytest
+
+    (live.worktree / "tests" / "test_counts.py").write_text(
+        "import pytest\n\n\ndef test_passes():\n    assert True\n\n\ndef test_fails():\n    assert 1 == 2\n\n\n"
+        "@pytest.mark.skip(reason='later')\ndef test_skipped():\n    pass\n\n\n"
+        "@pytest.mark.xfail(reason='known')\ndef test_xfailed():\n    assert False\n")
+    result = live.run(["pytest", "-q"])
+    counts = parse_pytest(result.stdout_tail)
+    assert result.exit_code == 1 and counts is not None, result.stdout_tail
+    assert (counts.collected, counts.passed, counts.failed, counts.skipped, counts.xfailed) == (5, 2, 1, 1, 1)
 
 
 # 12. Overhead -----------------------------------------------------------------------------------

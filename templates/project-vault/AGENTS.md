@@ -37,7 +37,7 @@ source:        # one of: human, deepseek, claude
 
 # Extra required keys by type
 component:  code              # list of repo-relative paths that implement it
-goal:       done_when, max_iterations, budget_usd, checkin_every
+goal:       done_when, max_iterations, budget_usd, checkin_every, protected
 question:   options, answered # answered: false until resolved
 plan:       spec, decisions, tasks
 practice:   applies_to

@@ -49,6 +49,7 @@ daedalus/
 │   │   ├── pricing.py        # the price table, peak windows (UTC), cost(), worst_case()
 │   │   ├── prompts.py        # the byte-stable system prompt
 │   │   ├── obsidian.py       # the Obsidian bridge: /open by path, /here via `obsidian eval`
+│   │   ├── loop.py           # the coding loop: /goal, iterations, check-ins, run state, report, lessons
 │   │   └── config.py         # ~/.config/daedalus/config.toml: model, effort, max_tokens, caps
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
@@ -68,6 +69,7 @@ daedalus/
 │       ├── accept.py         # ask_user's question, /answer, /promote
 │       ├── ingest.py         # /add: local documents into sources/ as markdown (MarkItDown)
 │       ├── worktree.py       # agent worktrees: create, list, diff, commit, merge (yours), drop
+│       ├── goals.py          # goal notes: the launch rule, done_when under rule 7, pytest counts, honest-done guards
 │       └── tools.py          # note read tools; list_files/read_code; propose_*; write_log; edit/write/delete_code
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
@@ -125,7 +127,7 @@ source:        # one of: human, deepseek, claude
 
 # Extra required keys by type
 component:  code              # list of repo-relative paths that implement it
-goal:       done_when, max_iterations, budget_usd, checkin_every
+goal:       done_when, max_iterations, budget_usd, checkin_every, protected
 question:   options, answered # answered: false until resolved
 plan:       spec, decisions, tasks
 practice:   applies_to
@@ -186,6 +188,7 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 - `/open <note>`, `/here`, `/add <file>`;
 - `/answer <question-id> <option-number | "free text">`, `/promote <inbox-note> [folder]`;
 - `/wt new <slug>`, `/wt list`, `/wt diff <slug>`, `/wt merge <slug>`, `/wt drop <slug> [--force]`, `/code <slug>`, `/code off`;
+- `/goal <note>`, `/goal resume [guidance]`, `/goal list`, `/review lessons`;
 - `/cost`, `/pending`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
 
 `queue_cli` stays as a debug tool. The REPL changes the session only through its own commands, which write `state.json` through `daedalus.core.state`; `daedalus-mcp` follows on its next call.
@@ -489,3 +492,36 @@ No file means the project can't run commands, and the refusal shows how to add o
 - `/code off` offers to commit the worktree's uncommitted changes. The default message is written by a separate, tool-less one-shot call (metered and capped like any other, outside the conversation, so it can't act); Enter accepts it. Declining leaves the changes in the worktree. Then it's back to the chat profile, with a fresh conversation.
 - `/end` in coder mode does the same, then the usual `CONTEXT.md` proposal, written by a chat-profile agent (coder mode has no `propose_edit`) from a summary of the coding session: the branch, the edits, the runs, and the commit.
 - `/vault` in coder mode leaves coder mode first. `/pull` and `/drop` keep it. `/wt drop` of the worktree you're coding in is refused.
+
+## The coding loop: `/goal`
+
+`/goal <note>` (`daedalus.terminal.loop`, with `daedalus.core.goals`) runs coder mode by itself on a goal note, in a fresh worktree `agent/<goal-slug>`, until the goal's check passes **honestly**, or a cap or a check-in stops it. Merging stays your command.
+
+**Goal notes** (`goals/<slug>.md`, type `goal`): `done_when` (a command, e.g. `"pytest -q"`), `max_iterations`, `budget_usd`, `checkin_every`, and `protected`, a list of repo-relative paths the run may not change (it may be empty; an entry ending in `/` covers a folder).
+- ★ **Only you launch goals.** `/goal` refuses a note unless it has `source: human`, or `status: accepted` (how an agent's draft gets there, by `/promote`). Agents can't start runs from goals they wrote.
+- `done_when` is split with `shlex` and authorized as the sandbox will run it (rule 7: allowed, and installed in the venv) **before** any worktree exists. A goal whose check can't run is refused, and nothing is left behind. A pytest check that prints no summary line at the baseline is refused too, and its worktree removed.
+
+**Start.** The worktree, then ★ **a baseline**: `done_when`, sandboxed, before any edit. For pytest, the collected, skipped, and xfailed counts from its summary line (collected is passed + failed + errors + skipped + xfailed + xpassed, so deselected tests don't count, and a module that fails to import counts as one); otherwise just the exit code.
+
+**Each iteration:**
+1. ★ **Fresh context.** A new conversation, on the coder profile, whose one user message holds the goal note, every earlier iteration's log in order, the worktree's `git diff --stat` against its base, the end of the last check's output, and any redirect or answered question. No tool history or `reasoning_content` carries over between iterations, which bounds context and cost however long the goal runs; within an iteration, `reasoning_content` is passed back as usual. At most 12 tool rounds. The agent ends with `PLAN:`, `DONE:`, and `NEXT:` lines.
+2. **Plan and edit.** A design choice cites precedent (`find_precedent`) or goes to `ask_user`, which pauses the run.
+3. **Check.** The loop runs `done_when` itself, sandboxed, whatever the agent ran.
+4. ★ **The honest-done rule.** Done only if all four hold: the check exits 0; for pytest, collected is at least the baseline; skipped and xfailed are each no more than the baseline; and no protected path differs from the base (committed, uncommitted, or new). A check that passes with a failed guard is **not done**, and the log and report say which guard, in words: "the check passed, but 1 fewer test was collected than at the start (2 → 1)."
+5. **Log.** `logs/<goal-slug>-<NN>.md` through `write_log`: create-only, committed in your checkout's vault. It holds the plan, the files edited (from the edit log), the check, its exit code and counts, the last 40 lines of output, each guard, the verdict, and what's next. Numbers continue across runs of the same goal.
+6. **Commit** the worktree's changes as `iter <NN>: <summary>` (nothing to commit, no commit).
+7. **Stop** at the first of: done; `max_iterations`; the goal's budget; a stop at a check-in. ★ Every ledger row in a run carries its `run_id` (ledger schema v2), and the goal budget, the session cap, and the daily cap are all checked in one transaction **before** each call, against its worst case. A call refused at the start of an iteration leaves no log.
+
+**Protected paths.** For the length of a run, the session carries the goal's `protected` (`Session.protected`), and `edit_code`, `write_code`, and `delete_code` refuse them: `PolicyError(rule=6)`, "protected by the goal", compared case-folded after the path is resolved.
+
+★ **Config changes check in at once.** A write to `pyproject.toml`, `setup.cfg`, `tox.ini`, `pytest.ini`, `.pytest.ini`, any `conftest.py`, `daedalus.toml`, or `uv.lock` is allowed, but the loop checks in right after that iteration, whatever `checkin_every` says, showing the diff. You see every change to how tests are found or run while it happens, not at merge. For `daedalus.toml` and `uv.lock` the check-in says the edit changes nothing until you merge: 10a reads both from your checkout.
+
+**Check-ins**, every `checkin_every` iterations and after a config change, show the iteration count, the spend against the goal budget, the last summary, and `git diff --stat`, then ask: **continue**, **redirect** (your guidance goes into the next iteration's message), or **stop**.
+
+**Pause and resume.** `ask_user` pauses the run (its iteration is logged and committed, with no check); answer with `/answer`, then `/goal resume` continues at the next iteration, with the answered question in its message. Ctrl-C pauses too: the iteration's edits stay uncommitted, and `/goal resume` commits them as `iter <NN> (interrupted)`, logs it, and goes on. `/goal resume <guidance>` on a run that stopped without being done grants another `max_iterations` iterations and another `budget_usd`.
+
+**Run state** lives in `~/.local/state/daedalus/runs/<run_id>.json` (`<goal-slug>-<UTC timestamp>`), written atomically after every step, so a resume works after quitting the REPL. `/goal list` shows the runs.
+
+**The report**, when a run ends: the stop reason, iterations and spend, each guard of the last check, any config files changed, and the branch's full `git diff --stat`. It ends with `/wt diff <slug>`, then `/wt merge <slug>`, or `/goal resume <guidance>`.
+
+**Lessons.** If something failed in the run and a later check fixed it, one more DeepSeek call, with no tools and no history, reads the run's logs and returns at most 3 lessons, which the loop proposes into the shared `inbox/` with `propose_lesson`: what broke, why, and the fix, with `applies_to` tags and a link to the run's last log. `/review lessons` walks pending lessons: approve (it lands in `shared:inbox/` as a draft, and the REPL prints the `/promote` that would accept it; approval never promotes), reject with a reason, or skip.

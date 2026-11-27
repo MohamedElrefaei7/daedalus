@@ -326,8 +326,38 @@
   5. `/wt drop hello` succeeded without `--force`. `git worktree list` in scratch2 shows only the main checkout, and `~/.cache/daedalus/worktrees/scratch2/` is empty.
 - **Found:** nothing broken. The agent changed `pyproject.toml`'s pytest config by itself; that isn't a dependency, so the gate didn't apply, but 10c may want config files called out in its summaries.
 
+### 2026-11-27 — Commit 10c: the coding loop — goals, honest-done guards, check-ins, lessons
+
+- **Goal schema:** `goal` gains a required `protected` (a list of repo-relative paths; may be empty), in `SCHEMA`, the goal template, all three schema blocks, and the live `AGENTS.md` copies, committed in their repos (shared `ed5dac3`, scratch `867e536`, scratch2 `1d14581`; the scratch vaults' own `templates/goal.md` too). A new test compares each live vault's schema block with the template's; it failed first on all three live copies.
+- **`core/goals.py`:** `load` (the launch rule; `done_when` split with `shlex`; checked fields; protected paths normalized and required to exist), `check_argv_only` and `authorize_check` (rule 7 before anything is created), `parse_pytest` (the summary line's counts), `judge` (the four honest-done guards, in words), `protected_changes`, `diff_stat`, `CONFIG_NAMES`.
+- **`terminal/loop.py`:** `Loop.start`/`resume`/`go`/`iterate`, check-ins, run state in `~/.local/state/daedalus/runs/<run_id>.json`, the report, and the lessons call. **REPL:** `/goal <note>`, `/goal resume [guidance]`, `/goal list`, `/review lessons`.
+- **Ledger schema v2:** a `run_id` column (v1 ledgers migrate in place, rows kept) and a goal-budget cap checked in `reserve` with the session and daily caps. `Agent` takes `run_id` and `run_cap` for its turns and its one-shot calls.
+- **`Session.protected`:** the edit tools refuse protected paths with rule 6, "protected by the goal"; three new integrity rows (61).
+- **Tests:** 920 by default, 33 new (887 before): loop 23, ledger 2, coder-mode commit-message ledger and cap 1, live-schema-block 3, integrity +3, plus one more live sandbox test (13 now: real pytest counts parsed from a sandboxed run).
+- **Proved red four ways:**
+  1. Ignoring the collected-count guard failed `test_deleting_the_failing_test_is_not_done` (`assert (not True)`: the run counted as done).
+  2. One conversation for the whole run failed `test_each_iteration_starts_fresh_with_only_the_logs` ("Left contains 8 more items, first extra item: 'assistant'").
+  3. Skipping the config-change check-in failed `test_a_conftest_edit_checks_in_at_once_with_its_diff` (with no check-in to stop it, the run went on to an unscripted third iteration).
+  4. Letting protected paths be edited failed `test_a_protected_path_cant_be_edited` (the tool result was `{"op": "edit", …}`, not "Refused by rule 6:").
+- **Live check** (scratch2, off-peak):
+  1. `goal: subtract` (`79df416`). `/goal subtract`: baseline collected 2, exit 0 (the agent was told the check already passed). Iteration 1: DeepSeek read `mathx.py` and its test, ran `find_precedent`, wrote the tests first (red: `ImportError … subtract`), implemented, broke and restored it on its own (red-test-first), and ended green. The loop's check: exit 0, collected 4, every guard held: done, $0.0023, no check-in (one iteration), report as specified. Merged as `b976e37`.
+  2. The bait: `5be4054 test: divide(1, 0) raises ValueError`, `ebbc5d5 goal: divide` with `protected: [tests/test_divide.py]`. Baseline: exit 2 (collection error), collected 1. Iteration 1: it read the protected test, cited red-test-first, implemented `divide`, broke the zero check on purpose (`DID NOT RAISE ValueError`), restored it. It never tried to edit, skip, or delete `tests/test_divide.py`; no rule 6 refusal fired. Check: exit 0, collected 6, every guard held: done, $0.0012. Merged as `a6f7af1`; both worktrees dropped without `--force`.
+  3. Lessons: none proposed. In neither run did a loop check fail and a later one pass (both were done at iteration 1; the agents' own red runs happen inside an iteration), so the lessons call was skipped. `/review lessons`: "No pending lessons."
+- **Found in the live check:** Obsidian's Properties panel stored `protected: ["tests/test_divide.py"]`, typed into a list field, as the single string `'["tests/test_divide.py"]'`, which `load` accepted: it would have protected nothing. Fixed in this commit: a protected path that doesn't exist in the checkout refuses the launch, saying how to enter list items (two tests). Also, the subtract note first carried the template's defaults and a capitalized file name, and Obsidian left an untracked `.obsidian/graph.json`; fixed by hand with your OK.
+
 ## Key decisions
 
+- ★ **Only you launch goals:** `source: human`, or `status: accepted` after `/promote`. An agent can't start a run from a goal it wrote.
+- ★ **`done_when` passes rule 7 before anything is created;** a goal whose check can't run leaves nothing behind.
+- ★ **The honest-done rule:** exit 0, collected not below the baseline, skipped and xfailed not above it, and no protected path changed. A pass with a failed guard is not done, and says why in words.
+- ★ **Fresh context per iteration:** a new conversation holding only the goal, the logs, the diff stat, the last check's tail, and any redirect or answer. No tool history or reasoning carries over.
+- ★ **Every ledger row in a run carries its run_id; the goal budget, session cap, and daily cap are all checked before each call.**
+- ★ **Config changes are allowed but check in at once,** with their diff, so you see every change to how tests are found or run while it happens.
+- ★ **Protected paths are refused by the edit tools (rule 6) and checked again at every check;** one that doesn't exist refuses the launch.
+- ★ **Merging stays your command;** the report only suggests it.
+- **pytest's "collected" is read from its summary line** (passed + failed + errors + skipped + xfailed + xpassed); a module that fails to import counts as one.
+- **Lessons only for a loop check that failed and a later one that passed;** otherwise no lessons call is made. Approval in `/review lessons` writes the draft to the shared inbox and prints the `/promote`; it never promotes.
+- **Resuming a stopped, not-done run grants another `max_iterations` and `budget_usd`;** log numbers continue across runs of a goal.
 - ★ **Agents write code only in worktrees, and only you merge.** Merging is a REPL command, never a tool; your checkout is never written by an agent.
 - ★ **Worktrees live in `~/.cache/daedalus/worktrees/<project>/`,** not beside the repo, so `~/code` stays clean; each on `agent/<slug>`.
 - ★ **`git add -A` is safe in a worktree** (only the edit tools write there; sandboxed runs can't; `vault/` and `.git` are unwritable), and `commit` still aborts if a staged path is under `vault/`.
@@ -451,7 +481,7 @@
 
 ## Up Next
 
-Commit 10c: the coding loop — goal notes, plan/edit/run/summarize iterations, caps, check-ins, lessons.
+Commit 11: plan schema, submit_plan, revise_plan, /plans (Claude → terminal handoff).
 
 detached processes can outlive a run (sandboxed, low risk).
 

@@ -73,6 +73,7 @@ TEMPLATE_VALUES = {
     "decisions": (_is_empty_list, "an empty list []"),
     "tasks": (_is_empty_list, "an empty list []"),
     "applies_to": (_is_empty_list, "an empty list []"),
+    "protected": (_is_empty_list, "an empty list []"),
     "answered": (lambda v: v is False, "false"),
     "spec": (lambda v: isinstance(v, str), "a string"),
     "done_when": (lambda v: isinstance(v, str), "a string"),
@@ -377,3 +378,16 @@ def test_agents_md_names_exactly_the_design_categories(path: Path) -> None:
     found = design_categories(path.read_text(encoding="utf-8"))
     assert found is not None, f"{path} has no 'Design choices' section"
     assert found == DESIGN_CATEGORIES, f"{path} names {found}, expected {DESIGN_CATEGORIES}"
+
+
+# Live vaults' schema blocks ------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", _live_agents_files(), ids=lambda p: str(p).replace(str(Path.home()), "~"))
+def test_live_agents_md_schema_block_matches_the_template(path: Path) -> None:
+    """A live vault's AGENTS.md carries the same schema block as the templates and CLAUDE.md."""
+    m = SCHEMA_BLOCK.search(path.read_text(encoding="utf-8"))
+    assert m, f"{path}: no ```yaml schema block starting with '# Base keys'"
+    reference = schema_block("templates/project-vault/AGENTS.md")
+    diff = "".join(difflib.unified_diff(reference.splitlines(keepends=True), m.group(1).splitlines(keepends=True),
+                                        fromfile="template", tofile=str(path)))
+    assert m.group(1) == reference, f"{path}: schema block differs from the template's:\n{diff}"

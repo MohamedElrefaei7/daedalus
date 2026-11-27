@@ -26,7 +26,45 @@ def test_file_location_and_wal(state_root) -> None:
     assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     cols = [r[1] for r in con.execute("PRAGMA table_info(calls)")]
     assert cols == ["id", "ts_utc", "model", "peak", "prompt_cache_hit", "prompt_cache_miss", "completion",
-                    "reasoning", "cost_usd", "estimated", "session_id"]
+                    "reasoning", "cost_usd", "estimated", "session_id", "run_id"]
+
+
+V1_DDL = """CREATE TABLE calls (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL, model TEXT NOT NULL,
+peak INTEGER NOT NULL, prompt_cache_hit INTEGER NOT NULL, prompt_cache_miss INTEGER NOT NULL,
+completion INTEGER NOT NULL, reasoning INTEGER NOT NULL, cost_usd REAL NOT NULL, estimated INTEGER NOT NULL,
+session_id TEXT NOT NULL)"""
+
+
+def test_a_v1_ledger_gains_run_id_and_keeps_its_rows(state_root) -> None:
+    con = sqlite3.connect(state_root / "ledger.sqlite")
+    con.execute(V1_DDL)
+    con.execute("INSERT INTO calls (ts_utc, model, peak, prompt_cache_hit, prompt_cache_miss, completion, reasoning, "
+                "cost_usd, estimated, session_id) VALUES ('2026-11-25T12:00:00.000000+00:00', 'deepseek-flash', 0, "
+                "0, 10, 5, 0, 0.25, 0, 'old')")
+    con.execute("PRAGMA user_version = 1")
+    con.commit()
+    con.close()
+    assert ledger.spent(session_id="old") == 0.25
+    (row,) = ledger.rows("old")
+    assert row["run_id"] is None
+    assert sqlite3.connect(state_root / "ledger.sqlite").execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def run_reserve(run_id, worst, run_cap):
+    return ledger.reserve(session_id="s1", model="deepseek-flash", when=WED_OFF, peak=False, input_tokens=100,
+                          max_tokens=8000, worst_case=Decimal(worst), session_cap=10.0, daily_cap=10.0,
+                          run_id=run_id, run_cap=run_cap)
+
+
+def test_the_goal_budget_is_checked_before_the_call_and_rows_carry_the_run(state_root) -> None:
+    a = run_reserve("goal-1", "0.04", 0.10)
+    run_reserve("goal-1", "0.04", 0.10)
+    assert ledger.row(a)["run_id"] == "goal-1" and ledger.spent(run_id="goal-1") == pytest.approx(0.08)
+    with pytest.raises(CapExceeded) as exc:
+        run_reserve("goal-1", "0.04", 0.10)  # 0.08 + 0.04 > 0.10
+    assert exc.value.cap == "goal" and "budget_usd is $0.10" in str(exc.value)
+    assert len(ledger.rows("s1")) == 2, "a refused reservation writes nothing"
+    run_reserve("goal-2", "0.04", 0.10)  # another run has its own budget
 
 
 def test_reserve_settle_cancel() -> None:

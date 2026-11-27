@@ -8,6 +8,7 @@ Session from it with daedalus.core.state.load_session.
 from __future__ import annotations
 
 import os
+import posixpath
 from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property
@@ -31,6 +32,23 @@ class Area(Enum):
     OUTSIDE = "outside"
 
 
+def normalize_protected(paths) -> tuple[str, ...]:
+    """Protected paths as clean worktree-relative POSIX paths; refused if absolute or escaping with '..'."""
+    if isinstance(paths, str):
+        raise SessionError("protected must be a list of paths, not one string")
+    out = []
+    for raw in paths or ():
+        if not isinstance(raw, str) or not raw.strip():
+            raise SessionError(f"protected entry {raw!r} must be a non-empty path")
+        if raw.startswith("/") or os.path.isabs(raw):
+            raise SessionError(f"protected entry {raw!r} must be relative to the repo root")
+        norm = posixpath.normpath(raw.strip())
+        if norm == ".." or norm.startswith("../") or norm == ".":
+            raise SessionError(f"protected entry {raw!r} must name a path inside the repo")
+        out.append(norm + ("/" if raw.rstrip().endswith("/") else ""))
+    return tuple(dict.fromkeys(out))
+
+
 def _overlaps(a: Path, b: Path) -> bool:
     return a == b or a in b.parents or b in a.parents
 
@@ -41,6 +59,9 @@ class Session:
     active: str
     pulled: tuple[str, ...] = ()
     worktree: Path | None = None
+    # Worktree-relative paths a goal run protects (commit 10c): the edit tools refuse them, rule 6. An entry
+    # ending in "/" protects everything under it.
+    protected: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         projects = self.registry.projects
@@ -55,6 +76,9 @@ class Session:
             raise SessionError(f"project {self.active!r} is active, so it can't also be pulled")
         if len(set(self.pulled)) != len(self.pulled):
             raise SessionError(f"pulled projects repeat a name: {self.pulled}")
+        object.__setattr__(self, "protected", normalize_protected(self.protected))
+        if self.protected and self.worktree is None:
+            raise SessionError("protected paths apply only to a worktree")
         if self.worktree is not None:
             wt = Path(os.path.realpath(self.worktree))
             if not wt.is_dir():

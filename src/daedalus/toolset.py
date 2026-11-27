@@ -176,7 +176,7 @@ def ask_user(s: Session, source: str, question: str, category: str, options: lis
 
 def _edit(e: tools.Edit) -> dict[str, Any]:
     return {"op": e.op, "rel_path": e.rel_path, "bytes_before": e.bytes_before, "bytes_after": e.bytes_after,
-            "message": f"{e.op} {e.rel_path}: done, in the worktree. Commit is Mohamed's, when coder mode ends."}
+            "message": f"{e.op} {e.rel_path}: done, in the worktree (committed later, not by you)."}
 
 
 def edit_code(s: Session, rel_path: str, old: str, new: str, edit_log: tools.EditLog | None = None) -> dict[str, Any]:

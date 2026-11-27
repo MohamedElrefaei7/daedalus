@@ -40,7 +40,9 @@ from daedalus.core.queue import (
 )
 from daedalus.core.registry import load_registry
 from daedalus.core.session import Session
-from daedalus.core.tools import CodeEditError, edit_code, propose_edit, propose_lesson, propose_note, write_log
+from daedalus.core.tools import (
+    CodeEditError, delete_code, edit_code, propose_edit, propose_lesson, propose_note, write_code, write_log,
+)
 
 HELLO = "# Hello\n"
 
@@ -397,6 +399,23 @@ def edit_old_matches_twice(w):
     return Case(_edit(w, "src/twice.py", old="x = 1", new="x = 2"), CodeEditError)
 
 
+def _guarded(w):
+    """A goal run's session: the world's worktree, with src/main.py protected."""
+    return Session(w.registry, "alpha", pulled=("beta",), worktree=w.worktree, protected=("src/main.py",))
+
+
+def protected_edit_code(w):
+    return Case(lambda: edit_code(_guarded(w), "src/main.py", "print('hi')", "print('bye')"), PolicyError, rule=6)
+
+
+def protected_write_code(w):
+    return Case(lambda: write_code(_guarded(w), "src/main.py", "print('replaced')\n"), PolicyError, rule=6)
+
+
+def protected_delete_code(w):
+    return Case(lambda: delete_code(_guarded(w), "src/main.py"), PolicyError, rule=6)
+
+
 CASES = [
     rule1_traversal_into_repo, rule1_traversal_outside, rule1_unpulled_vault, rule1_unregistered_vault,
     rule1_symlink_escape, rule1_reauth_unregistered_on_apply,
@@ -416,6 +435,7 @@ CASES = [
     rule6_edit_in_checkout, rule6_edit_into_checkout_by_dotdot, rule4_edit_worktree_vault, rule4_edit_worktree_git,
     rule1_dotdot_escape_from_worktree, rule6_symlink_in_worktree_to_checkout, rule6_edit_with_no_worktree,
     edit_old_matches_zero_times, edit_old_matches_twice,
+    protected_edit_code, protected_write_code, protected_delete_code,
 ]
 
 

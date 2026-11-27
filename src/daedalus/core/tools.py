@@ -541,7 +541,21 @@ def _code_target(session: Session, rel_path: str):
     if not isinstance(rel_path, str) or not rel_path.strip():
         raise CodeEditError(f"rel_path {rel_path!r} must be a path relative to the worktree root")
     # An absolute path is left to the policy, so one into your checkout is refused by rule 6, by name.
-    return authorize(session.worktree / rel_path, Op.WRITE_CODE, session)
+    auth = authorize(session.worktree / rel_path, Op.WRITE_CODE, session)
+    hit = protected_match(auth.rel, session.protected)
+    if hit is not None:
+        raise PolicyError(6, auth.path, f"{auth.rel} is protected by the goal ({hit}); a goal run can't change it")
+    return auth
+
+
+def protected_match(rel: str, protected: tuple[str, ...]) -> str | None:
+    """The protected entry covering worktree-relative ``rel``, or None. Compared case-folded, as macOS does."""
+    r = rel.casefold()
+    for entry in protected:
+        e = entry.casefold()
+        if e.endswith("/") and (r + "/").startswith(e) or r == e.rstrip("/"):
+            return entry
+    return None
 
 
 def _text(data: bytes, what: str) -> str:

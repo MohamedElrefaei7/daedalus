@@ -12,7 +12,7 @@ SCHEMA = {
     "base": ["type", "status", "created", "related", "shared_refs", "project_refs", "source"],
     "extra": {
         "component": ["code"],
-        "goal": ["done_when", "max_iterations", "budget_usd", "checkin_every"],
+        "goal": ["done_when", "max_iterations", "budget_usd", "checkin_every", "protected"],
         "question": ["options", "answered"],
         "plan": ["spec", "decisions", "tasks"],
         "practice": ["applies_to"],

@@ -10,6 +10,7 @@ done_when: ""
 max_iterations: 5
 budget_usd: 0.50
 checkin_every: 2
+protected: []
 ---
 
 # {{title}}

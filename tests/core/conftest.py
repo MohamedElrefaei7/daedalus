@@ -41,6 +41,7 @@ DEFAULTS: dict[str, Any] = {
     "max_iterations": 5,
     "budget_usd": 0.5,
     "checkin_every": 2,
+    "protected": [],
     "options": [],
     "answered": False,
     "spec": "",
