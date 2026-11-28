@@ -167,6 +167,8 @@ def test_a_merged_plan_branch_closes_its_run(proj, fake) -> None:
     with pytest.raises(RunError, match=f"branch merged at {merge[:7]}; revise the plan for further work"):
         runner_for(proj, fake, UI(), Runner()).run("mathx")
     assert planrun.read_runs(plain(proj))["merged_sha"] == merge
+    repl.command("/plans")
+    assert f"run stopped (checkin) · t1 stopped · closed: merged at {merge[:7]}" in buf.getvalue()
 
 
 def test_a_dropped_plan_branch_is_still_found_merged(proj, fake) -> None:

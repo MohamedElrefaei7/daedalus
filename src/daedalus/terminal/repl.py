@@ -809,7 +809,8 @@ class Repl:
             r = e.get("run")
             ran = ("  not run yet (/run " + f"{e['slug']}{'-v' + str(e['version']) if e['version'] else ''})"
                    if r is None else f"  run {r['status']}" + (f" ({r['stop_reason']})" if r["stop_reason"] else "")
-                   + " · " + ", ".join(f"{t['id']} {t['status']}" for t in r["tasks"]))
+                   + " · " + ", ".join(f"{t['id']} {t['status']}" for t in r["tasks"])
+                   + (f" · closed: merged at {r['merged_sha'][:7]}" if r.get("merged_sha") else ""))
             say(f"{e['id'] or '-':14}  {e['slug']}{version}  {e['rel_path']}{ran}")
         if not listed["approved"]:
             say("  none")

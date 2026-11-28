@@ -497,7 +497,14 @@
   8. Regex extraction back for `red_test_note`: `test_notes_never_become_paths`, "the red test's tool.py, tests/test_other.py doesn't exist …".
   9. A collection error at done let through: `test_a_new_collection_error_at_done_is_refused`, `assert not True` (done). The 12b behavior, couldn't-run refused, broke the same way: `test_a_collection_that_cant_run_at_done_is_refused`.
   Breaks 2, 4, and 7 first went red only through the scripted fakes; the tests now script enough to reach the real assertion.
-- **Live check:** Mohamed's, after this commit (Part G).
+- **Live check (Part G), 2026-11-28, scratch2:**
+  1. Startup closed both old runs: "closed plan run 1m8fym1jcsry88 (mathx-cli v2): its branch agent/plan-mathx-cli-v2 was merged at baa9049" (its branch was dropped, so it was found through its tasks' last commit) and "closed plan run 1m8g3vyrb23vgm (pytest-testpaths v1): … merged at b964074". `/runs pytest-testpaths` showed "2 of 3 iterations · $0.0085 of $1.00" and "closed: branch merged at b964074".
+  2. Asked for a plan that guarantees `subtract` handles negative operands. Claude read the code first. It found that a function-level test would pass at base ("the same dead-red situation as the last plan") and planned the real gap instead: a `subtract` CLI subcommand. It needed no "submit anyway". Plan `subtract-negative-operands` v1 (`1m8h74qnr0c2kb`) had a structured red test, `tests/test_cli.py::test_subtract_accepts_negative_operands`, plus a `red_test_note`, and one new decision with consequences. It was approved in `6b17f06`, and the decision note is `decisions/interface-add-a-subtract-subcommand-to-the-mathx.md`.
+  3. `/run` made run `1m8h769hc0qhw9`. Baseline: `done_when` collected 1, exit 0, and the whole suite at the start had 13 tests. Over one iteration the agent wrote the test, saw it fail with "invalid choice: 'subtract'" (SystemExit 2), then added the subparser and a dispatch table. The check exited 0 with 2 collected, and every guard held, including the counterfactual ("at 6b17f06 with only tests/test_cli.py copied in: exit 1"). Committed `3cbf6fe`, $0.0018. The final gate passed, and in the queue the task's batches show 1 iteration with stop `done`.
+  4. `/wt merge` didn't ask (the run was done). It merged as `1d4b6bd`, closed the run (`merged_sha` 1d4b6bd in the queue), and said `/run` now refuses. In scratch2: 14 passed, and `git status` was clean.
+  - ★ **Not exercised live: `report_already_satisfied`.** Claude's planning avoided the dead red, so the agent never needed the claim, and no satisfied check-in came. That is the outcome the planning rule is meant to produce, but the claim path is still proven only by tests.
+  - **Found in the live check:** `/plans` listed the closed pytest-testpaths run as "run stopped (checkin) · t1 stopped", with nothing saying it was closed. It now adds "· closed: merged at <sha7>". `test_a_merged_plan_branch_closes_its_run` checks this and failed before the fix.
+  - Not in the paste: `/wt drop plan-pytest-testpaths-v1`, `/run pytest-testpaths`'s refusal, and Claude's answer to "How did that run go?". Both plan worktrees still exist.
 
 ## Key decisions
 
