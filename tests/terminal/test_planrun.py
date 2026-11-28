@@ -373,3 +373,13 @@ def test_run_and_runs_and_plans_in_the_repl(proj, fake) -> None:
     assert "plan mathx-v1 · run " in text and "t1 · task t1 · done · 1 iteration(s)" in text
     assert "mathx v1  plans/mathx-v1.md  run done · t1 done" in text
     assert "error: no plan 'nothing-here' in alpha" in text
+
+
+def test_red_test_refs_ignore_dotted_names_that_arent_files() -> None:
+    """The live check's red test (commit 12b): `[tool.pytest.ini_options]` once yielded a file `tool.py`."""
+    refs = planrun.red_test_refs("tests/test_pyproject_config.py::test_pytest_testpaths_is_tests reads pyproject.toml "
+                                 "and asserts [tool.pytest.ini_options].testpaths == [\"tests\"]; fails before the "
+                                 "change, passes after")
+    assert refs == [("tests/test_pyproject_config.py",
+                     "tests/test_pyproject_config.py::test_pytest_testpaths_is_tests")]
+    assert planrun.red_test_refs("see tests/test_x.py.") == [("tests/test_x.py", "tests/test_x.py")]

@@ -68,7 +68,8 @@ STOP_TEXTS = {
     "checkin_stop": "Mohamed stopped it at",
 }
 # A test file a red test names: tests/test_x.py, optionally ::test_name (or a parametrized id).
-RED_REF = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*[\w.-]+\.py)((?:::[\w.\[\]-]+)*)")
+# `.py` must end the name, so `tool.py` isn't read out of `[tool.pytest.ini_options]`.
+RED_REF = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*[\w.-]+\.py)(?![\w-])((?:::[\w.\[\]-]+)*)")
 
 
 def red_test_refs(red_test: str) -> list[tuple[str, str]]:
