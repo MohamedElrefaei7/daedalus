@@ -332,3 +332,29 @@ def test_an_import_error_in_the_counterfactual_counts_as_failing(proj, fake) -> 
     runner = Runner(pytest_out(passed=1), pytest_out(passed=3), cf=lambda tmp: IMPORT_ERROR_4)
     run = runner_for(proj, fake, UI(), runner).run("mathx")
     assert run.status == "done"
+
+
+def test_a_config_file_edited_and_restored_says_so(proj, fake) -> None:
+    """The commit 12b live check: the agent set pyproject.toml wrong, then put it back; the check-in and read_runs
+    said "config changed" over an empty diff."""
+    original = (proj.alpha_repo / "pyproject.toml").read_text() if (proj.alpha_repo / "pyproject.toml").exists() else None
+    if original is None:
+        (proj.alpha_repo / "pyproject.toml").write_text("[project]\nname = 'alpha'\n")
+        git(proj.alpha_repo, "add", "pyproject.toml")
+        git(proj.alpha_repo, "commit", "-q", "-m", "pyproject")
+        original = (proj.alpha_repo / "pyproject.toml").read_text()
+    make_plan(proj, task("t1", **{**NEW_TASK, "files": ["pyproject.toml", "tests/test_new.py"]}))
+    wrong = ("write_code", {"rel_path": "pyproject.toml", "content": original + "# wrong\n"})
+    back = ("write_code", {"rel_path": "pyproject.toml", "content": original})
+    fake.responses += [*turn(real_test(), IMPL, wrong, back, done="tried a value, put it back")]
+    ui = UI(("stop", None))
+    run = runner_for(proj, fake, ui, Runner(pytest_out(passed=1), cf=counterfactual)).run("mathx")
+    (info,) = ui.checkins
+    assert info.config_changed == ["pyproject.toml"] and info.config_diff.strip() == ""
+    assert "was edited during this iteration and restored: no net change" in info.lockfile_note
+    t1 = planruns.task(run.id, "t1")
+    assert "config edited and restored, no net change: pyproject.toml" in t1.text
+    text = planrun.format_runs(planrun.read_runs(plain(proj)))
+    assert "collected 1 (start empty)" in text
+    log = (proj.alpha / "logs" / "plan-mathx-v1-t1-01.md").read_text()
+    assert "(at the start: the done_when baseline is empty)" in log

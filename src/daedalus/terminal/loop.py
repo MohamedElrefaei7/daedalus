@@ -597,7 +597,8 @@ class Loop:
             b = state["baseline"]
             lines += ["", "## Check", "",
                       f"`{' '.join(state['argv'])}` → exit {r['exit_code']}" + (" (timed out)" if r.get("timed_out") else "")
-                      + (f" · {_counts_text(r['counts'])} (at the start: {_counts_text(b['counts'])})"
+                      + (f" · {_counts_text(r['counts'])} (at the start: "
+                         + ("the done_when baseline is empty" if b.get("empty") else _counts_text(b["counts"])) + ")"
                          if b["counts"] is not None or r["counts"] else ""),
                       "", "```", r.get("output_tail", "").rstrip(), "```", "", "## Guards", ""]
             lines += [f"- {'held' if g['held'] else 'FAILED'}: {g['name']}: {g['detail']}" for g in r["guards"]]
@@ -633,6 +634,12 @@ class Loop:
         read_from_checkout = [p for p in last["config"] if os.path.basename(p) in goals.READ_FROM_CHECKOUT]
         note = (f"{', '.join(read_from_checkout)}: daedalus reads these from your checkout, never the worktree, so this "
                 "edit changes nothing that runs or gets installed until you merge." if read_from_checkout else None)
+        if last["config"] and not config_diff.strip():  # edited, then put back within the iteration
+            last["config_restored"] = True
+            save(state)
+            restored = (f"{', '.join(last['config'])} was edited during this iteration and restored: no net change, "
+                        "but the iteration's own runs used the edited version.")
+            note = f"{restored} {note}" if note else restored
         modified, tests_diff = goals.tests_modified(wt, state["base"], state["baseline"].get("test_files", []))
         batch, total, n = spend(state)
         info = CheckIn(len(state["iterations"]), state["limit_iterations"], batch, state["budget_usd"], last["summary"],

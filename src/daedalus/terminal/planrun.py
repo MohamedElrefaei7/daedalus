@@ -433,7 +433,8 @@ def outcome(state: dict) -> tuple[str, str | None, str | None]:
 
 def _checkin_text(state: dict) -> str:
     last = state["iterations"][-1] if state["iterations"] else {}
-    why = f"config changed: {', '.join(last['config'])}" if last.get("config") else "scheduled"
+    why = ((f"config edited and restored, no net change: {', '.join(last['config'])}" if last.get("config_restored")
+            else f"config changed: {', '.join(last['config'])}") if last.get("config") else "scheduled")
     done = "; that iteration was otherwise done" if last.get("done") else ""
     return (f"the check-in after iteration {len(state['iterations'])} ({why}{done}): "
             f"{last.get('summary', '')}").rstrip(": ")
@@ -585,8 +586,9 @@ def format_runs(summary: dict[str, Any]) -> str:
         hd = t.get("honest_done")
         if hd and hd.get("last_check"):
             b, c = hd.get("baseline") or {}, hd["last_check"]
+            start = "empty" if (t.get("baseline") or {}).get("empty") else b.get("collected")
             lines.append(f"      check: exit {c.get('exit_code')}, collected {c.get('collected')} (start "
-                         f"{b.get('collected')}), skipped {c.get('skipped')}, xfailed {c.get('xfailed')}"
+                         f"{start}), skipped {c.get('skipped')}, xfailed {c.get('xfailed')}"
                          + (f"; missing: {', '.join(hd['missing_node_ids'])}" if hd.get("missing_node_ids") else "")
                          + (f"; protected changed: {', '.join(hd['protected_changed'])}"
                             if hd.get("protected_changed") else ""))

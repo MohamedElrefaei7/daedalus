@@ -461,7 +461,20 @@
   5. The counterfactual copying the whole final tree: `test_the_counterfactual_runs_against_the_code_before_the_change`, "your red test passes against the code before your change … with only src/x.py, tests/test_new.py copied in: exit 0".
   6. No final gate: `test_final_suite_gates_plan_done`, `('done', None) == ('failed', 'final_suite')`.
   7. Note names back in the table: `test_approve_never_cuts_a_file_name_at_80_columns`, "the note's name was cut before the question".
-- **Live check:** Mohamed's, after this commit (Part D).
+- **Live check** (scratch2, off-peak):
+  1. `/wt drop plan-mathx-cli-v2` (merged, so no `--force`). Claude, asked for a one-task plan setting pytest's `testpaths` to `tests`, ran `get_scope`, `list_notes`, `find_precedent` (none), then `submit_plan`: `pytest-testpaths` v1, `1m8g3ey8rbhzxp`, valid first time, no decisions. Approved as `f600f30 agent(claude): approve plan pytest-testpaths-v1` (the plan note only).
+  2. The first `/run` failed preflight with "the red test's tool.py doesn't exist": the red-test pattern read `tool.py` out of `[tool.pytest.ini_options]`. Fixed (`143e4d5`, `.py` must end the name, a test on the real text); with Mohamed's OK the failed run's rows were deleted (queue backed up first) and its empty worktree dropped. Nothing had run.
+  3. `/run pytest-testpaths` (run `1m8g3vyrb23vgm`). Stored baseline: "done_when baseline: empty (all named paths are created by the task) (not yet there, so left out: tests/test_pyproject_config.py); whole suite at the start: 12 tests; red test: created_by_task". Iteration 1: the agent found `testpaths = ["tests"]` already in `pyproject.toml`, wrote `tests/test_pyproject_config.py`, and edited `pyproject.toml` twice to no net change. The check passed and every guard held except ★ **the counterfactual**: "your red test passes against the code before your change (`pytest -q tests/test_pyproject_config.py::test_pytest_testpaths_is_tests` at f600f30 with only tests/test_pyproject_config.py copied in: exit 0), so it proves nothing". The config edit checked in (the first live check-in); Mohamed stopped it: `stopped (checkin)`, text "Mohamed stopped it at: the check-in after iteration 1 (config changed: pyproject.toml): …".
+  4. `/run` again resumed the same branch with the same stored baseline (both `/runs` print the identical baseline line). As a stop on an iteration that wasn't done, it began a new batch: iteration 2 read the plan, saw the premise was false, set `testpaths = ["test"]` to show the test goes red for the right reason, restored it, and declined to fake a red. The counterfactual failed again, the check-in came again, and Mohamed stopped it again. t1: 2 iterations, $0.0085, ↑ 189,625 ↓ 11,155.
+  5. Claude, from `read_runs`: the run stopped without delivering what the plan wanted, "and the cause was a wrong assumption in my plan": `testpaths` was already set at the base commit and it never read the file before submitting. It reported the check-in stop, that the counterfactual refused the red test, that every original test still exists and no protected path changed, and offered to accept t1 as already satisfied or re-scope it.
+  6. Mohamed reviewed `/wt diff` and merged it anyway, keeping the test as a regression guard: `b964074` (`--no-ff`). On main, scratch2's suite, sandboxed: 13 passed. The plan run stays `stopped (checkin)`, and the final gate never ran.
+- **Found in the live check:**
+  - ★ A4 did its job live: this plan's red test could never honestly be red (the setting predates the task, since `97b17c8`), and no earlier check could see that, because the test file was the task's to create. Before 12b this task would have been "done" on iteration 1.
+  - The check-in said "config changed: pyproject.toml" over an empty diff (edited and restored within the iteration), and `/runs` printed "collected 1 (start None)" for an empty baseline, with the log saying "(at the start: no pytest summary line)". Fixed: "config edited and restored, no net change", a note in the check-in that the iteration's own runs used the edited version, and "start empty" (one test, red first).
+  - A task stopped at a check-in, not done, resumes as a new batch: the task header said "1/3 iterations" while the loop said "iteration 2 of 4".
+  - A plan run whose branch Mohamed merged stays `stopped`; `/run` would resume it.
+  - Claude planned without reading the file the task changes.
+  - `uv run pytest -q` run directly in scratch2 left `__pycache__/` untracked there: its `.gitignore` doesn't ignore it.
 - **Fix, found starting the live check:** `/help` printed through rich markup, so `[dir]`, `[text]`, and `[plan]` vanished from its lines (`/promote`'s and `/goal resume`'s since they were added); it's printed as plain text now, with a test that failed before. `/run` on a finished plan whose worktree is gone no longer tells you to diff and merge it.
 
 ## Key decisions
@@ -630,6 +643,10 @@
 ## Up Next
 
 Commit 13: context sets.
+
+Claude's plan instructions: read every file a task changes before submitting (the pytest-testpaths plan's premise was false).
+
+`/run` should notice a plan branch that's already merged, and the task header should count a resumed batch's iterations.
 
 `--retry` for failed plan tasks.
 

@@ -900,7 +900,8 @@ class LoopView:
     def checkin(self, info: goal_loop.CheckIn) -> tuple[str, str | None]:
         out = self.repl.console
         self.repl.view.end()
-        why = f"config changed: {', '.join(info.config_changed)}" if info.config_changed else "scheduled"
+        why = ((f"config edited and restored: {', '.join(info.config_changed)}" if not info.config_diff.strip() else
+                f"config changed: {', '.join(info.config_changed)}") if info.config_changed else "scheduled")
         total = f"; ${info.total_spent:.4f} in total across {info.batches} batches" if info.batches > 1 else ""
         out.print(Text(f"\n── check-in ({why}) ── iteration {info.iteration} of {info.max_iterations} · spent "
                        f"${info.spent:.4f} of ${info.budget:.2f}{' this batch' if total else ''}{total}",
