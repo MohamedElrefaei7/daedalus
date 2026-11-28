@@ -1,4 +1,4 @@
-"""Plans: Claude writes a plan to Mohamed's spec; it waits in the queue until he approves it (commit 12).
+"""Plans: Claude writes a plan to Mohamed's spec; it waits in the queue until he approves it.
 
 A plan is a typed ``plan`` note, ``plans/<slug>-v<N>.md`` in the active
 project's vault. Its frontmatter carries the base keys plus:
@@ -24,9 +24,10 @@ Versions: submit makes v1. revise makes v<N+1>, carrying
 the same transaction if it's still pending. Nothing is deleted: every version
 stays readable, and plan_status shows the chain.
 
-Applying a plan is commit 12 (the plan and its new decisions in one commit):
-apply.apply refuses plan proposals, so the generic path can never skip
-writing the decisions.
+Approving a plan (approve_plan, Mohamed's action) re-validates it and writes the
+plan note and one decision note per new decision in ONE commit, or nothing.
+apply.apply refuses plan proposals, so the generic path can never skip writing
+the decisions. Running an approved plan is daedalus.terminal.planrun (/run).
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from typing import Any
 
 import yaml
 
-from . import gate, notes, queue, tools
+from . import gate, notes, planruns, queue, tools
 from .apply import repo_for
 from .errors import DraftInvalid, ProposalError
 from .policy import Authorized, Op, PolicyError, authorize, check_argv
@@ -60,6 +61,7 @@ MAX_ITERATIONS = 10
 TASK_REQUIRED = ("id", "summary", "files", "red_test", "done_when", "max_iterations", "budget_usd")
 TASK_OPTIONAL = ("protected",)
 DECISION_KEYS = ("category", "choice", "basis")
+DECISION_SERVER_KEYS = ("note",)  # approval links each new decision to the note it wrote
 # What Claude may put in a plan's frontmatter; the server sets the rest.
 CLAUDE_KEYS = ("spec", "decisions", "tasks", "related", "shared_refs", "project_refs")
 SERVER_KEYS = ("type", "status", "created", "source", "supersedes")
@@ -123,7 +125,11 @@ def _decision_errors(session: Session, decisions: Any) -> list[str]:
             errors.append(f"{where}: must be a mapping {{category, choice, basis}}, not {type(d).__name__}")
             continue
         for key in sorted(set(d) - set(DECISION_KEYS), key=str):
-            errors.append(f"{where}.{key}: unknown key; a decision has exactly category, choice, and basis")
+            if key in DECISION_SERVER_KEYS:
+                errors.append(f"{where}.{key}: set by the server when Mohamed approves the plan, never by you; "
+                              "leave it out")
+            else:
+                errors.append(f"{where}.{key}: unknown key; a decision has exactly category, choice, and basis")
         category, choice, basis = d.get("category"), d.get("choice"), d.get("basis")
         cat_ok = category in DESIGN_CATEGORIES
         if not cat_ok:
@@ -629,6 +635,7 @@ def status(session: Session, plan_ref: str) -> dict[str, Any]:
         "rejection_reason": v.reason if v.status == "rejected" else None,
         "latest_version": latest.version, "latest_status": latest.status,
         "chain": [_version_dict(c) for c in chain],
+        "run": planruns.summary_for(session.active, v.id) if v.status == "applied" else None,
     }
 
 
@@ -664,6 +671,215 @@ def list_plans(session: Session) -> dict[str, Any]:
         if e.vault != session.active:
             continue
         parsed = _parse_rel(e.rel_path)
+        pid = applied.get(e.rel_path)
         approved.append({"rel_path": e.rel_path, "slug": parsed[0] if parsed else e.rel_path,
-                         "version": parsed[1] if parsed else None, "id": applied.get(e.rel_path)})
+                         "version": parsed[1] if parsed else None, "id": pid,
+                         "run": planruns.summary_for(session.active, pid)})
     return {"project": session.active, "pending": pending, "approved": approved, "rejected": rejected}
+
+
+# Approving (commit 12) -----------------------------------------------------------------------
+
+DECISION_STEM_MAX = 48
+DECISION_TITLE_MAX = 90
+
+
+@dataclass(frozen=True)
+class NewDecision:
+    index: int  # 1-based, as validate_plan numbers decisions
+    category: str
+    choice: str
+    stem: str
+    rel_path: str
+    text: str
+
+
+@dataclass(frozen=True)
+class Prepared:
+    """Everything approval will write, worked out (and checked) before anything is written."""
+
+    proposal: queue.Proposal
+    slug: str
+    version: int
+    view: PlanView
+    plan_text: str  # the accepted plan note
+    decisions: tuple[NewDecision, ...]
+
+
+@dataclass(frozen=True)
+class Approved:
+    proposal: queue.Proposal
+    slug: str
+    version: int
+    plan_ref: str
+    decision_refs: tuple[str, ...]
+    commit_sha: str
+
+
+def decision_stem(category: str, choice: str) -> str:
+    """``<category>-<slugified choice>``, at most 48 characters, cut at a word."""
+    stem = category.replace("_", "-")
+    for word in re.findall(r"[a-z0-9]+", choice.lower()):
+        if len(stem) + 1 + len(word) > DECISION_STEM_MAX:
+            break
+        stem = f"{stem}-{word}"
+    return stem[:DECISION_STEM_MAX].rstrip("-")
+
+
+def _stem_taken(session: Session, stem: str) -> bool:
+    """True if a bare [[stem]] would already resolve to something the link resolver can see."""
+    try:
+        tools.resolve_ref(session, stem)
+    except tools.AmbiguousRefError:
+        return True
+    except tools.RefError:
+        return os.path.lexists(session.active_vault / "decisions" / f"{stem}.md")
+    return True
+
+
+def _free_stem(session: Session, base: str, used: set[str]) -> str:
+    stem, n = base, 2
+    while stem in used or _stem_taken(session, stem):
+        suffix = f"-{n}"
+        stem, n = base[:DECISION_STEM_MAX - len(suffix)].rstrip("-") + suffix, n + 1
+    return stem
+
+
+def _decision_template(session: Session) -> str:
+    """The vault's own decision template (the one hand-written decisions start from), else the package's."""
+    from .lifecycle import TEMPLATES
+
+    for path in (session.active_vault / "templates" / "decision.md",
+                 TEMPLATES / "project-vault" / "templates" / "decision.md"):
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    raise ProposalError("no decision template: neither the vault's templates/decision.md nor the package's exists")
+
+
+def _fill_section(body: str, heading: str, text: str) -> str:
+    """Put ``text`` right under ``## heading`` (added at the end if the template has no such section)."""
+    m = re.search(rf"^## {re.escape(heading)}[ \t]*\n", body, re.M)
+    if not m:
+        return body.rstrip("\n") + f"\n\n## {heading}\n\n{text}\n"
+    return body[: m.end()] + f"\n{text}\n" + body[m.end():]
+
+
+def decision_text(session: Session, category: str, choice: str, plan_stem: str, spec: str, source: str,
+                  today: str) -> str:
+    """A decision note from the vault's decision template, as if written by hand: accepted, and new in the plan."""
+    from .accept import set_frontmatter
+
+    template = _decision_template(session)
+    title = choice if len(choice) <= DECISION_TITLE_MAX else choice[: DECISION_TITLE_MAX - 1].rstrip() + "…"
+    text = set_frontmatter(template, {"type": "decision", "status": "accepted", "created": today,
+                                      "related": [f"[[{plan_stem}]]", spec], "source": source,
+                                      "category": category})
+    raw, body = notes.split_frontmatter(text)
+    head = text[: len(text) - len(body)]
+    body = body.replace("{{title}}", title).replace("{{date}}", today)
+    body = _fill_section(body, "Context", f"New in [[{plan_stem}]], approved on {today}. Category: `{category}`. "
+                                          f"Spec: {spec}.")
+    body = _fill_section(body, "Decision", choice)
+    return head + body
+
+
+def _accepted_plan_text(text: str, notes_by_index: dict[int, str]) -> str:
+    """The plan note as approval writes it: status accepted, each new decision linked to its note."""
+    raw, body = notes.split_frontmatter(text)
+    fm, _ = notes.load_frontmatter(raw)
+    fm["status"] = "accepted"
+    for i, stem in notes_by_index.items():
+        fm["decisions"][i - 1]["note"] = f"[[{stem}]]"
+    related = list(fm.get("related") or [])
+    fm["related"] = related + [f"[[{stem}]]" for stem in notes_by_index.values() if f"[[{stem}]]" not in related]
+    dumped = yaml.safe_dump(fm, sort_keys=False, default_flow_style=None, allow_unicode=True, width=1000)
+    return f"---\n{dumped}---\n{body if body.startswith(chr(10)) else chr(10) + body}"
+
+
+def _refuse_unless_approvable(session: Session, rec: queue.Proposal) -> tuple[str, int]:
+    parsed = _parse_rel(rec.rel_path)
+    if rec.vault != session.active or parsed is None or rec.kind != "create":
+        raise PlanError(f"proposal {rec.id} is {rec.kind} {rec.vault}:{rec.rel_path}, not a plan in "
+                        f"{session.active}'s plans/")
+    slug, n = parsed
+    if rec.status != "pending":
+        why = {"superseded": "a later version replaced it; approve the latest",
+               "rejected": f"it was rejected ({rec.status_reason}); Claude revises it with revise_plan",
+               "applied": "it's already approved"}.get(rec.status, "only a pending plan can be approved")
+        raise queue.NotPending(f"plan {slug} v{n} ({rec.id}) is {rec.status}, not pending: {why}")
+    latest = versions(session, slug)[-1]
+    if latest.version != n:
+        raise PlanError(f"plan {slug} v{n} isn't the latest version (v{latest.version} is {latest.status}); only "
+                        "the latest version can be approved")
+    return slug, n
+
+
+def prepare_approval(session: Session, change_id: str, *, session_cap_usd: float | None = None,
+                     today: dt.date | None = None) -> Prepared:
+    """Check the plan can be approved now and work out every note approval writes. Writes nothing."""
+    rec = queue.get(change_id)
+    slug, n = _refuse_unless_approvable(session, rec)
+    # Re-validate against the state now: precedent may have been un-accepted, the spec moved, or the allow list
+    # changed since the plan was submitted.
+    errors = validate_plan(session, rec.content, session_cap_usd=session_cap_usd, rel_path=rec.rel_path)
+    if errors:
+        raise PlanInvalid(f"{rec.vault}:{rec.rel_path} no longer validates, so it stays pending", errors)
+    pv = view(rec.content, rec.rel_path)
+    fm = _fm_of(rec.content)
+    plan_stem = f"{slug}-v{n}"
+    day = (today or dt.date.today()).isoformat()
+    used = {plan_stem}
+    new: list[NewDecision] = []
+    for i, d in enumerate(pv.decisions, 1):
+        if not d.is_new:
+            continue
+        stem = _free_stem(session, decision_stem(d.category, d.choice), used)
+        used.add(stem)
+        rel = f"decisions/{stem}.md"
+        text = decision_text(session, d.category, d.choice, plan_stem, str(fm["spec"]).strip(), rec.source, day)
+        new.append(NewDecision(i, d.category, d.choice, stem, rel, text))
+    plan_text = _accepted_plan_text(rec.content, {d.index: d.stem for d in new})
+    for rel, text in [(rec.rel_path, plan_text), *((d.rel_path, d.text) for d in new)]:
+        auth = Authorized(session.active_vault / rel, Area.ACTIVE_VAULT, session.active, rel)
+        errs = notes.draft_errors(text, auth)
+        if errs:
+            raise DraftInvalid(f"{session.active}:{rel}", errs)
+    return Prepared(rec, slug, n, pv, plan_text, tuple(new))
+
+
+def approve_plan(session: Session, change_id: str, *, session_cap_usd: float | None = None,
+                 today: dt.date | None = None) -> Approved:
+    """Write the plan note and one decision note per new decision, as one commit. Mohamed's action only.
+
+    Refused (nothing written, the plan stays as it was) unless the row is a pending plan and the latest version
+    of its slug, and it still validates. Every target must still be absent at write time; any failure rolls every
+    path back. The plan proposal goes applying → applied with the commit sha, or failed with the reason.
+    """
+    from .apply import Change, apply_changes
+    from .vaultio import head_or_none, write_lock
+
+    with write_lock():  # held from the checks to the commit, so nothing changes in between
+        prep = prepare_approval(session, change_id, session_cap_usd=session_cap_usd, today=today)
+        rec = prep.proposal
+        repo = repo_for(session.registry, session.active)
+        plan_path = authorize(session.active_vault / rec.rel_path, Op.WRITE_PLAN, session).path
+        changes = [Change(plan_path, prep.plan_text, None)]
+        for d in prep.decisions:
+            changes.append(Change(authorize(session.active_vault / d.rel_path, Op.USER_ACTION, session).path,
+                                  d.text, None))
+        if not queue.transition(rec.id, "pending", "applying", target_path=str(plan_path), repo_path=str(repo),
+                                base_head=head_or_none(repo)):
+            raise queue.NotPending(f"plan {rec.id} is no longer pending")
+        try:
+            sha = apply_changes(repo, changes, f"approve plan {prep.slug}-v{prep.version}",
+                                message=[f"agent({rec.source}): approve plan {prep.slug}-v{prep.version}"],
+                                change_id=rec.id)
+        except queue.StaleProposal as e:  # checked before any write: nothing was written, so it stays pending
+            queue.transition(rec.id, "applying", "pending")
+            raise e
+        except BaseException as e:
+            queue.transition(rec.id, "applying", "failed", reason=f"approval failed, nothing was written: {e}")
+            raise
+        queue.transition(rec.id, "applying", "applied", commit_sha=sha)
+    return Approved(queue.get(rec.id), prep.slug, prep.version, f"{session.active}:{rec.rel_path}",
+                    tuple(f"{session.active}:{d.rel_path}" for d in prep.decisions), sha)

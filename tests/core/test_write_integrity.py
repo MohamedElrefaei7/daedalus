@@ -19,7 +19,10 @@ Since commit 10b, edit_code has rows for rules 1, 4, and 6, and for its
 exactly-once rule. The snapshot covers the checkout's digest (and the
 worktree's) as well as every vault's. Since commit 11, plans have rows: an
 invalid plan, a plan whose basis isn't precedent, an invalid revision (its
-pending v1 stays pending), and apply on a plan (refused until commit 12).
+pending v1 stays pending), and apply on a plan (refused: plans go only through
+approval). Since commit 12, approval has rows: nothing reaches a vault or the
+checkout except approve_plan's one commit (superseded, rejected, an older
+version, no longer valid, a target that appeared, and a failing commit).
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from conftest import DROP, git, note_text, write_note, write_raw, write_registry
 from test_apply import install_hook
 
 from daedalus.core import plans, queue
-from daedalus.core.errors import PlanApprovalNotYet
+from daedalus.core.errors import PlanApprovalOnly
 from daedalus.core.accept import PromoteError, answer_question, promote
 from daedalus.core.gate import GateRefused, propose_with_basis
 from daedalus.core.ingest import IngestError, ingest
@@ -453,7 +456,54 @@ def plan_invalid_revision(w):
 def plan_approve(w):
     fm = _plan(w)
     pid = plans.submit(w.session, "claude", "mathx", fm, "Why.", session_cap_usd=1.0).proposal.id
-    return Case(lambda: apply(w.session, pid), PlanApprovalNotYet)
+    return Case(lambda: apply(w.session, pid), PlanApprovalOnly)
+
+
+def _pid(w, fm=None):
+    return plans.submit(w.session, "claude", "mathx", fm or _plan(w), "Why.", session_cap_usd=1.0).proposal.id
+
+
+def _approve(w, pid):
+    return lambda: plans.approve_plan(w.session, pid, session_cap_usd=1.0)
+
+
+def plan_approve_superseded(w):
+    pid = _pid(w)
+    plans.revise(w.session, "claude", "mathx", _plan(w), "Again.", session_cap_usd=1.0)
+    return Case(_approve(w, pid), NotPending)
+
+
+def plan_approve_rejected(w):
+    pid = _pid(w)
+    reject(pid, "no")
+    return Case(_approve(w, pid), NotPending)
+
+
+def plan_approve_older_version(w):
+    pid = _pid(w)
+    reject(pid, "redo")
+    plans.revise(w.session, "claude", "mathx", _plan(w), "Again.", session_cap_usd=1.0)
+    queue.transition(pid, "rejected", "pending")
+    return Case(_approve(w, pid), plans.PlanError)
+
+
+def plan_approve_no_longer_valid(w):
+    pid = _pid(w)
+    path = w.alpha / "decisions" / "storage-engine.md"
+    path.write_text(path.read_text().replace("status: accepted", "status: proposed"))
+    return Case(_approve(w, pid), plans.PlanInvalid)
+
+
+def plan_approve_target_appeared(w):
+    pid = _pid(w)
+    write_raw(w.alpha, "plans/mathx-v1.md", "# made by hand\n")
+    return Case(_approve(w, pid), StaleProposal)
+
+
+def plan_approve_commit_fails(w):
+    pid = _pid(w)
+    install_hook(w.alpha_repo)
+    return Case(_approve(w, pid), CommitFailed, status_changes={pid: "failed"})
 
 
 CASES = [
@@ -477,6 +527,8 @@ CASES = [
     edit_old_matches_zero_times, edit_old_matches_twice,
     protected_edit_code, protected_write_code, protected_delete_code,
     plan_invalid, plan_basis_not_precedent, plan_invalid_revision, plan_approve,
+    plan_approve_superseded, plan_approve_rejected, plan_approve_older_version, plan_approve_no_longer_valid,
+    plan_approve_target_appeared, plan_approve_commit_fails,
 ]
 
 

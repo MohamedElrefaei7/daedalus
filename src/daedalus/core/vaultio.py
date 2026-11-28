@@ -41,6 +41,13 @@ def write_lock(timeout: float = 60.0) -> Iterator[None]:
     The file's existence means nothing. timeout=0 tries once.
     """
     global _held_here
+    if _held_here > 0:  # this process already holds it: an approval that calls apply_changes inside its lock
+        _held_here += 1
+        try:
+            yield
+        finally:
+            _held_here -= 1
+        return
     path = lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)

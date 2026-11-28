@@ -1,4 +1,4 @@
-"""The agent tools, shared by daedalus-mcp (Claude, thirteen) and the terminal agent (DeepSeek: twelve in chat,
+"""The agent tools, shared by daedalus-mcp (Claude, fourteen) and the terminal agent (DeepSeek: twelve in chat,
 fourteen in coder mode).
 
 Each function takes the Session first and returns a JSON-ready dict. The
@@ -27,9 +27,9 @@ from daedalus.terminal.config import ConfigError
 # The nine tools both front ends share, in order.
 NAMES = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
          "find_precedent")
-# Plans are Claude's job: only daedalus-mcp has these four, never the DeepSeek agent.
-PLAN_TOOLS = ("submit_plan", "revise_plan", "plan_status", "list_plans")
-# daedalus-mcp's exact tool set (Claude), in order: thirteen.
+# Plans are Claude's job: only daedalus-mcp has these five, never the DeepSeek agent.
+PLAN_TOOLS = ("submit_plan", "revise_plan", "plan_status", "list_plans", "read_runs")
+# daedalus-mcp's exact tool set (Claude), in order: fourteen.
 MCP_NAMES = NAMES + PLAN_TOOLS
 # The terminal agent's (DeepSeek) adds the two /end needs (CONTEXT.md and inbox edits, and lessons), and
 # ask_user, which ends its turn. Claude asks in its own chat, so daedalus-mcp has no ask_user.
@@ -228,6 +228,12 @@ def list_plans(s: Session) -> dict[str, Any]:
     return plans.list_plans(s)
 
 
+def read_runs(s: Session, plan_ref: str | None = None) -> dict[str, Any]:
+    from daedalus.terminal import planrun  # the loop's run state; imported late (the loop imports this module)
+
+    return planrun.read_runs(s, plan_ref or None)
+
+
 def _edit(e: tools.Edit) -> dict[str, Any]:
     return {"op": e.op, "rel_path": e.rel_path, "bytes_before": e.bytes_before, "bytes_after": e.bytes_after,
             "message": f"{e.op} {e.rel_path}: done, in the worktree (committed later, not by you)."}
@@ -390,8 +396,18 @@ DESCRIPTIONS = {
     ),
     "plan_status": (
         "Read-only. A plan's status (pending, rejected, superseded, applied, ...), Mohamed's reason if he rejected "
-        "it, and its whole version chain, oldest first. plan_ref is the slug (its latest version), a proposal id, "
+        "it, its whole version chain, oldest first, and for an approved plan its run status (read_runs has the "
+        "detail). plan_ref is the slug (its latest version), a proposal id, "
         "or <slug>-v<N>. Call it to learn why a plan was rejected before revising it."
+    ),
+    "read_runs": (
+        "Read-only. How a plan run went, after Mohamed approved a plan and ran it in the terminal: the plan slug "
+        "and version, its branch, head commit, and diffstat against his checkout, the run's status and stop reason, "
+        "and for each task its status, iterations, cost, tokens in and out, the honest-done numbers against the "
+        "baseline stored at the task's start (collected, skipped, xfailed, test IDs that disappeared, protected "
+        "paths changed), the last iteration's summary and its log note, and any question or check-in. plan_ref is "
+        "optional (the slug, a proposal id, or <slug>-v<N>); without it, the project's most recent plan run. At "
+        "most 12,000 characters: the oldest iteration summaries are trimmed first, and the result says so."
     ),
     "list_plans": (
         "Read-only. The active project's plans: pending ones (id, slug, version, task count, each decision marked "

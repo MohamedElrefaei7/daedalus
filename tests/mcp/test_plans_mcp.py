@@ -1,4 +1,4 @@
-"""Plans over daedalus-mcp (commit 11): thirteen tools, no source, queue-only, and the reject → revise loop."""
+"""Plans over daedalus-mcp (commits 11, 12): fourteen tools, no source, queue-only, and the reject → revise loop."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "core"))  # test_plans' fixtures live with the core tests
 
 from mcp_helpers import PLAN_TOOLS, TOOLS, run  # noqa: E402
+from mcp_helpers import run as run_  # noqa: E402
 from test_plans import BODY, good, plan_world  # noqa: E402
 
 from daedalus import toolset  # noqa: E402
@@ -15,13 +16,13 @@ from daedalus.core import queue  # noqa: E402
 from daedalus.core.apply import reject  # noqa: E402
 
 
-def test_exactly_thirteen_tools_and_none_takes_source(mcp) -> None:
+def test_exactly_fourteen_tools_and_none_takes_source(mcp) -> None:
     async def go():
         async with mcp:
             return await mcp.client.list_tools()
 
     tools = run(go())
-    assert {t.name for t in tools} == TOOLS and len(TOOLS) == 13
+    assert {t.name for t in tools} == TOOLS and len(TOOLS) == 14
     assert tuple(t.name for t in tools) == toolset.MCP_NAMES
     for t in tools:
         assert "source" not in t.input_schema.get("properties", {}), t.name
@@ -116,3 +117,35 @@ def test_find_precedent_tells_claude_to_mark_new_not_to_use_ask_user(mcp) -> Non
     assert result["precedents"] == []
     assert "ask_user" not in result["note"] and 'basis "new"' in result["note"]
     assert "ask_user" in toolset.NO_PRECEDENT["agent"]  # the DeepSeek agent keeps its own advice
+
+
+def test_read_runs_over_daedalus_mcp(mcp, mworld) -> None:
+    """read_runs is read-only and Claude's: with no run it says so; with one it returns the run as JSON."""
+    from daedalus.core import planruns, plans
+
+    plan_world(mworld)
+    p = plans.submit(mworld.session, "claude", "mathx", good(), BODY, session_cap_usd=1.0).proposal
+
+    async def go():
+        async with mcp:
+            none = await mcp.refused("read_runs")
+            plans.approve_plan(mworld.session, p.id, session_cap_usd=1.0)
+            run = planruns.create(plan_change_id=p.id, project="alpha", slug="mathx", version=1,
+                                  branch="agent/plan-mathx-v1", worktree_path=str(mworld.root / "wt"),
+                                  wt_slug="plan-mathx-v1", task_rows=[("t1", "add multiply(a, b)"),
+                                                                      ("t2", "a tiny CLI")])
+            planruns.set_run(run.id, "stopped", reason="daily_cap", text="t1: no room today", ended=True)
+            before = mworld.snapshot()
+            got = await mcp.ok("read_runs", {"plan_ref": "mathx"})
+            latest = await mcp.ok("read_runs")
+            status = await mcp.ok("plan_status", {"plan_ref": "mathx"})
+            return none, got, latest, status, before, run
+
+    none, got, latest, status, before, run = run_(go())
+    assert "no plan has run in alpha yet" in none
+    assert (got["plan"], got["status"], got["stop_reason"], got["run_id"]) == ("mathx-v1", "stopped", "daily_cap", run.id)
+    assert [t["id"] for t in got["tasks"]] == ["t1", "t2"] and got["tasks"][0]["status"] == "pending"
+    assert got["head"] is None and "is gone" in got["diffstat_against_main"]  # no such branch in this world
+    assert latest["run_id"] == run.id
+    assert status["run"]["status"] == "stopped" and status["run"]["stop_reason"] == "daily_cap"
+    assert mworld.snapshot()["digests"] == before["digests"]  # read-only

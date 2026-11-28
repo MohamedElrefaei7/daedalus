@@ -142,7 +142,9 @@ def all_runs(project: str | None = None) -> list[dict]:
 
 
 def resumable(project: str) -> list[dict]:
-    return [s for s in all_runs(project) if s["status"] == "paused" or (s["status"] == "stopped" and not s.get("done"))]
+    """Goal runs /goal resume may continue. A plan task's run is /run's to resume, never /goal's."""
+    return [s for s in all_runs(project) if not s.get("plan_run")
+            and (s["status"] == "paused" or (s["status"] == "stopped" and not s.get("done")))]
 
 
 def _now() -> str:
@@ -195,6 +197,11 @@ def _counts_text(c: dict | None) -> str:
     return f"collected {k.collected}, skipped {k.skipped}, xfailed {k.xfailed}"
 
 
+def _resume(state: dict) -> str:
+    """The command that resumes this run: /goal resume for a goal note, /run <plan> for a plan task."""
+    return state.get("resume_hint") or "/goal resume"
+
+
 def _tail_lines(text: str, n: int) -> str:
     return "\n".join((text or "").rstrip("\n").splitlines()[-n:])
 
@@ -225,19 +232,15 @@ class Loop:
         goals.authorize_check(goal, config, venv)
         return goal, venv
 
-    def start(self, ref: str) -> dict:
-        goal, _ = self.prepare(ref)
-        made = worktree.create(self.session, goal.slug)
-        rec = made.record
-        if made.warning:
-            self.ui.say(f"⚠ {made.warning}", "yellow")
+    def new_state(self, goal: Goal, rec: worktree.Record, base: str | None = None) -> dict[str, Any]:
+        """A fresh run's state for ``goal`` in the worktree ``rec``, starting at ``base`` (default: its base)."""
         run_id = f"{goal.slug}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d%H%M%S')}"
         logs = self.session.active_vault / "logs"
         offset = max([int(m.group(1)) for p in logs.glob(f"{goal.slug}-*.md")
                       if (m := re.fullmatch(rf"{re.escape(goal.slug)}-(\d+)\.md", p.name))] or [0])
-        state: dict[str, Any] = {
+        return {
             "run_id": run_id, "project": self.session.active, "goal_ref": goal.ref, "goal_slug": goal.slug,
-            "wt_slug": rec.slug, "wt_path": rec.path, "branch": rec.branch, "base": rec.base,
+            "wt_slug": rec.slug, "wt_path": rec.path, "branch": rec.branch, "base": base or rec.base,
             "argv": list(goal.argv), "protected": list(goal.protected), "max_iterations": goal.max_iterations,
             "budget_usd": goal.budget_usd, "checkin_every": goal.checkin_every,
             "limit_iterations": goal.max_iterations, "limit_budget": goal.budget_usd, "log_offset": offset,
@@ -245,30 +248,50 @@ class Loop:
             "last_output": "", "config_changed": [], "stop_reason": None, "done": False, "started": _now(),
             "batches": [{"started": _now(), "spent_before": 0.0}],
         }
+
+    def measure_baseline(self, state: dict, goal: Goal) -> tuple[dict, str]:
+        """done_when, sandboxed, before any edit: (the baseline, the check's output). Raises GoalError if a pytest
+        check prints no summary line, since the honest-done guards couldn't be checked."""
+        wt = Path(state["wt_path"])
+        result = self.runner(self.run_session(state), list(goal.argv), wt)
+        counts = goals.parse_pytest(result.stdout_tail) if goal.is_pytest else None
+        if goal.is_pytest and counts is None:
+            raise GoalError(f"`{' '.join(goal.argv)}` printed no pytest summary line at the start (exit "
+                            f"{result.exit_code}), so the honest-done guards couldn't be checked:\n"
+                            f"{_tail_lines(result.stdout_tail + result.stderr_tail, 15)}")
+        baseline = {"exit_code": result.exit_code, "counts": counts.__dict__ if counts else None,
+                    "node_ids": [], "collection_errors": [], "test_files": []}
+        if goal.is_pytest:
+            listed = goals.parse_collect(self.runner(self.run_session(state), goals.collect_argv(goal.argv),
+                                                     wt).stdout_tail)
+            baseline.update(node_ids=list(listed.node_ids), collection_errors=list(listed.errors),
+                            test_files=list(goals.base_test_files(wt, state["base"])))
+        return baseline, result.stdout_tail
+
+    def begin(self, state: dict, baseline: dict, output: str) -> dict:
+        """Record the baseline, say it, and run the iterations."""
+        state["baseline"] = baseline
+        state["last_output"] = output[-MESSAGE_TAIL_CHARS:]
+        save(state)
+        counts = _counts_text(baseline["counts"]) + ", " if baseline["counts"] else ""
+        self.ui.say(f"  baseline: {counts}exit {baseline['exit_code']}", "dim")
+        return self.go(state)
+
+    def start(self, ref: str) -> dict:
+        goal, _ = self.prepare(ref)
+        made = worktree.create(self.session, goal.slug)
+        rec = made.record
+        if made.warning:
+            self.ui.say(f"⚠ {made.warning}", "yellow")
+        state = self.new_state(goal, rec)
         try:
-            self.ui.say(f"Run {run_id}: {goal.ref} in {rec.path} on {rec.branch}. Baseline: `{' '.join(goal.argv)}` …",
-                        "bold")
-            result = self.runner(self.run_session(state), list(goal.argv), Path(rec.path))
-            counts = goals.parse_pytest(result.stdout_tail) if goal.is_pytest else None
-            if goal.is_pytest and counts is None:
-                raise GoalError(f"`{' '.join(goal.argv)}` printed no pytest summary line at the start (exit "
-                                f"{result.exit_code}), so the honest-done guards couldn't be checked:\n"
-                                f"{_tail_lines(result.stdout_tail + result.stderr_tail, 15)}")
+            self.ui.say(f"Run {state['run_id']}: {goal.ref} in {rec.path} on {rec.branch}. Baseline: "
+                        f"`{' '.join(goal.argv)}` …", "bold")
+            baseline, output = self.measure_baseline(state, goal)
         except BaseException:
             worktree.drop(self.session.registry, self.session.active, rec.slug, force=True)  # nothing in it yet
             raise
-        state["baseline"] = {"exit_code": result.exit_code, "counts": counts.__dict__ if counts else None,
-                             "node_ids": [], "collection_errors": [], "test_files": []}
-        if goal.is_pytest:
-            listed = goals.parse_collect(self.runner(self.run_session(state), goals.collect_argv(goal.argv),
-                                                     Path(rec.path)).stdout_tail)
-            state["baseline"].update(node_ids=list(listed.node_ids), collection_errors=list(listed.errors),
-                                     test_files=list(goals.base_test_files(rec.path, rec.base)))
-        state["last_output"] = result.stdout_tail[-MESSAGE_TAIL_CHARS:]
-        save(state)
-        base_text = (_counts_text(state["baseline"]["counts"]) if goal.is_pytest else "") + f", exit {result.exit_code}"
-        self.ui.say(f"  baseline: {base_text.lstrip(', ')}", "dim")
-        return self.go(state)
+        return self.begin(state, baseline, output)
 
     def run_session(self, state: dict) -> Session:
         return replace(self.session, worktree=Path(state["wt_path"]), protected=tuple(state["protected"]))
@@ -281,7 +304,10 @@ class Loop:
             candidates = [s for s in candidates if s["run_id"] == run_id]
         if not candidates:
             raise GoalError("no paused or stopped run to resume" + (f" with id {run_id}" if run_id else ""))
-        state = candidates[-1]
+        return self.continue_run(candidates[-1], guidance)
+
+    def continue_run(self, state: dict, guidance: str | None = None) -> dict:
+        """Resume a paused or stopped run from its saved state (its baseline is the one in ``state``)."""
         if state["status"] == "stopped":  # another batch: the goal note's iterations and budget again
             state["limit_iterations"] = len(state["iterations"]) + state["max_iterations"]
             total = ledger.spent(run_id=state["run_id"])
@@ -354,8 +380,9 @@ class Loop:
                    "goal, with tests that cover it." if base["exit_code"] == 0 else "")
         head = ITERATION.format(n=n, max=state["limit_iterations"], check=" ".join(state["argv"]), counts=counts,
                                 protected=protected, already=already)
-        goal_text = tools.authorize(self.session.active_vault / state["goal_ref"].split(":", 1)[1], tools.Op.READ,
-                                    self.session).path.read_text("utf-8")
+        goal_text = state.get("goal_text") or tools.authorize(
+            self.session.active_vault / state["goal_ref"].split(":", 1)[1], tools.Op.READ,
+            self.session).path.read_text("utf-8")
         logs = [self._read_log(state, it["nn"]) for it in state["iterations"]]
         parts = [head, _section(f"The goal ({state['goal_ref']})", goal_text),
                  _section("Earlier iterations' logs", "\n\n".join(logs)),
@@ -395,7 +422,7 @@ class Loop:
             self.proposals += agent.proposals
             state["status"], state["pause"] = "paused", "interrupted"
             save(state)
-            self.ui.say(f"Paused {state['run_id']} at iteration {n}; its edits stay uncommitted. /goal resume "
+            self.ui.say(f"Paused {state['run_id']} at iteration {n}; its edits stay uncommitted. {_resume(state)} "
                         f"commits them as iter {nn:02d} (interrupted) and goes on.", "yellow")
             return "paused"
         except CapExceeded as e:
@@ -404,7 +431,7 @@ class Loop:
             self.proposals += agent.proposals
             state["status"], state["pause"] = "paused", "interrupted"
             save(state)
-            self.ui.say(f"Paused {state['run_id']}: {e}. /goal resume retries iteration {n}.", "yellow")
+            self.ui.say(f"Paused {state['run_id']}: {e}. {_resume(state)} retries iteration {n}.", "yellow")
             return "paused"
         self.proposals += agent.proposals
         if capped is not None and not agent.tool_calls:
@@ -440,7 +467,7 @@ class Loop:
             state["status"], state["pause"] = "paused", "ask_user"
             save(state)
             self.ui.say(f"Paused {state['run_id']}: the agent asked {record['asked']}. Answer with /answer, then "
-                        "/goal resume.", "magenta")
+                        f"{_resume(state)}.", "magenta")
             return "paused"
         if capped is not None:
             self.ui.say(str(capped), "bold red")
@@ -466,13 +493,16 @@ class Loop:
         verdict = goals.judge(goal_like, result.exit_code, result.stdout_tail, baseline, changed, now_ids,
                               state["wt_path"])
         counts = goals.parse_pytest(result.stdout_tail) if goal_like.is_pytest else None
+        missing = sorted(set(baseline.node_ids) - set(now_ids)) if now_ids is not None else None
         record.update(exit_code=result.exit_code, counts=counts.__dict__ if counts else None,
                       guards=[g.__dict__ for g in verdict.guards], done=verdict.done, verdict=verdict.reason,
-                      timed_out=result.timed_out, output_tail=_tail_lines(out, LOG_TAIL_LINES))
+                      timed_out=result.timed_out, output_tail=_tail_lines(out, LOG_TAIL_LINES),
+                      missing_node_ids=missing, protected_changed=changed)
 
     def _log(self, state: dict, r: dict, reply: str, capped: CapExceeded | None) -> None:
         lines = [f"# {state['goal_slug']} — iteration {r['nn']:02d}", "",
-                 f"- run: {state['run_id']}", f"- goal: [[{state['goal_ref'].split(':', 1)[1].removesuffix('.md')}]]",
+                 f"- run: {state['run_id']}",
+                 f"- goal: {state.get('goal_link') or '[[' + state['goal_ref'].split(':', 1)[1].removesuffix('.md') + ']]'}",
                  f"- branch: {state['branch']}", "", "## Plan", "", r["plan"] or _one_line(reply, 400) or "(none)", "",
                  "## Files edited", ""]
         lines += [f"- {e}" for e in r["edits"]] or ["(none)"]
@@ -530,7 +560,7 @@ class Loop:
         except (EOFError, KeyboardInterrupt):
             state["status"], state["pause"] = "paused", "checkin"
             save(state)
-            self.ui.say(f"Paused {state['run_id']} at a check-in; /goal resume continues.", "yellow")
+            self.ui.say(f"Paused {state['run_id']} at a check-in; {_resume(state)} continues.", "yellow")
             return "paused"
         if choice == "redirect" and text:
             state["redirect"] = text
@@ -572,6 +602,10 @@ class Loop:
         lines += [f"  git diff --stat ({state['branch']} against its start):",
                   *("    " + line for line in (committed or "(no committed changes)").splitlines())]
         slug = state["wt_slug"]
+        if state.get("plan_run"):
+            lines.append("  Next: " + ("the plan's next task." if state["done"] else
+                                       f"{_resume(state)} (/runs shows the plan's run)."))
+            return "\n".join(lines)
         lines.append(f"  Next: /wt diff {slug}, then /wt merge {slug}" if state["done"] else
                      f"  Next: /wt diff {slug} to look; /goal resume <guidance> to go on (another "
                      f"{state['max_iterations']} iterations and ${state['budget_usd']:.2f}); /wt drop {slug} --force "

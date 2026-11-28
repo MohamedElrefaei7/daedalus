@@ -29,7 +29,7 @@ from daedalus.terminal import agent, loop, prompts  # noqa: E402
 from daedalus.terminal.repl import COMMANDS  # noqa: E402
 
 AGENT_ONLY = set(agent.PROFILES["chat"]) | set(agent.PROFILES["coder"])
-ALL_TOOLS = set(toolset.MCP_NAMES) | AGENT_ONLY | set(getattr(toolset, "RUNS_TOOLS", ()))
+ALL_TOOLS = set(toolset.MCP_NAMES) | AGENT_ONLY
 WORDY = {"run"}  # tool names that are also words
 
 
@@ -85,6 +85,18 @@ def bad_plan() -> dict:
     return fm
 
 
+OUTCOME_STATES = [  # every way a coding-loop run ends, as read_runs reports it
+    {"status": "paused", "pause": "checkin", "iterations": [{"summary": "s"}], "next": 2},
+    {"status": "paused", "pause": "interrupted", "iterations": [], "next": 1},
+    {"status": "stopped", "stop_reason": "max_iterations", "iterations": [{"guards": [1], "exit_code": 1,
+                                                                            "done": False, "verdict": "v"}]},
+    {"status": "stopped", "stop_reason": "budget_usd", "iterations": []},
+    {"status": "stopped", "stop_reason": "the daily cap", "iterations": []},
+    {"status": "stopped", "stop_reason": "the session cap", "iterations": []},
+    {"status": "stopped", "stop_reason": "stopped at a check-in", "iterations": []},
+]
+
+
 def claude_texts(mcp, mworld) -> list[str]:
     plan_world(mworld)
     write_note(mworld.alpha, "decisions/old-way.md", "decision", "# Old way\n", status="superseded")
@@ -117,8 +129,13 @@ def claude_texts(mcp, mworld) -> list[str]:
                                                             "summary": "x"}))
             texts.append(await mcp.refused("propose_note", {"rel_path": "decisions/x.md", "content": note,
                                                             "summary": "x"}))
-            for extra in getattr(toolset, "CLAUDE_FIXED_TEXTS", ()):
-                texts.append(extra)
+            texts.append(await mcp.refused("read_runs"))
+            texts.append(await mcp.refused("read_runs", {"plan_ref": "mathx"}))
+            from daedalus.core import queue
+            from daedalus.terminal import planrun
+
+            texts += [*planrun.STOP_TEXTS.values(), queue.INTERRUPTED_RUN]  # read_runs returns these to Claude
+            texts += [planrun.outcome(st)[2] for st in OUTCOME_STATES]
         return texts
 
     return run(go())

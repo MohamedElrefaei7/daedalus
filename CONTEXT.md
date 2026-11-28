@@ -410,9 +410,40 @@
 - **A5, the plan template:** both scratch vaults' `templates/plan.md` were byte-identical to the old package template, so they were replaced: scratch `b28bf95`, scratch2 `3718a70` (`templates: plan.md v2 format`). The shared vault has no `plan.md`.
 - **Tests:** 986 by default (+11), 14 live, all passing.
 
+### 2026-11-27 — Commit 12: plan approval, /run, read_runs
+
+- **Approval (`plans.approve_plan`, `prepare_approval`):** refused unless the row is a pending plan and the latest version; re-validated against the state now (every error at once; it stays pending); then, under the write lock throughout, one `apply_changes` commit, `agent(claude): approve plan <slug>-v<N>` with `Daedalus-Change: <the plan's id>`: the plan note (`status: accepted`, each new decision gaining a server-set `note` link, the stems in `related`) and one `decisions/<category>-<choice>.md` per `basis: new`, filled from the vault's own decision template, the stem cut at 48 characters and suffixed `-2`, `-3` against every note in scope. `apply_changes` takes the proposal's id as its change-set id, so the proposal and change set reconcile against one commit; the write lock is now re-entrant in one process.
+- **Confirmation:** `/approve` on a plan shows the decisions again and asks `Accept N new decisions as precedent? [y/N]` (or `Approve plan <slug>-v<N>?`); anything but `y` writes nothing. `queue_cli apply` needs `--accept-decisions`. `/end`'s review never approves plans and lists them as "plans waiting — use /approve". The generic `apply` still refuses plans (`PlanApprovalNotYet` is now `PlanApprovalOnly`).
+- **`/run` (`terminal/planrun.py`, `core/planruns.py`):** queue schema v5 adds `plan_runs` and `plan_tasks` (tables only, no rebuild). `goals.load` accepts `plan:<id>#<task>` only for an applied plan whose note is accepted. One worktree and branch per plan (`agent/plan-<slug>-v<N>`), tasks in order on it; per task: the daily-cap room check, the preflight (protected paths and the red test's files on the branch; `done_when` under rule 7 with the venv pin; the red test run, "red test already passes" stops it), then the baseline, stored once in `plan_tasks`, then the 10c loop. It stops at the first unfinished task; question, checkin, daily_cap, and interrupted resume with `/run` from the stored baseline; max_iterations, budget, honest_done_refused, and preflight are failures. A running run holds an OS lock; a queue open reconciles one whose lock is free to stopped / interrupted. `/runs`, and `/plans` shows run status.
+- **`read_runs` (daedalus-mcp, fourteen tools):** the run, the branch, head, diffstat, and per task its numbers against the stored baseline, its last iteration from its log, and its log link, capped at 12,000 characters (oldest iteration summaries trimmed first). `plan_status` includes the run status. Claude's instructions: after a failed run, `read_runs`, then `revise_plan` if the plan was the problem, and say which.
+- **The loop** gained `new_state`, `measure_baseline`, `begin`, and `continue_run`, so a plan task runs in the shared worktree from a stored baseline; its records now keep the missing test IDs and changed protected paths; `/goal resume` never touches a plan task's run.
+- **Tests:** 1039 by default, 53 new (986 before): approval 18, `/run` 21, the REPL +5, the v4→v5 migration +2 (from A4's frozen-DDL builder), daedalus-mcp +1, integrity rows +6 (71: approving a superseded, rejected, older, or no-longer-valid plan, a target that appeared, a failing commit). 14 live, all passing.
+- **Proved red ten ways** (each break made, its test run, then restored):
+  1. Approval skipping the decision notes failed `test_approval_writes_every_new_decision` ("approval didn't write interface-python-m-scratch2-mathx-add-2-3").
+  2. Decisions in a second commit failed `test_plan_and_decisions_land_in_one_commit` (`assert '2' == '1'` commits).
+  3. A failure writing the second decision note, with the rollback removed, failed `test_a_failed_approval_leaves_nothing_behind` (alpha's and the checkout's digests changed).
+  4. No re-validation, after a precedent was set to `status: proposed`, failed `test_approval_revalidates` ("DID NOT RAISE PlanInvalid").
+  5. Approval without `y` failed `test_approve_writes_nothing_without_an_explicit_y` (the plan was approved on an empty answer); `queue_cli` without `--accept-decisions` failed `test_queue_cli_needs_accept_decisions_for_a_plan` (`assert 0 == 1`).
+  6. Generic `apply()` accepting a plan failed commit 11's `test_apply_refuses_a_plan_and_writes_nothing`; rule 5 still refused the write (`PROPOSE in the active vault is allowed only in: inbox/, questions/, CONTEXT.md`), a second layer.
+  7. Resume re-measuring the baseline (an iteration deletes `tests/test_y.py`, the process is killed, `/run` resumes) failed `test_resume_uses_the_stored_baseline` (`('done', None) == ('failed', 'honest_done_refused')`: the lowered bar let it pass).
+  8. `/run` going on after a failed task failed `test_stops_at_the_first_unfinished_task` (`('t2', 'done', None) != ('t2', 'pending', None)`).
+  9. Skipping the red-test preflight failed `test_a_red_test_that_already_passes_stops_with_preflight` (`('t1', 'done', None) != ('t1', 'failed', 'preflight')`).
+  10. Letting a pending plan's provenance launch failed `test_a_pending_plans_provenance_is_refused` ("DID NOT RAISE GoalError").
+  Breaks 7–9 first went red only through the scripted fakes ("an unscripted check ran"); the tests now script enough that a break reaches the real assertion.
+- **Live check:** Mohamed's, after this commit (Part F).
+
 ## Key decisions
 
-- ★ **No unapproved plan touches the vault.** Plans are validated in full and held in the queue (Op.WRITE_PLAN into `plans/`); the generic `apply` refuses them, so approval (commit 12) always writes the plan and its new decisions together.
+- ★ **No unapproved plan touches the vault.** Plans are validated in full and held in the queue (Op.WRITE_PLAN into `plans/`); the generic `apply` refuses them, so approval (`approve_plan`) always writes the plan and its new decisions together.
+- ★ **Approval makes precedent, so it's explicit:** Mohamed sees the decisions again and types `y`; non-interactive paths need `--accept-decisions`; `/end` never approves a plan. The plan and every new decision land in one commit, re-validated at approval, or nothing lands.
+- **New decisions look hand-written:** filled from the vault's own `templates/decision.md`, `category` as an extra frontmatter key (unknown keys are allowed, so no schema change), stems unique across everything the link resolver sees.
+- ★ **Plan run state lives in the queue, never the vault;** the plan note isn't edited after approval.
+- ★ **One branch per plan, tasks stacked in order; only Mohamed merges.**
+- ★ **Each task's baseline is measured once, before its first iteration, and stored; a resume never re-measures it.**
+- ★ **A run stops at the first unfinished task.** question, checkin, daily_cap, and interrupted resume with `/run`; max_iterations, budget, honest_done_refused, and preflight are failures that Claude fixes with `revise_plan` after `read_runs`.
+- **A task whose red test already passes doesn't start:** it has no honest done-condition.
+- **A running plan run holds an OS lock for its life;** a free lock on a `running` row means its process is gone, and a queue open reconciles it to interrupted.
+- **Text that reaches Claude names no slash command** except in a sentence addressed to Mohamed; stored stop texts name none, and the terminal adds the command to type.
 - ★ **`validate_plan` returns every error at once,** each naming its field and task id, so one round trip tells Claude everything to fix.
 - ★ **A plan decision's basis is `new` or OK precedent, nothing else.** Proposed, draft, pulled, superseded, ambiguous, or missing bases refuse the whole plan.
 - ★ **`source` (and type, status, created, supersedes) is set by the server, never by Claude;** passing one is an error in the list.
@@ -562,7 +593,13 @@
 
 ## Up Next
 
-Commit 12: plan approval (plan + new decisions in one commit), /run, read_runs.
+Commit 13: context sets.
+
+`--retry` for failed plan tasks.
+
+lint: warn on vault templates that drift from package templates.
+
+validate_plan could check that a red_test names a test file (`/run`'s preflight does, at the task's start).
 
 detached processes can outlive a run (sandboxed, low risk).
 

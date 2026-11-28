@@ -156,8 +156,9 @@ def spent(since_utc: dt.datetime | None = None, session_id: str | None = None, r
         return _spent(con, since_utc, session_id, run_id)
 
 
-def totals(since_utc: dt.datetime | None = None, session_id: str | None = None) -> Totals:
-    where, args = _where(since_utc, session_id)
+def totals(since_utc: dt.datetime | None = None, session_id: str | None = None,
+           run_id: str | None = None) -> Totals:
+    where, args = _where(since_utc, session_id, run_id)
     with closing(connect()) as con:
         row = con.execute(
             "SELECT COUNT(*), COALESCE(SUM(prompt_cache_hit),0), COALESCE(SUM(prompt_cache_miss),0), "

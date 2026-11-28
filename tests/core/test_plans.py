@@ -9,7 +9,7 @@ from conftest import write_note, write_raw
 
 from daedalus.core import plans, queue
 from daedalus.core.apply import apply, reject
-from daedalus.core.errors import PlanApprovalNotYet
+from daedalus.core.errors import PlanApprovalOnly
 from daedalus.core.plans import PlanError, PlanInvalid, validate_plan
 
 CAP = 1.00
@@ -330,7 +330,7 @@ def test_a_second_submit_of_the_same_slug_is_refused(pw) -> None:
 def test_apply_refuses_a_plan_and_writes_nothing(pw) -> None:
     v1 = plans.submit(pw.session, "claude", "mathx", good(), BODY, session_cap_usd=CAP).proposal
     before = pw.snapshot()
-    with pytest.raises(PlanApprovalNotYet, match="plan approval arrives in commit 12"):
+    with pytest.raises(PlanApprovalOnly, match="a plan is approved only by plan approval"):
         apply(pw.session, v1.id)
     assert pw.snapshot() == before
     assert not (pw.alpha / "plans" / "mathx-v1.md").exists()
@@ -381,5 +381,5 @@ def test_migrates_a_version_3_queue_keeping_rows(state_root) -> None:
     assert (rec.status, rec.target_path) == ("pending", "/t")
     assert queue.transition("old3", "pending", "superseded")
     with queue.connect() as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert c.execute("PRAGMA user_version").fetchone()[0] == queue.SCHEMA_VERSION
         assert c.execute("SELECT 1 FROM sqlite_master WHERE name = 'proposals_by_status'").fetchone()

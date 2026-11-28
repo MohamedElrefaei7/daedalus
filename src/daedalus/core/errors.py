@@ -44,5 +44,5 @@ class UnknownProposal(ProposalError, KeyError):
     pass
 
 
-class PlanApprovalNotYet(ProposalError):
+class PlanApprovalOnly(ProposalError):
     """A plan proposal can't go through the generic apply: approving it must also write its decisions."""

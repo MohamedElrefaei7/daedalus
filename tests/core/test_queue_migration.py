@@ -92,3 +92,43 @@ def test_a_failed_rebuild_leaves_the_file_at_v3_with_every_row(v3, monkeypatch) 
         assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         con.close()
+
+
+# v4 → v5 (commit 12): plan runs. Only tables are added; the proposals table isn't rebuilt. -------
+
+@pytest.fixture
+def v4(state_root, monkeypatch):
+    monkeypatch.setattr(queue, "_reconciling", True)
+    build_queue(queue.queue_path(), 4, proposals=sample_proposals((*V3_STATUSES, "superseded")))
+    return queue.queue_path()
+
+
+def test_v4_to_v5_adds_the_plan_run_tables_and_keeps_every_row(v4) -> None:
+    before, proposals_sql = dump(v4), table_sql(v4, "proposals")
+    assert before["user_version"] == 4 and table_sql(v4, "plan_runs") is None
+    with queue.connect() as con:
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    after = dump(v4)
+    assert after["user_version"] == 5
+    assert {k: v for k, v in after.items() if k != "user_version"} == \
+        {k: v for k, v in before.items() if k != "user_version"}
+    assert table_sql(v4, "proposals") == proposals_sql, "v4 → v5 must not rebuild the proposals table"
+    assert table_sql(v4, "plan_runs") and table_sql(v4, "plan_tasks") and table_sql(v4, "plan_runs_by_plan")
+
+
+class _FailsAddingPlanTasks(sqlite3.Connection):
+    def execute(self, sql, *args):
+        if "CREATE TABLE IF NOT EXISTS plan_tasks" in sql:
+            raise sqlite3.OperationalError("injected: disk I/O error")
+        return super().execute(sql, *args)
+
+
+def test_a_failed_v5_migration_leaves_the_file_at_v4(v4, monkeypatch) -> None:
+    before = dump(v4)
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(queue.sqlite3, "connect", lambda *a, **k: real_connect(*a, factory=_FailsAddingPlanTasks, **k))
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        queue.connect()
+    monkeypatch.setattr(queue.sqlite3, "connect", real_connect)
+    assert dump(v4) == before and table_sql(v4, "plan_runs") is None

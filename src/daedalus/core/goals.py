@@ -76,8 +76,16 @@ def _positive_int(fm: dict, key: str) -> int:
     return v
 
 
+PLAN_PROVENANCE = re.compile(r"plan:(?P<id>[0-9a-z]{14})#(?P<task>t\d+)")
+PLAN_CHECKIN_EVERY = 3  # plan tasks carry no checkin_every, so a task checks in every 3 iterations
+
+
 def load(session: Session, ref: str) -> Goal:
-    """Read and check a goal note in the active project. Raises GoalError, or the policy's PolicyError."""
+    """Read and check a goal in the active project: a goal note, or a plan task by its provenance
+    ``plan:<change_id>#<task id>``. Raises GoalError, or the policy's PolicyError."""
+    m = PLAN_PROVENANCE.fullmatch(ref.strip())
+    if m:
+        return load_plan_task(session, m["id"], m["task"])
     match = tools.resolve_ref(session, ref if "/" in ref or ":" in ref else f"goals/{ref}")
     if match.vault != session.active:
         raise GoalError(f"{match.vault}:{match.rel_path} isn't in the active project ({session.active}); goals run "
@@ -346,3 +354,68 @@ def is_config(rel: str) -> bool:
 
 def config_paths(paths: list[str]) -> list[str]:
     return [p for p in dict.fromkeys(paths) if is_config(p)]
+
+
+# Plan tasks ------------------------------------------------------------------------------------
+
+def load_plan_task(session: Session, change_id: str, task_id: str) -> Goal:
+    """A goal from an approved plan's task. ★ The launch rule for plans: the plan's proposal row must be applied
+    AND its note in plans/ must be accepted. A pending, rejected, or superseded plan never launches, nor one
+    whose note was edited out of acceptance after approval."""
+    from . import plans, queue
+
+    ref = f"plan:{change_id}#{task_id}"
+    try:
+        rec = queue.get(change_id)
+    except queue.UnknownProposal:
+        raise GoalError(f"{ref}: no plan proposal {change_id}") from None
+    parsed = plans._parse_rel(rec.rel_path)
+    if rec.vault != session.active or parsed is None:
+        raise GoalError(f"{ref}: {change_id} isn't a plan in {session.active}")
+    if rec.status != "applied":
+        raise GoalError(f"{ref}: the plan {rec.rel_path} is {rec.status}, not approved. Only an approved plan's "
+                        "tasks launch: approve it with /approve first")
+    full = f"{session.active}:{rec.rel_path}"
+    try:
+        note, errors = tools.read_note(session, full, strict=False)
+    except FileNotFoundError:
+        raise GoalError(f"{ref}: the plan was approved but {full} is gone") from None
+    fm = note.frontmatter
+    if fm.get("type") != "plan" or fm.get("status") != "accepted" or errors:
+        raise GoalError(f"{ref}: {full} isn't an accepted plan note (type {fm.get('type')!r}, status "
+                        f"{fm.get('status')!r}{'; ' + '; '.join(errors) if errors else ''}); only an approved plan's "
+                        "tasks launch")
+    found = [t for t in fm.get("tasks") or [] if isinstance(t, dict) and t.get("id") == task_id]
+    if not found:
+        raise GoalError(f"{ref}: {full} has no task {task_id}")
+    t = found[0]
+    slug, n = parsed
+    try:
+        argv = tuple(shlex.split(str(t["done_when"])))
+        protected = normalize_protected(list(t.get("protected") or []))
+    except (ValueError, KeyError, SessionError) as e:
+        raise GoalError(f"{ref}: the task can't run: {e}") from None
+    if not argv:
+        raise GoalError(f"{ref}: done_when is empty")
+    return Goal(ref, f"plan-{slug}-v{n}-{task_id}", note, task_text(slug, n, fm, t, note.body), argv,
+                int(t["max_iterations"]), float(t["budget_usd"]), PLAN_CHECKIN_EVERY, protected)
+
+
+def task_text(slug: str, n: int, fm: dict, t: dict, body: str) -> str:
+    """What the coding agent reads as its goal: the task, the plan's binding decisions, and its context."""
+    lines = [f"# Task {t['id']} of plan {slug} v{n}: {t['summary']}", "",
+             f"Plan: [[plans/{slug}-v{n}]] (approved). Spec: {fm.get('spec')} (read it with read_note).", "",
+             f"- Files to start from: {', '.join(t.get('files') or [])}",
+             f"- Red test (fails before the change, passes after): {t['red_test']}",
+             f"- Done when: `{t['done_when']}`",
+             f"- At most {t['max_iterations']} iterations and ${float(t['budget_usd']):.2f}"]
+    if t.get("protected"):
+        lines.append(f"- Protected (you may not change these): {', '.join(t['protected'])}")
+    decisions = [d for d in fm.get("decisions") or [] if isinstance(d, dict)]
+    if decisions:
+        lines += ["", "## Binding decisions (approved with the plan; follow them, don't revisit them)", ""]
+        for d in decisions:
+            cite = d.get("note") if str(d.get("basis")).strip() == "new" else d.get("basis")
+            lines.append(f"- {d.get('category')}: {d.get('choice')} ({cite})")
+    lines += ["", "## The plan's context", "", body.strip()]
+    return "\n".join(lines) + "\n"

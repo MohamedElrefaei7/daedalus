@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from . import queue
-from .errors import CommitFailed, NotPending, PlanApprovalNotYet, ProposalError, StaleProposal
+from .errors import CommitFailed, NotPending, PlanApprovalOnly, ProposalError, StaleProposal
 from .policy import Op, PolicyError, authorize
 from .queue import Proposal
 from .registry import SHARED_NAME, Registry
@@ -93,9 +93,9 @@ def apply(session: Session, change_id: str) -> Proposal:
             raise NotPending(f"proposal {change_id} is {rec.status}, not pending")
         # A plan never goes through the generic path: approving one must also write its new decisions.
         if is_plan_proposal(rec):
-            raise PlanApprovalNotYet(f"proposal {change_id} is a plan ({rec.vault}:{rec.rel_path}); plan approval "
-                                     "arrives in commit 12. Nothing was written. /reject it with a reason, or leave "
-                                     "it pending.")
+            raise PlanApprovalOnly(f"proposal {change_id} is a plan ({rec.vault}:{rec.rel_path}); a plan is approved "
+                                   "only by plan approval (/approve in the terminal), which writes it and its new "
+                                   "decisions in one commit. Nothing was written.")
 
         # 2. Re-authorize against the session passed in now.
         auth = authorize(vault_root(session.registry, rec.vault) / rec.rel_path, Op.PROPOSE, session)
@@ -175,7 +175,8 @@ class Change:
     base_sha256: str | None  # what the caller read: the file must still hash to this; None means it must not exist
 
 
-def apply_changes(repo: Path, changes: list[Change], summary: str, message: list[str] | None = None) -> str:
+def apply_changes(repo: Path, changes: list[Change], summary: str, message: list[str] | None = None,
+                  change_id: str | None = None) -> str:
     """Write every change and make exactly one commit, or leave every path as it was. Returns the sha.
 
     Under the write lock, in order: stale-check every path against its
@@ -185,6 +186,10 @@ def apply_changes(repo: Path, changes: list[Change], summary: str, message: list
     ``git commit --only``. Any failure, including a failing hook, restores
     every path and marks the change set failed. A crash anywhere after the
     record is reconciled on the next queue open.
+
+    ``change_id`` names the change set (and the commit's Daedalus-Change
+    trailer); plan approval passes the plan proposal's id, so the proposal and
+    its change set reconcile against the same commit.
     """
     if not changes:
         raise ValueError("apply_changes needs at least one change")
@@ -193,7 +198,7 @@ def apply_changes(repo: Path, changes: list[Change], summary: str, message: list
         raise ProposalError(f"every path in a change set must be inside {repo}")
     if len(set(rels)) != len(rels):
         raise ProposalError("a change set names the same path twice")
-    change_id = queue.new_id()
+    change_id = change_id or queue.new_id()
     message = message or [summary]
     with write_lock():
         dirfds = [open_dir_nofollow(c.path.parent) for c in changes]

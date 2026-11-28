@@ -1,8 +1,8 @@
 """daedalus-mcp: the MCP server the Claude desktop app talks to, over stdio.
 
 A thin layer over daedalus.core. Claude can read the session's vaults and the
-active project's code, propose new notes, and submit and revise plans (into
-the queue, never the vault). It can't approve, apply, reject, edit, or write
+active project's code, propose new notes, submit and revise plans (into the
+queue, never the vault), and read how an approved plan's run went. It can't approve, apply, reject, edit, or write
 logs: those tools are never registered here.
 
 The tool bodies live in daedalus.toolset, shared with the terminal agent.
@@ -44,7 +44,9 @@ INSTRUCTIONS = """\
 Daedalus gives you read access to the user's Obsidian project vaults, the shared vault of practices and \
 lessons, and the active project's code. You can't change anything directly: propose_note queues a new note \
 for the user to approve in their terminal, and submit_plan queues a plan written to their spec (revise_plan \
-after a rejection; plan_status tells you why). Call get_scope first to see which project is active. Notes are \
+after a rejection; plan_status tells you why). After a plan run stops with a failure, call read_runs, then \
+revise_plan if the plan was the problem, and say in chat which it was: the plan, or the code. Call get_scope \
+first to see which project is active. Notes are \
 addressed as vault:path/to/note.md (for example shared:practices/red-test-first.md) or by bare wikilink \
 target (red-test-first)."""
 
@@ -169,6 +171,11 @@ def build_server(registry_path: str | os.PathLike[str] | None = None,
     @_tool_errors("list_plans")
     def list_plans() -> dict[str, Any]:
         return toolset.list_plans(session())
+
+    @mcp.tool(name="read_runs", description=describe("read_runs"))
+    @_tool_errors("read_runs")
+    def read_runs(plan_ref: str | None = None) -> dict[str, Any]:
+        return toolset.read_runs(session(), plan_ref)
 
     return mcp
 

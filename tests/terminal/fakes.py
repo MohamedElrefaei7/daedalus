@@ -119,6 +119,8 @@ class FakeDeepSeek:
         r = self.responses[0] if (self.repeat_last and len(self.responses) == 1) else self.responses.pop(0)
         if isinstance(r, httpx2.Response):
             return r
+        if callable(r):  # e.g. raise a BaseException: the process dies mid-call
+            return r(request)
         if isinstance(r, Explodes):
             return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=r)
         if isinstance(r, list):

@@ -45,6 +45,7 @@ from . import ledger, obsidian
 from daedalus.toolset import refusal
 
 from . import loop as goal_loop
+from . import planrun
 from .agent import Agent, Events, ToolOutcome, tool_label
 from .config import Config, ConfigError, load_config
 from .deepseek import DeepSeek, DeepSeekError, Reply
@@ -56,7 +57,8 @@ log = logging.getLogger("daedalus.terminal")
 # Every slash command the REPL handles. Commands are Mohamed's: text sent to Claude names one only in a
 # sentence addressed to him (tests/mcp/test_client_text.py).
 COMMANDS = ("/new", "/vaults", "/vault", "/pull", "/drop", "/end", "/open", "/here", "/add", "/answer", "/promote",
-            "/wt", "/code", "/goal", "/review", "/cost", "/pending", "/plans", "/diff", "/approve", "/reject", "/help",
+            "/wt", "/code", "/goal", "/review", "/cost", "/pending", "/plans", "/diff", "/approve", "/reject", "/run",
+            "/runs", "/help",
             "/quit", "/exit")
 
 HELP = """\
@@ -85,7 +87,9 @@ HELP = """\
 /pending               proposals waiting for you
 /plans                 Claude's plans: pending (with their versions), approved, and rejected
 /diff <id>             what a proposal would change (a plan: its decisions first, then its tasks)
-/approve <id>          apply a proposal and commit it
+/approve <id>          apply a proposal and commit it (a plan: shows its decisions and asks first)
+/run <plan>            run an approved plan's tasks in order on agent/plan-<slug>-v<N>; again to resume a stop
+/runs [plan]           how a plan run went: each task's status, iterations, cost, checks, and stop
 /reject <id> <reason>  reject a proposal
 /help                  this list
 /quit                  exit without /end (Ctrl-D works too)
@@ -377,8 +381,16 @@ class Repl:
                 else:
                     self.console.print(Text(diff(change_id)))
             elif name == "/approve":
-                p = apply(self.session, self._id(rest, "/approve <id>"))
-                self.console.print(f"applied {p.id}: {p.vault}:{p.rel_path} in commit {p.commit_sha[:7]}")
+                change_id = self._id(rest, "/approve <id>")
+                if is_plan_proposal(queue.get(change_id)):
+                    self.approve_plan(change_id)
+                else:
+                    p = apply(self.session, change_id)
+                    self.console.print(f"applied {p.id}: {p.vault}:{p.rel_path} in commit {p.commit_sha[:7]}")
+            elif name == "/run":
+                self.run_plan(self._id(rest, "/run <plan>"))
+            elif name == "/runs":
+                self.console.print(Text(planrun.format_runs(planrun.read_runs(self.session, rest or None))))
             elif name == "/reject":
                 change_id, _, reason = rest.partition(" ")
                 p = reject(self._id(change_id, "/reject <id> <reason>"), reason.strip())
@@ -392,7 +404,7 @@ class Repl:
             for f in e.files:
                 self.console.print(Text(f"  conflict: {f}", style="red"))
         except (queue.ProposalError, StateError, RegistryError, LifecycleError, KeyError, ValueError, RefError,
-                obsidian.ObsidianError, worktree.WorktreeError, SandboxError, GoalError) as e:
+                obsidian.ObsidianError, worktree.WorktreeError, SandboxError, GoalError, plans.PlanError) as e:
             self.console.print(Text(f"error: {e}", style="red"))
         return None
 
@@ -579,6 +591,18 @@ class Repl:
             self.coded.append(f"Goal run {state['run_id']} ({state['goal_ref']}, {state['branch']}): "
                               f"{state['stop_reason']} after {len(state['iterations'])} iteration(s).")
 
+    def run_plan(self, plan_ref: str) -> None:
+        if self.coding is not None:
+            raise ValueError("leave coder mode (/code off) before running a plan")
+        runner = planrun.PlanRunner(self.session, self.ds, self.cfg, self.session_id, LoopView(self),
+                                    meter=self.agent.meter, runner=self.runner)
+        try:
+            done = runner.run(plan_ref)
+        finally:
+            self.carried_proposals += runner.proposals
+        self.coded.append(f"Plan run {done.id} ({done.slug} v{done.version}, {done.branch}): {done.status}"
+                          + (f" ({done.stop_reason})" if done.stop_reason else "") + ".")
+
     def review_lessons(self, rest: str) -> None:
         if rest.strip() != "lessons":
             raise ValueError("usage: /review lessons")
@@ -667,10 +691,20 @@ class Repl:
                       + " ".join(self.coded) + f"\n\n{prompt}")
         self.ask(prompt, attach=False)
         self.review(carried + self.agent.proposals)
+        self.plans_waiting()
+
+    def plans_waiting(self) -> None:
+        """/end never approves plans: approving one makes its new decisions binding, so it's /approve's job."""
+        waiting = plans.list_plans(self.session)["pending"]
+        if waiting:
+            self.console.print(Text(f"plans waiting — use /approve <id>:", style="bold yellow"))
+            for e in waiting:
+                self.console.print(Text(f"  {e['id']}  {e['slug']} v{e['version']}"))
 
     def review(self, ids: list[str], after_approve: Callable[[Any], None] | None = None) -> None:
         """Walk proposals one at a time: approve, reject with a reason, or skip (leave pending)."""
-        waiting = [i for i in dict.fromkeys(ids) if queue.get(i).status == "pending"]
+        waiting = [i for i in dict.fromkeys(ids) if queue.get(i).status == "pending"
+                   and not is_plan_proposal(queue.get(i))]  # plans are approved only with /approve
         if not waiting:
             self.console.print("No proposals to review.")
             return
@@ -743,7 +777,11 @@ class Repl:
         self.console.print(Text("Approved plans:", style="bold"))
         for e in listed["approved"]:
             version = f" v{e['version']}" if e["version"] else ""
-            say(f"{e['id'] or '-':14}  {e['slug']}{version}  {e['rel_path']}")
+            r = e.get("run")
+            ran = ("  not run yet (/run " + f"{e['slug']}{'-v' + str(e['version']) if e['version'] else ''})"
+                   if r is None else f"  run {r['status']}" + (f" ({r['stop_reason']})" if r["stop_reason"] else "")
+                   + " · " + ", ".join(f"{t['id']} {t['status']}" for t in r["tasks"]))
+            say(f"{e['id'] or '-':14}  {e['slug']}{version}  {e['rel_path']}{ran}")
         if not listed["approved"]:
             say("  none")
 
@@ -756,23 +794,7 @@ class Repl:
         say(f"spec: {pv.spec}")
         if pv.supersedes:
             say(f"supersedes: {pv.supersedes}")
-        new = sum(d.is_new for d in pv.decisions)
-        table = Table(title=f"Decisions ({len(pv.decisions)}; {new} new)", title_justify="left")
-        for col in ("category", "choice", "basis"):
-            table.add_column(col)
-        for d in pv.decisions:
-            if d.is_new:
-                table.add_row(Text(d.category), Text(d.choice), Text("NEW: binding once approved"),
-                              style="bold yellow")
-            else:
-                table.add_row(Text(d.category), Text(d.choice), Text(f"cited {d.basis}"))
-        if pv.decisions:
-            self.console.print(table)
-            if new:
-                self.console.print(Text(f"Approving this plan makes {new} new decision{'s' if new != 1 else ''} "
-                                        "binding.", style="bold yellow"))
-        else:
-            say("Decisions: none")
+        self.decisions_table(pv)
         self.console.print(Text(f"Tasks ({len(pv.tasks)})", style="bold"))
         for t in pv.tasks:
             self.console.print(Text(f"{t.id}  {t.summary}", style="bold"))
@@ -785,6 +807,55 @@ class Repl:
                 say(f"    protected:  {', '.join(t.protected)}")
         if pv.body:
             self.console.print(Markdown(pv.body))
+
+    def decisions_table(self, pv: plans.PlanView, stems: dict[int, str] | None = None) -> int:
+        """The plan's decisions, NEW ones highlighted (with the note approval writes, if known). Returns the count
+        of new ones."""
+        new = sum(d.is_new for d in pv.decisions)
+        if not pv.decisions:
+            self.console.print(Text("Decisions: none"))
+            return 0
+        table = Table(title=f"Decisions ({len(pv.decisions)}; {new} new)", title_justify="left")
+        for col in ("category", "choice", "basis"):
+            table.add_column(col)
+        for i, d in enumerate(pv.decisions, 1):
+            if d.is_new:
+                note = f" → decisions/{stems[i]}.md" if stems and i in stems else ""
+                table.add_row(Text(d.category), Text(d.choice), Text(f"NEW: binding once approved{note}"),
+                              style="bold yellow")
+            else:
+                table.add_row(Text(d.category), Text(d.choice), Text(f"cited {d.basis}"))
+        self.console.print(table)
+        if new:
+            self.console.print(Text(f"Approving this plan makes {new} new decision{'s' if new != 1 else ''} "
+                                    "binding.", style="bold yellow"))
+        return new
+
+    def approve_plan(self, change_id: str) -> None:
+        """/approve on a plan: re-check it, show the decisions again, and write nothing without an explicit y."""
+        try:
+            prep = plans.prepare_approval(self.session, change_id, session_cap_usd=self.cfg.session_cap_usd)
+        except plans.PlanInvalid as e:
+            self.console.print(Text(f"error: {e.target}", style="red"))
+            for err in e.errors:
+                self.console.print(Text(f"  {err}", style="red"))
+            return
+        n = self.decisions_table(prep.view, {d.index: d.stem for d in prep.decisions})
+        question = (f"Accept {n} new decision{'s' if n != 1 else ''} as precedent? [y/N] " if n else
+                    f"Approve plan {prep.slug}-v{prep.version}? [y/N] ")
+        try:
+            answer = self.read_line(question).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer != "y":
+            self.console.print(f"not approved; {change_id} stays pending. Nothing was written.")
+            return
+        done = plans.approve_plan(self.session, change_id, session_cap_usd=self.cfg.session_cap_usd)
+        self.console.print(Text(f"approved plan {done.slug} v{done.version} in commit {done.commit_sha[:7]}: "
+                                f"{done.plan_ref}" + "".join(f", {r}" for r in done.decision_refs)))
+        if done.decision_refs:
+            self.console.print(Text(f"{len(done.decision_refs)} new decision(s) are now precedent. /run "
+                                    f"{done.slug} runs its tasks.", style="green"))
 
     def cost(self) -> None:
         now = ledger.utc_now()

@@ -37,13 +37,13 @@ from typing import Iterable
 
 from . import vaultio
 from .errors import (  # re-exported: callers import these from daedalus.core.queue
-    CommitFailed, DraftInvalid, LockBusy, NotPending, PlanApprovalNotYet, ProposalError, ProposalTooLarge,
+    CommitFailed, DraftInvalid, LockBusy, NotPending, PlanApprovalOnly, ProposalError, ProposalTooLarge,
     StaleProposal, UnknownProposal,
 )
 
 STATE_ROOT = Path("~/.local/state/daedalus").expanduser()
 MAX_CONTENT_BYTES = 256 * 1024
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 KINDS = ("create", "edit")
 STATUSES = ("pending", "applying", "applied", "rejected", "stale", "failed", "superseded")
@@ -94,6 +94,49 @@ _CHANGESETS = (
         PRIMARY KEY (changeset_id, seq)
     )""",
 )
+# Plan runs (v5, commit 12): run state lives here, never in the vault; the plan note isn't edited after approval.
+RUN_STATUSES = ("pending", "running", "done", "stopped", "failed")
+STOP_REASONS = ("question", "checkin", "daily_cap", "interrupted", "preflight", "max_iterations", "budget",
+                "honest_done_refused")
+RESUMABLE = ("question", "checkin", "daily_cap", "interrupted")
+_IN = lambda values: ", ".join(f"'{v}'" for v in values)  # noqa: E731
+_PLAN_RUNS = (
+    f"""CREATE TABLE IF NOT EXISTS plan_runs (
+        id             TEXT PRIMARY KEY,
+        plan_change_id TEXT NOT NULL,
+        project        TEXT NOT NULL,
+        slug           TEXT NOT NULL,
+        version        INTEGER NOT NULL,
+        branch         TEXT NOT NULL,
+        worktree_path  TEXT NOT NULL,
+        wt_slug        TEXT NOT NULL,
+        status         TEXT NOT NULL CHECK (status IN ({_IN(RUN_STATUSES)})),
+        stop_reason    TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_IN(STOP_REASONS)})),
+        stop_text      TEXT,
+        started_at     TEXT NOT NULL,
+        ended_at       TEXT,
+        updated_at     TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS plan_runs_by_plan ON plan_runs (project, plan_change_id)",
+    f"""CREATE TABLE IF NOT EXISTS plan_tasks (
+        plan_run_id  TEXT NOT NULL REFERENCES plan_runs (id),
+        task_id      TEXT NOT NULL,
+        idx          INTEGER NOT NULL,
+        summary      TEXT NOT NULL,
+        status       TEXT NOT NULL CHECK (status IN ({_IN(RUN_STATUSES)})),
+        stop_reason  TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_IN(STOP_REASONS)})),
+        run_id       TEXT,           -- the coding loop's run id: its ledger rows and its logs
+        base         TEXT,           -- the branch's commit when the task started
+        baseline     TEXT,           -- JSON, measured once before the first iteration and never again
+        iterations   INTEGER NOT NULL DEFAULT 0,
+        cost_usd     REAL NOT NULL DEFAULT 0,
+        text         TEXT,           -- the question, check-in, or stop message
+        started_at   TEXT,
+        ended_at     TEXT,
+        PRIMARY KEY (plan_run_id, task_id)
+    )""",
+)
+
 _V1_COLUMNS = (
     "id", "vault", "rel_path", "kind", "content", "base_sha256", "base_content", "source", "summary",
     "created_at", "updated_at", "status", "status_reason", "commit_sha",
@@ -143,18 +186,71 @@ def connect() -> sqlite3.Connection:
         if con.execute("SELECT 1 FROM proposals WHERE status = 'applying' UNION ALL "
                        "SELECT 1 FROM changesets WHERE status = 'applying' LIMIT 1").fetchone():
             reconcile()
+    if con.execute("SELECT 1 FROM plan_runs WHERE status = 'running' LIMIT 1").fetchone():
+        reconcile_plan_runs(con)
     return con
+
+
+# Plan runs: a 'running' run whose process is gone is interrupted ---------------------------
+
+INTERRUPTED_RUN = "the process running it stopped (killed, crashed, or closed); it's resumable"
+
+
+def plan_run_lock_path(run_id: str) -> Path:
+    return STATE_ROOT / "plan-runs" / f"{run_id}.lock"
+
+
+def plan_run_live(run_id: str) -> bool:
+    """A running plan run holds an OS lock on its lock file for as long as its process lives (like the write
+    lock: the kernel drops it when the process exits or crashes). Free means no process is running it."""
+    import fcntl
+
+    path = plan_run_lock_path(run_id)
+    if not path.exists():
+        return False
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def reconcile_plan_runs(con: sqlite3.Connection) -> list[str]:
+    """Mark every 'running' plan run (and its running task) stopped / interrupted if no process runs it."""
+    settled = []
+    for (run_id,) in con.execute("SELECT id FROM plan_runs WHERE status = 'running'").fetchall():
+        if plan_run_live(run_id):
+            continue
+        now, text = _now(), INTERRUPTED_RUN
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute("UPDATE plan_tasks SET status = 'stopped', stop_reason = 'interrupted', text = ?, "
+                        "ended_at = ? WHERE plan_run_id = ? AND status = 'running'", (text, now, run_id))
+            con.execute("UPDATE plan_runs SET status = 'stopped', stop_reason = 'interrupted', stop_text = ?, "
+                        "ended_at = ?, updated_at = ? WHERE id = ? AND status = 'running'", (text, now, now, run_id))
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+        settled.append(run_id)
+    return settled
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
     """Create the tables, or migrate in place: v1 had no 'applying' status, v2 no change sets, v3 no
-    'superseded' status. A status CHECK can't be altered in SQLite, so v1 and v3 rebuild the table, rows kept."""
+    'superseded' status, v4 no plan runs. A status CHECK can't be altered in SQLite, so v1 and v3 rebuild the
+    table, rows kept; v4 → v5 only adds tables."""
     if con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
         return
     con.execute("BEGIN IMMEDIATE")
     try:
         version = con.execute("PRAGMA user_version").fetchone()[0]  # re-check under the lock
-        if version < SCHEMA_VERSION:
+        if version < 4:
             # One rebuild into the current definition covers every older status CHECK.
             exists = con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'proposals'").fetchone()
             con.execute("DROP TABLE IF EXISTS proposals_new")
@@ -167,6 +263,9 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             con.execute("CREATE INDEX IF NOT EXISTS proposals_by_status ON proposals (status, vault, id)")
         if version < 3:
             for ddl in _CHANGESETS:
+                con.execute(ddl)
+        if version < 5:
+            for ddl in _PLAN_RUNS:
                 con.execute(ddl)
         if version < SCHEMA_VERSION:
             con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

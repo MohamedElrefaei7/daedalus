@@ -29,7 +29,7 @@ daedalus/
 │   └── smoke_read.py         # live read-layer smoke test against the real registry
 ├── src/daedalus/
 │   ├── mcp_server.py         # daedalus-mcp: the stdio MCP server for the Claude desktop app
-│   ├── toolset.py            # the agent tools: daedalus-mcp (thirteen), the terminal agent (twelve; fourteen in coder mode)
+│   ├── toolset.py            # the agent tools: daedalus-mcp (fourteen), the terminal agent (twelve; fourteen in coder mode)
 │   ├── secrets.py            # API keys in the macOS Keychain (`python -m daedalus.secrets set|status`)
 │   ├── queue_cli.py          # debug CLI for the queue (list/diff/apply/reject); the REPL replaces it
 │   ├── state.py              # `python -m daedalus.state` entry point (logic in core/state.py)
@@ -50,6 +50,7 @@ daedalus/
 │   │   ├── prompts.py        # the byte-stable system prompt
 │   │   ├── obsidian.py       # the Obsidian bridge: /open by path, /here via `obsidian eval`
 │   │   ├── loop.py           # the coding loop: /goal, iterations, check-ins, run state, report, lessons
+│   │   ├── planrun.py        # /run: an approved plan's tasks as loop runs on one branch; preflight; read_runs
 │   │   └── config.py         # ~/.config/daedalus/config.toml: model, effort, max_tokens, caps
 │   └── core/                 # the safety core
 │       ├── schema.py         # SCHEMA: single source of truth for frontmatter
@@ -69,8 +70,9 @@ daedalus/
 │       ├── accept.py         # ask_user's question, /answer, /promote
 │       ├── ingest.py         # /add: local documents into sources/ as markdown (MarkItDown)
 │       ├── worktree.py       # agent worktrees: create, list, diff, commit, merge (yours), drop
-│       ├── goals.py          # goal notes: the launch rule, done_when under rule 7, pytest counts, honest-done guards
-│       ├── plans.py          # plans from Claude: validate_plan (every error at once), submit, revise, status, list
+│       ├── goals.py          # goal notes and plan tasks: the launch rule, done_when under rule 7, pytest counts, honest-done guards
+│       ├── plans.py          # plans from Claude: validate_plan (every error at once), submit, revise, status, list, approve_plan
+│       ├── planruns.py       # plan run state in the queue (schema v5): runs, tasks, stored baselines, the run lock
 │       └── tools.py          # note read tools; list_files/read_code; propose_*; write_log; edit/write/delete_code
 ├── templates/
 │   ├── project-vault/        # copied wholesale to create a project vault
@@ -155,9 +157,9 @@ Agents never write a vault directly. `propose_note`, `propose_edit`, and `propos
 6. If the commit fails, restore the previous content (or remove a create) and mark it `failed` with git's output.
 7. Mark it `applied` and store `commit_sha`.
 
-The commit message is `agent(<source>): <summary>`, a blank line, then the trailer `Daedalus-Change: <id>`. `write_log` creates `logs/<run_id>.md` with an exclusive create (`open(..., "x")`) and commits it at once as `log(<source>): <run_id>`; no approval is needed. Every vault write, whether apply, reject, or `write_log`, holds one write lock. It's an OS lock (`fcntl.flock`) on `~/.local/state/daedalus/write.lock`: the kernel releases it when the holder exits, crashes included, and the file's existence means nothing.
+The commit message is `agent(<source>): <summary>`, a blank line, then the trailer `Daedalus-Change: <id>`. `write_log` creates `logs/<run_id>.md` with an exclusive create (`open(..., "x")`) and commits it at once as `log(<source>): <run_id>`; no approval is needed. Every vault write, whether apply, reject, or `write_log`, holds one write lock. It's an OS lock (`fcntl.flock`) on `~/.local/state/daedalus/write.lock`: the kernel releases it when the holder exits, crashes included, and the file's existence means nothing. It's re-entrant within one process (plan approval holds it from its checks to its commit, around `apply_changes`).
 
-**Queue statuses** (schema v4): `pending`, `applying`, `applied`, `rejected`, `stale`, `failed`, and `superseded` (a plan version replaced by its revision while still pending). A status CHECK can't be altered in SQLite, so the v3→v4 migration rebuilds the table, rows kept.
+**Queue statuses** (schema v5): `pending`, `applying`, `applied`, `rejected`, `stale`, `failed`, and `superseded` (a plan version replaced by its revision while still pending). A status CHECK can't be altered in SQLite, so the v3→v4 migration rebuilds the table, rows kept. v4→v5 only adds the plan-run tables (`plan_runs`, `plan_tasks`). Migration tests start from frozen old DDL (`tests/core/queue_fixtures.py`), never from the current code, and check every column of every row, `foreign_key_check`, `integrity_check`, and that a failure partway leaves the old version intact.
 
 **Crash recovery.** Every queue open reconciles `applying` records whose apply isn't running; "not running" means the write lock is free. If a commit with the proposal's `Daedalus-Change` trailer exists, the record is marked `applied` with that sha. Otherwise the old content is restored (or a create removed), the path unstaged, and the record marked `failed` with reason `interrupted`. A file changed after the crash is left alone.
 
@@ -167,7 +169,7 @@ A refused write leaves every vault's digest, every repo's HEAD, and the queue un
 
 The MCP server for the Claude desktop app, in `src/daedalus/mcp_server.py` (FastMCP, pinned in `pyproject.toml`), run over stdio as `daedalus-mcp`. It's a thin layer over `daedalus.core`: every tool goes through the same session, path policy, and queue. The tool bodies and descriptions live in `daedalus.toolset`, shared with the terminal agent.
 
-**The exact tool set.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus the four plan tools `submit_plan`, `revise_plan`, `plan_status`, `list_plans` (thirteen, `toolset.MCP_NAMES`). Nothing else: never `apply`, `reject`, `propose_edit`, `ask_user`, `write_log`, or anything that applies or rejects. `tests/mcp/test_server.py::test_exact_tool_set` fails if a tool is added or removed.
+**The exact tool set.** `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus the five plan tools `submit_plan`, `revise_plan`, `plan_status`, `list_plans`, `read_runs` (fourteen, `toolset.MCP_NAMES`). Nothing else: never `apply`, `reject`, `propose_edit`, `ask_user`, `write_log`, or anything that applies or rejects. `tests/mcp/test_server.py::test_exact_tool_set` fails if a tool is added or removed.
 
 - **The server sets `source="claude"`.** `propose_note`, `submit_plan`, and `revise_plan` have no `source` parameter, and their input schemas refuse extra arguments. With the source rule, a draft saying `source: human` is refused, so Claude can't present its work as the human's.
 - **Never write to stdout.** Over stdio, stdout carries only JSON-RPC; one stray `print()` corrupts the stream. Logging goes to stderr and to `~/.local/state/daedalus/mcp.log`; the FastMCP banner is off. `test_stdout_is_only_json_rpc` runs the real script and parses every stdout line.
@@ -196,7 +198,7 @@ The desktop app's entry, merged into `~/Library/Application Support/Claude/claud
 - `/answer <question-id> <option-number | "free text">`, `/promote <inbox-note> [folder]`;
 - `/wt new <slug>`, `/wt list`, `/wt diff <slug>`, `/wt merge <slug>`, `/wt drop <slug> [--force]`, `/code <slug>`, `/code off`;
 - `/goal <note>`, `/goal resume [guidance]`, `/goal list`, `/review lessons`;
-- `/cost`, `/pending`, `/plans`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/help`, `/quit`.
+- `/cost`, `/pending`, `/plans`, `/diff <id>`, `/approve <id>`, `/reject <id> <reason>`, `/run <plan>`, `/runs [plan]`, `/help`, `/quit`.
 
 `daedalus` isn't on your PATH: run it as `uv run --directory ~/code/daedalus daedalus [project]`.
 
@@ -224,7 +226,7 @@ Any failure rolls back in reverse. Each undo is armed before its step and tolera
 
 **The API key lives in the macOS Keychain,** through `keyring`: service `daedalus`, account `deepseek`, never in a file. `python -m daedalus.secrets set deepseek` stores it (via `getpass`), and `status` says whether one is present without printing it. `DEEPSEEK_API_KEY` overrides the Keychain, for tests and CI. With no key, `daedalus` exits saying how to set one, before any client exists.
 
-**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus `propose_edit` and `propose_lesson` for `/end`, and `ask_user`: twelve. daedalus-mcp shares the first nine and adds the four plan tools; the agent never has those, since plans are Claude's job. Coder mode has its own fourteen (below). The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
+**Agent tools.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `find_precedent`, plus `propose_edit` and `propose_lesson` for `/end`, and `ask_user`: twelve. daedalus-mcp shares the first nine and adds the five plan tools; the agent never has those, since plans are Claude's job. Coder mode has its own fourteen (below). The policy limits `propose_edit` to `CONTEXT.md`, `inbox/`, and `questions/` (rule 5), and `propose_lesson` to the shared `inbox/`. The schemas refuse extra arguments, and none has `source`: the agent code calls `propose_note` with `source="deepseek"`. Tool results are capped at 60,000 characters, with a truncation note. There are at most 12 tool rounds per user turn. Refusals go back to the model as the tool result, naming the rule. Schema errors that `read_note` reports are also shown in the terminal.
 
 **Pricing** (`terminal/pricing.py`, one table with `checked: 2026-11-25`). USD per 1M tokens, off-peak; peak is double.
 
@@ -383,7 +385,7 @@ The inbox deletion is authorized as `PROPOSE` (inbox is where drafts live), and 
    - if a commit with the trailer landed, the set is marked applied;
    - otherwise every path still holding our content is restored, and a path changed since is left alone.
 
-Plan approval in commit 12 will reuse this to write several decision notes at once.
+Plan approval (commit 12) uses it to write the plan and its new decisions as one commit; it passes `change_id` (the plan proposal's id), so the proposal and its change set reconcile against the same commit.
 
 ## Uploads: `/add`
 
@@ -494,7 +496,7 @@ No file means the project can't run commands, and the refusal shows how to add o
 - Each authorizes `Op.WRITE_CODE` (rules 1, 4, 6; an absolute path is left to the policy, so one into your checkout is rule 6 by name), writes atomically through an `O_NOFOLLOW` directory fd, and re-checks the realpath afterwards, restoring the file if it moved, as apply does. Binary (a NUL byte) and non-UTF-8 content is refused, and an edit keeps the file's mode. Every edit lands in the conversation's in-memory `EditLog`, for 10c's summaries.
 - **`run(argv)`** is 10a's sandboxed runner in the session's worktree. It returns the exit code, duration, timed-out flag, and the last 20,000 characters of stdout and 8,000 of stderr. `repl.log` gets metadata only: the program, the argument count, exit, duration, and output sizes; never the arguments' text or the output.
 
-**The coder profile.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `edit_code`, `write_code`, `delete_code`, `run`, `find_precedent`, `ask_user`: fourteen, with its own preamble (block 1 of the system prompt) and its own wording for `read_code` and `list_files`. The chat profile's twelve and daedalus-mcp's thirteen each have an exact-set test.
+**The coder profile.** Exactly `get_scope`, `list_notes`, `read_note`, `search`, `backlinks`, `list_files`, `read_code`, `propose_note`, `edit_code`, `write_code`, `delete_code`, `run`, `find_precedent`, `ask_user`: fourteen, with its own preamble (block 1 of the system prompt) and its own wording for `read_code` and `list_files`. The chat profile's twelve and daedalus-mcp's fourteen each have an exact-set test.
 
 **Coder mode in the REPL.**
 - `/code <slug>` sets `Session.worktree`, switches to the coder profile, starts a fresh conversation, and shows `[coding <project> · agent/<slug>] › ` as the prompt. Each `run` prints its exit code, its time, and the last 12 lines of its output.
@@ -539,7 +541,7 @@ No file means the project can't run commands, and the refusal shows how to add o
 
 ## Plans from Claude
 
-★ **No unapproved plan touches the vault.** Claude, in the Claude desktop app, writes a plan to Mohamed's spec and submits it through daedalus-mcp. It's validated in full, then held in the queue as a proposal into `plans/`, authorized as `Op.WRITE_PLAN` (rule 5). In the terminal, `/plans` lists it and `/diff` shows it; Mohamed rejects it with a reason, and Claude reads the reason with `plan_status` and submits a revision. Approving a plan is commit 12, which writes the plan and its new decisions in one commit. Until then **`apply` refuses every plan proposal** ("plan approval arrives in commit 12", `PlanApprovalNotYet`, nothing written), so a plan can never go through the generic path, which would skip writing its decisions. `/reject` works as for any proposal. `daedalus.core.plans`.
+★ **No unapproved plan touches the vault.** Claude, in the Claude desktop app, writes a plan to Mohamed's spec and submits it through daedalus-mcp. It's validated in full, then held in the queue as a proposal into `plans/`, authorized as `Op.WRITE_PLAN` (rule 5). In the terminal, `/plans` lists it and `/diff` shows it; Mohamed rejects it with a reason, and Claude reads the reason with `plan_status` and submits a revision, or he approves it (`/approve`), which writes the plan and its new decisions in one commit, and runs it (`/run`). **The generic `apply` refuses every plan proposal** (`PlanApprovalOnly`, nothing written; rule 5 would also refuse it), so a plan can never go through the generic path, which would skip writing its decisions: plans go only through `plans.approve_plan`. `/reject` works as for any proposal. `daedalus.core.plans`.
 
 **The schema.** A plan is a typed `plan` note at `plans/<slug>-v<N>.md`: the base keys, plus:
 - `spec`: a wikilink that resolves, unambiguously, to an existing note in the **active** vault.
@@ -558,16 +560,59 @@ The body is free markdown under `## Context and non-obvious decisions`, which mu
 
 ★ **`validate_plan(session, text, *, session_cap_usd=None) -> list[str]` returns every error at once.** Each error names its field, and its task id where there is one, e.g. `tasks[t2].max_iterations: 11 must be a whole number from 1 to 10`, `decisions[1].basis: …`, or `tasks[#3].id` for a task with no usable id. One round trip gives Claude everything it needs to fix the plan. With no cap passed, it reads the terminal's `session_cap_usd`.
 
-**The four tools** (daedalus-mcp only; `toolset.PLAN_TOOLS`):
+**The plan tools** (daedalus-mcp only; `toolset.PLAN_TOOLS`):
 - **`submit_plan(slug, frontmatter, body)`.**
   - `slug` follows the project-name rules: at most 64 characters, not ending in `-v<N>`, and not already used by any version in the queue or `plans/`.
   - ★ `frontmatter` takes only `spec`, `decisions`, `tasks`, `related`, `shared_refs`, and `project_refs`. **The server sets** `type: plan`, `status: proposed`, `created`, `source: claude`, and `supersedes`. Passing any of them, or any other key, is an error in the list.
   - The server adds the spec to `related`, writes the title `# <slug> v<N>`, and puts the body under the heading (unless the body already has it).
   - If the plan is valid, it's queued as `plans/<slug>-v1.md`. If not, the tool returns `{"status": "invalid", "errors": [...]}` and nothing is queued. In core, `plans.submit` raises `PlanInvalid` (a `DraftInvalid`) carrying the list.
 - **`revise_plan(plan_ref, frontmatter, body)`** takes the whole plan again, validated the same way, and creates `plans/<slug>-v<N+1>.md` with `supersedes: "[[<slug>-v<N>]]"`. `plan_ref` is a proposal id, a slug (meaning its latest version), `<slug>-v<N>`, or `plans/<slug>-v<N>.md`, and it must name the latest version. ★ If v<N> is still pending, it's marked `superseded` in the same queue transaction that inserts v<N+1> (`queue.insert(..., supersede=id)`). A rejected v<N> stays rejected. No version is ever deleted, and an invalid revision changes nothing, so v<N> stays pending.
-- **`plan_status(plan_ref)`** returns the named version's status, `rejection_reason` if it was rejected, and the version chain from oldest to newest. This is how Claude reads why a plan was rejected.
-- **`list_plans()`** returns the active project's pending plans (each with its chain), its approved plans (accepted notes in `plans/`), and its rejected plans not yet revised, with their reasons.
+- **`plan_status(plan_ref)`** returns the named version's status, `rejection_reason` if it was rejected, the version chain from oldest to newest, and, for an approved plan, its run status (`run`: status, stop reason, branch, and each task's status). This is how Claude reads why a plan was rejected.
+- **`read_runs(plan_ref?)`**: how a plan run went (below).
+- **`list_plans()`** returns the active project's pending plans (each with its chain), its approved plans (accepted notes in `plans/`, each with its run status), and its rejected plans not yet revised, with their reasons.
 
 **REPL.**
-- **`/plans`** lists pending plans: id, slug and version, task count, and decisions marked `cited` or `NEW`. Earlier versions are listed under each one, with their status, and a rejection's reason. Rejected plans awaiting a revision come next, then approved plans.
+- **`/plans`** lists pending plans: id, slug and version, task count, and decisions marked `cited` or `NEW`. Earlier versions are listed under each one, with their status, and a rejection's reason. Rejected plans awaiting a revision come next, then approved plans, each with its run status (or "not run yet").
 - **`/diff <plan-id>`** renders the plan, not raw YAML: the spec link (and `supersedes`); **the decisions first**, as a table with every `new` one highlighted and a line counting how many approval would make binding; then the tasks, with files, red test, done-when, caps, and protected paths; then the body. Every other proposal's `/diff` is unchanged.
+- **`/approve <plan-id>`** re-checks the plan, shows its decisions again (NEW ones highlighted, each with the note approval will write), and asks `Accept N new decisions as precedent? [y/N]` (or `Approve plan <slug>-v<N>? [y/N]` with none). Anything but `y` writes nothing. `/end`'s review never approves plans: it lists them as "plans waiting — use /approve". `python -m daedalus.queue_cli … apply <plan-id>` refuses without `--accept-decisions`.
+
+## Approving a plan
+
+★ **Approving a plan is where Mohamed's design decisions become precedent, so it's explicit and all-or-nothing.** `plans.approve_plan(session, change_id)`, under the write lock from its checks to its commit:
+1. **Refuse** unless the row is a plan in the active project, `pending`, and the latest version of its slug. Superseded, rejected, applied, and older versions each get their own refusal; nothing changes.
+2. **Re-validate** with `validate_plan` against the state now: a precedent may have been deleted or un-accepted since submission, the spec moved, the allow list changed. Invalid now means refused with every error at once (`PlanInvalid`), and the plan stays pending.
+3. **Build** (`prepare_approval`, which the REPL also calls to show what will be written):
+   - the plan note at `plans/<slug>-v<N>.md`, `status: accepted`; each new decision entry gains the server-set key `note: "[[<stem>]]"`, and the stems join its `related`. `note` is refused from Claude like the other server keys.
+   - one decision note per `basis: new` decision, at `decisions/<category>-<slugified choice>.md` (the stem cut at a word, at most 48 characters). A stem that any note the link resolver can see already uses (active, pulled, or shared) gets `-2`, `-3`, …, since ambiguous links are refused. Each is filled from **the vault's own `templates/decision.md`** (the package's if the vault has none), so it reads like a hand-written decision: `status: accepted`, `source` the plan's, `category`, `related` the plan and the spec; the title is the choice (cut at 90 characters), `## Context` says it was new in `[[<slug>-v<N>]]`, approved on that date, and `## Decision` holds the choice.
+   - each note passes the schema and the link rule before anything is written.
+4. **Apply** with `apply_changes`: one path-limited commit, `agent(<source>): approve plan <slug>-v<N>`, with `Daedalus-Change: <the plan proposal's id>`. Every target must still be absent at write time (a target that appeared is refused, and the plan stays pending); any other failure rolls every path back and marks the plan `failed`. The plan proposal goes `pending → applying → applied` (with the sha), and a crash is reconciled as usual: the proposal and its change set share the id, so both settle against the one commit.
+
+## Running a plan: `/run`
+
+`/run <plan-ref>` (`daedalus.terminal.planrun`) turns an approved plan's tasks into coding-loop runs, in order, on one branch.
+- ★ **Only an approved plan runs.** `goals.load` accepts the provenance `plan:<change_id>#<task id>` only when the proposal row is `applied` **and** the note in `plans/` is an accepted plan note; a pending, rejected, or superseded plan, or one whose note was edited out of acceptance, is refused by the core launch function itself.
+- ★ **One branch per plan; tasks stack on it.** The first `/run` creates one worktree, `agent/plan-<slug>-v<N>`, from your checkout's HEAD, under the usual worktree root. Tasks run in order, so t2 starts from t1's last commit. Only you merge (`/wt merge plan-<slug>-v<N>`, `--no-ff`), and dropping unmerged work still needs `--force`.
+- **One `/run` at a time per project.** Claiming a run happens under the write lock; the running process then holds an OS lock on `~/.local/state/daedalus/plan-runs/<run id>.lock` for as long as it lives.
+
+**Run state lives in the queue** (schema v5), never the vault: the plan note isn't edited after approval. `plan_runs` (plan, slug, version, branch, worktree, status, stop reason and text, times) and `plan_tasks` (task id, index, status, stop reason, the loop's `run_id`, the commit it started from, ★ **the stored baseline**, iterations, cost, and the question, check-in, or stop text). Statuses: `pending`, `running`, `done`, `stopped`, `failed`. The loop keeps its per-iteration state in `runs/<run_id>.json` as for `/goal`; `/goal resume` never touches a plan task's run.
+
+**Before each task starts** (not on a resume):
+0. **The daily cap.** If today's remaining room is less than the task's `budget_usd` (its worst case), stop with `daily_cap`. That isn't a failure.
+1. **Existence.** Every `protected` path exists on the branch (the rule `validate_plan` relaxes for paths an earlier task creates is enforced for real here), and every test file the `red_test` names (`path/test_x.py`, optionally `::test_name`) exists, or this task lists it in `files`. A red test that names no test file can't be run, so it stops too.
+2. **Rule 7 with the venv pin.** `done_when` must be allowed **and** installed in the venv (commit 11 checked only the allow list).
+3. **The red test runs**, sandboxed (`pytest -q <the named tests that exist>`). If every named test exists and it passes, stop with `preflight`: "red test already passes". A task whose test is green before it starts has no honest done-condition.
+4. **The baseline** is measured and stored in `plan_tasks` before the first iteration; it's stored once, and a second store is refused.
+
+Then the commit 10c loop runs the task with a goal built from it (the summary, `files` as the starting hint, `red_test`, `done_when`, `max_iterations`, `budget_usd`, `protected`, the plan's binding decisions, and its context), with the same honest-done rule, check-ins (every 3 iterations, plus config changes), and create-only logs (`logs/plan-<slug>-v<N>-<task>-<NN>.md`).
+
+**Stopping and resuming.**
+- ★ **The run stops at the first task that doesn't finish**, whatever the reason; later tasks stay `pending`.
+- `question`, `checkin`, `daily_cap`, and `interrupted` are **resumable**: `/run <plan-ref>` again (after `/answer` for a question) continues the stopped task on the same branch. Done tasks never run again. A session-cap stop counts as `interrupted`.
+- ★ **Resume uses the stored baseline, never a re-measured one.** Otherwise an interrupted iteration that deleted a test would lower the bar for the rest of the task.
+- `max_iterations`, `budget`, `honest_done_refused` (the last check passed but a guard failed), and `preflight` are **failures**, not resumable: the way forward is Claude reading the run (`read_runs`) and calling `revise_plan`. (`--retry` for a failed task is Up Next.)
+- Every queue open reconciles a `running` plan run whose lock is free (its process is gone) to `stopped` / `interrupted`, as `applying` rows are reconciled; `/run` then commits the interrupted iteration's edits and goes on.
+- Texts stored for a stop are sent to Claude by `read_runs`, so they name no slash command; the terminal adds the command to type.
+
+**REPL.** `/run` streams the loop as `/code` does, with a one-line header per task (`t2 · argparse add CLI · 0/5 iterations · $0.00 of $0.40`). `/runs [plan-ref]` prints `read_runs`' summary for a person. `/plans` shows each approved plan's run status.
+
+**`read_runs(plan_ref?)`** (daedalus-mcp only; READ). Default: the active project's most recent plan run. JSON: the plan slug and version, branch, head sha, `git diff --stat` against your checkout's HEAD, the run's status and stop reason; per task its id, summary, status, iterations, cost, ↑/↓ tokens (the ledger rows with its `run_id`), the honest-done numbers against the stored baseline (collected, skipped, xfailed, test IDs that no longer exist, protected paths changed, the verdict), the last iteration's summary from its log, any question or check-in text, and the log note's link. At most 12,000 characters: the oldest iteration summaries go first, and `trimmed` says so. Claude's server instructions say: after a run stops with a failure, call `read_runs`, then `revise_plan` if the plan was the problem, and say which in chat.
