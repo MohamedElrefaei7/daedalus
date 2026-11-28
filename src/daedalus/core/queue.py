@@ -43,7 +43,7 @@ from .errors import (  # re-exported: callers import these from daedalus.core.qu
 
 STATE_ROOT = Path("~/.local/state/daedalus").expanduser()
 MAX_CONTENT_BYTES = 256 * 1024
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 KINDS = ("create", "edit")
 STATUSES = ("pending", "applying", "applied", "rejected", "stale", "failed", "superseded")
@@ -99,9 +99,10 @@ RUN_STATUSES = ("pending", "running", "done", "stopped", "failed")
 STOP_REASONS = ("question", "checkin", "daily_cap", "interrupted", "preflight", "max_iterations", "budget",
                 "honest_done_refused")
 RESUMABLE = ("question", "checkin", "daily_cap", "interrupted")
+# A run (not a task) can also fail its final full-suite gate (v6, commit 12b); not resumable.
+RUN_STOP_REASONS = STOP_REASONS + ("final_suite",)
 _IN = lambda values: ", ".join(f"'{v}'" for v in values)  # noqa: E731
-_PLAN_RUNS = (
-    f"""CREATE TABLE IF NOT EXISTS plan_runs (
+_PLAN_RUNS_TABLE = f"""CREATE TABLE {{name}} (
         id             TEXT PRIMARY KEY,
         plan_change_id TEXT NOT NULL,
         project        TEXT NOT NULL,
@@ -111,12 +112,17 @@ _PLAN_RUNS = (
         worktree_path  TEXT NOT NULL,
         wt_slug        TEXT NOT NULL,
         status         TEXT NOT NULL CHECK (status IN ({_IN(RUN_STATUSES)})),
-        stop_reason    TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_IN(STOP_REASONS)})),
+        stop_reason    TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_IN(RUN_STOP_REASONS)})),
         stop_text      TEXT,
         started_at     TEXT NOT NULL,
         ended_at       TEXT,
-        updated_at     TEXT NOT NULL
-    )""",
+        updated_at     TEXT NOT NULL,
+        final_output   TEXT    -- v6: the full suite's output when the final gate failed
+    )"""
+_PLAN_RUNS_V5_COLUMNS = ("id", "plan_change_id", "project", "slug", "version", "branch", "worktree_path", "wt_slug",
+                         "status", "stop_reason", "stop_text", "started_at", "ended_at", "updated_at")
+_PLAN_RUNS = (
+    _PLAN_RUNS_TABLE.format(name="plan_runs").replace("CREATE TABLE plan_runs", "CREATE TABLE IF NOT EXISTS plan_runs"),
     "CREATE INDEX IF NOT EXISTS plan_runs_by_plan ON plan_runs (project, plan_change_id)",
     f"""CREATE TABLE IF NOT EXISTS plan_tasks (
         plan_run_id  TEXT NOT NULL REFERENCES plan_runs (id),
@@ -243,8 +249,8 @@ def reconcile_plan_runs(con: sqlite3.Connection) -> list[str]:
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
     """Create the tables, or migrate in place: v1 had no 'applying' status, v2 no change sets, v3 no
-    'superseded' status, v4 no plan runs. A status CHECK can't be altered in SQLite, so v1 and v3 rebuild the
-    table, rows kept; v4 → v5 only adds tables."""
+    'superseded' status, v4 no plan runs, v5 no final_suite stop reason. A CHECK can't be altered in SQLite, so
+    v1 and v3 rebuild the proposals table and v5 rebuilds plan_runs, rows kept; v4 → v5 only adds tables."""
     if con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
         return
     con.execute("BEGIN IMMEDIATE")
@@ -267,6 +273,16 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         if version < 5:
             for ddl in _PLAN_RUNS:
                 con.execute(ddl)
+        elif version == 5:
+            # v6: plan_runs gains the final_suite stop reason (a CHECK, so the table is rebuilt, rows kept) and
+            # final_output. plan_tasks is untouched.
+            con.execute("DROP TABLE IF EXISTS plan_runs_new")
+            con.execute(_PLAN_RUNS_TABLE.format(name="plan_runs_new"))
+            cols = ", ".join(_PLAN_RUNS_V5_COLUMNS)
+            con.execute(f"INSERT INTO plan_runs_new ({cols}) SELECT {cols} FROM plan_runs")
+            con.execute("DROP TABLE plan_runs")
+            con.execute("ALTER TABLE plan_runs_new RENAME TO plan_runs")
+            con.execute("CREATE INDEX IF NOT EXISTS plan_runs_by_plan ON plan_runs (project, plan_change_id)")
         if version < SCHEMA_VERSION:
             con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         con.execute("COMMIT")

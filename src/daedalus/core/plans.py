@@ -61,6 +61,7 @@ MAX_ITERATIONS = 10
 TASK_REQUIRED = ("id", "summary", "files", "red_test", "done_when", "max_iterations", "budget_usd")
 TASK_OPTIONAL = ("protected",)
 DECISION_KEYS = ("category", "choice", "basis")
+DECISION_OPTIONAL = ("consequences",)  # commit 12b: what follows from the choice; written into the note
 DECISION_SERVER_KEYS = ("note",)  # approval links each new decision to the note it wrote
 # What Claude may put in a plan's frontmatter; the server sets the rest.
 CLAUDE_KEYS = ("spec", "decisions", "tasks", "related", "shared_refs", "project_refs")
@@ -124,12 +125,16 @@ def _decision_errors(session: Session, decisions: Any) -> list[str]:
         if not isinstance(d, dict):
             errors.append(f"{where}: must be a mapping {{category, choice, basis}}, not {type(d).__name__}")
             continue
-        for key in sorted(set(d) - set(DECISION_KEYS), key=str):
+        for key in sorted(set(d) - set(DECISION_KEYS) - set(DECISION_OPTIONAL), key=str):
             if key in DECISION_SERVER_KEYS:
                 errors.append(f"{where}.{key}: set by the server when Mohamed approves the plan, never by you; "
                               "leave it out")
             else:
-                errors.append(f"{where}.{key}: unknown key; a decision has exactly category, choice, and basis")
+                errors.append(f"{where}.{key}: unknown key; a decision has category, choice, and basis, and "
+                              "optionally consequences")
+        if "consequences" in d and (not isinstance(d["consequences"], str) or not d["consequences"].strip()):
+            errors.append(f"{where}.consequences: must be non-empty text saying what follows from the choice, or "
+                          "left out")
         category, choice, basis = d.get("category"), d.get("choice"), d.get("basis")
         cat_ok = category in DESIGN_CATEGORIES
         if not cat_ok:
@@ -568,6 +573,7 @@ class DecisionView:
     category: str
     choice: str
     basis: str
+    consequences: str | None = None
 
     @property
     def is_new(self) -> bool:
@@ -606,7 +612,8 @@ def view(text: str, rel_path: str) -> PlanView:
     raw, body = notes.split_frontmatter(text)
     fm = notes.load_frontmatter(raw)[0] if raw is not None else {}
     slug, n = _parse_rel(rel_path) or (rel_path, 0)
-    decisions = tuple(DecisionView(str(d.get("category", "")), str(d.get("choice", "")), str(d.get("basis", "")))
+    decisions = tuple(DecisionView(str(d.get("category", "")), str(d.get("choice", "")), str(d.get("basis", "")),
+                                   d["consequences"].strip() if isinstance(d.get("consequences"), str) else None)
                       for d in fm.get("decisions") or [] if isinstance(d, dict))
     tasks = tuple(TaskView(str(t.get("id", "?")), str(t.get("summary", "")), _strs(t.get("files")),
                            str(t.get("red_test", "")), str(t.get("done_when", "")), t.get("max_iterations"),
@@ -716,14 +723,22 @@ class Approved:
     commit_sha: str
 
 
+STEM_STOP_WORDS = frozenset("a an and as at by for in into is it of on or the to when with".split())
+
+
 def decision_stem(category: str, choice: str) -> str:
-    """``<category>-<slugified choice>``, at most 48 characters, cut at a word."""
-    stem = category.replace("_", "-")
+    """``<category>-<slugified choice>``: cut at a word, at most 48 characters, with trailing stop words dropped
+    (so a stem never ends in -as or -it). The collision suffix comes after this."""
+    words: list[str] = []
+    size = len(category)
     for word in re.findall(r"[a-z0-9]+", choice.lower()):
-        if len(stem) + 1 + len(word) > DECISION_STEM_MAX:
+        if size + 1 + len(word) > DECISION_STEM_MAX:
             break
-        stem = f"{stem}-{word}"
-    return stem[:DECISION_STEM_MAX].rstrip("-")
+        words.append(word)
+        size += 1 + len(word)
+    while words and words[-1] in STEM_STOP_WORDS:
+        words.pop()
+    return "-".join([category.replace("_", "-"), *words])[:DECISION_STEM_MAX].rstrip("-")
 
 
 def _stem_taken(session: Session, stem: str) -> bool:
@@ -765,7 +780,7 @@ def _fill_section(body: str, heading: str, text: str) -> str:
 
 
 def decision_text(session: Session, category: str, choice: str, plan_stem: str, spec: str, source: str,
-                  today: str) -> str:
+                  today: str, consequences: str | None = None) -> str:
     """A decision note from the vault's decision template, as if written by hand: accepted, and new in the plan."""
     from .accept import set_frontmatter
 
@@ -780,6 +795,7 @@ def decision_text(session: Session, category: str, choice: str, plan_stem: str, 
     body = _fill_section(body, "Context", f"New in [[{plan_stem}]], approved on {today}. Category: `{category}`. "
                                           f"Spec: {spec}.")
     body = _fill_section(body, "Decision", choice)
+    body = _fill_section(body, "Consequences", consequences or f"Not stated in [[{plan_stem}]].")  # never blank
     return head + body
 
 
@@ -836,7 +852,8 @@ def prepare_approval(session: Session, change_id: str, *, session_cap_usd: float
         stem = _free_stem(session, decision_stem(d.category, d.choice), used)
         used.add(stem)
         rel = f"decisions/{stem}.md"
-        text = decision_text(session, d.category, d.choice, plan_stem, str(fm["spec"]).strip(), rec.source, day)
+        text = decision_text(session, d.category, d.choice, plan_stem, str(fm["spec"]).strip(), rec.source, day,
+                             d.consequences)
         new.append(NewDecision(i, d.category, d.choice, stem, rel, text))
     plan_text = _accepted_plan_text(rec.content, {d.index: d.stem for d in new})
     for rel, text in [(rec.rel_path, plan_text), *((d.rel_path, d.text) for d in new)]:

@@ -40,11 +40,14 @@ def pytest_out(passed=0, failed=0, skipped=0, xfailed=0, exit_code=None) -> RunR
     return RunResult(code, f"{'F' * failed}{'.' * passed}\n{summary} in 0.01s\n", "", 0.3, False)
 
 
-def collected(wt: Path) -> RunResult:
-    """What `pytest --collect-only -q` would list: every test_* function in the worktree's test_*.py files."""
+def collected(wt: Path, argv=("pytest", "--collect-only", "-q")) -> RunResult:
+    """What `pytest --collect-only -q` would list: every test_* function in the worktree's test_*.py files, or
+    only in the files argv names."""
     import re
 
+    named = {a.split("::", 1)[0] for a in argv[1:] if not a.startswith("-")}
     ids = sorted(f"{f.relative_to(wt).as_posix()}::{name}" for f in Path(wt).rglob("test_*.py")
+                 if not named or f.relative_to(wt).as_posix() in named
                  for name in re.findall(r"^def (test_\w+)", f.read_text(), re.M))
     return RunResult(0 if ids else 5, "\n".join(ids) + f"\n\n{len(ids)} tests collected in 0.01s\n", "", 0.2, False)
 
@@ -56,14 +59,18 @@ class Runner:
     else from the worktree's real files, and recorded apart in ``collect_calls``.
     """
 
-    def __init__(self, *results: RunResult, collects: list[RunResult] | None = None) -> None:
+    def __init__(self, *results: RunResult, collects: list[RunResult] | None = None, cf=None) -> None:
         self.results, self.calls = list(results), []
         self.collects, self.collect_calls = list(collects or []), []
+        self.cf, self.cf_calls = cf, []  # /run's counterfactual runs (a cf-* worktree); red unless scripted
 
     def __call__(self, session, argv, wt, **_kw) -> RunResult:
+        if Path(wt).name.startswith("cf-"):
+            self.cf_calls.append((list(argv), Path(wt)))
+            return self.cf(Path(wt)) if self.cf else RunResult(1, "F\n1 failed in 0.01s\n", "", 0.1, False)
         if "--collect-only" in argv:
             self.collect_calls.append(list(argv))
-            return self.collects.pop(0) if self.collects else collected(Path(wt))
+            return self.collects.pop(0) if self.collects else collected(Path(wt), argv)
         self.calls.append((list(argv), Path(wt), session.protected))
         if not self.results:
             raise AssertionError("an unscripted check ran")
@@ -286,7 +293,8 @@ def test_deleting_the_failing_test_is_not_done(proj, fake) -> None:
     state = run_one(proj, fake, pytest_out(passed=1), ("delete_code", {"rel_path": "tests/test_x.py"}))
     assert not state["done"] and state["stop_reason"] == "max_iterations"
     assert failed_guards(state) == {"collected": "1 fewer test was collected than at the start (2 → 1)",
-                                    "node_ids": "1 test from the start no longer exists: tests/test_x.py::test_x"}
+                                    "node_ids": "1 test from the start no longer exists: tests/test_x.py::test_x",
+                                    "suite": "1 test in the suite at the start no longer exists: tests/test_x.py::test_x"}
     assert "the check passed, but 1 fewer test was collected than at the start" in state["iterations"][-1]["verdict"]
     assert "✗ collected" in state["report"]
 
@@ -296,7 +304,8 @@ def test_swapping_the_failing_test_for_a_trivial_one_is_not_done(proj, fake) -> 
     state = run_one(proj, fake, pytest_out(passed=2), ("delete_code", {"rel_path": "tests/test_x.py"}),
                     ("write_code", {"rel_path": "tests/test_z.py", "content": "def test_z():\n    assert True\n"}))
     assert not state["done"], "deleting a failing test and adding a trivial one counted as done"
-    assert failed_guards(state) == {"node_ids": "1 test from the start no longer exists: tests/test_x.py::test_x"}
+    assert failed_guards(state) == {"node_ids": "1 test from the start no longer exists: tests/test_x.py::test_x",
+                                    "suite": "1 test in the suite at the start no longer exists: tests/test_x.py::test_x"}
     assert "tests/test_x.py::test_x" in state["report"]
 
 
@@ -318,8 +327,10 @@ def test_a_collection_error_baseline_whose_test_file_is_deleted_is_not_done(proj
     assert state["baseline"]["node_ids"] == ["tests/test_y.py::test_y"]
     assert not state["done"]
     assert failed_guards(state) == {"test_files": "1 test file from the start no longer exists: tests/test_x.py "
-                                                  "(the start had collection errors, so files are checked)"}
-    assert [c for c in runner.collect_calls] == [["pytest", "--collect-only", "-q"]] * 2
+                                                  "(the start had collection errors, so files are checked)",
+                                    "suite": "1 test in the suite at the start no longer exists: tests/test_x.py::test_x"}
+    # done_when's and the whole suite's collection, at the start and again at the check
+    assert [c for c in runner.collect_calls] == [["pytest", "--collect-only", "-q"]] * 4
 
 
 def test_skipping_the_failing_test_is_not_done(proj, fake) -> None:

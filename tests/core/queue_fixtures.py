@@ -58,7 +58,68 @@ CHANGESETS = (
 )
 INDEX = "CREATE INDEX proposals_by_status ON proposals (status, vault, id)"
 
-DDL = {3: (V3_PROPOSALS, *CHANGESETS, INDEX), 4: (V4_PROPOSALS, *CHANGESETS, INDEX)}
+_REASONS = ("'question', 'checkin', 'daily_cap', 'interrupted', 'preflight', 'max_iterations', 'budget', "
+            "'honest_done_refused'")
+_RUN_STATUSES = "'pending', 'running', 'done', 'stopped', 'failed'"
+V5_PLAN_RUNS = (
+    f"""CREATE TABLE plan_runs (
+        id             TEXT PRIMARY KEY,
+        plan_change_id TEXT NOT NULL,
+        project        TEXT NOT NULL,
+        slug           TEXT NOT NULL,
+        version        INTEGER NOT NULL,
+        branch         TEXT NOT NULL,
+        worktree_path  TEXT NOT NULL,
+        wt_slug        TEXT NOT NULL,
+        status         TEXT NOT NULL CHECK (status IN ({_RUN_STATUSES})),
+        stop_reason    TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_REASONS})),
+        stop_text      TEXT,
+        started_at     TEXT NOT NULL,
+        ended_at       TEXT,
+        updated_at     TEXT NOT NULL
+    )""",
+    "CREATE INDEX plan_runs_by_plan ON plan_runs (project, plan_change_id)",
+    f"""CREATE TABLE plan_tasks (
+        plan_run_id  TEXT NOT NULL REFERENCES plan_runs (id),
+        task_id      TEXT NOT NULL,
+        idx          INTEGER NOT NULL,
+        summary      TEXT NOT NULL,
+        status       TEXT NOT NULL CHECK (status IN ({_RUN_STATUSES})),
+        stop_reason  TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_REASONS})),
+        run_id       TEXT,
+        base         TEXT,
+        baseline     TEXT,
+        iterations   INTEGER NOT NULL DEFAULT 0,
+        cost_usd     REAL NOT NULL DEFAULT 0,
+        text         TEXT,
+        started_at   TEXT,
+        ended_at     TEXT,
+        PRIMARY KEY (plan_run_id, task_id)
+    )""",
+)
+SAMPLE_PLAN_ROWS = (
+    "INSERT INTO plan_runs VALUES ('pr000000000001', '0000000000p001', 'alpha', 'mathx', 2, 'agent/plan-mathx-v2', "
+    "'/wt/a', 'plan-mathx-v2', 'done', NULL, NULL, '2026-11-27T01:00:00+00:00', '2026-11-27T02:00:00+00:00', "
+    "'2026-11-27T02:00:00+00:00')",
+    "INSERT INTO plan_runs VALUES ('pr000000000002', '0000000000p002', 'alpha', 'cli', 1, 'agent/plan-cli-v1', '/wt/b', "
+    "'plan-cli-v1', 'stopped', 'question', 't1: asked q-x', '2026-11-27T03:00:00+00:00', NULL, "
+    "'2026-11-27T03:30:00+00:00')",
+    "INSERT INTO plan_runs VALUES ('pr000000000003', '0000000000p003', 'beta', 'io', 1, 'agent/plan-io-v1', '/wt/c', "
+    "'plan-io-v1', 'failed', 'preflight', 't1: red test already passes', '2026-11-27T04:00:00+00:00', "
+    "'2026-11-27T04:01:00+00:00', '2026-11-27T04:01:00+00:00')",
+    "INSERT INTO plan_tasks VALUES ('pr000000000001', 't1', 1, 'multiply', 'done', NULL, 'r1', 'abc', "
+    "'{\"exit_code\": 1}', 1, 0.0021, NULL, 's', 'e')",
+    "INSERT INTO plan_tasks VALUES ('pr000000000001', 't2', 2, 'cli', 'done', NULL, 'r2', 'def', "
+    "'{\"empty\": true}', 2, 0.0042, NULL, 's', 'e')",
+    "INSERT INTO plan_tasks VALUES ('pr000000000002', 't1', 1, 'cli', 'stopped', 'question', 'r3', 'ghi', NULL, 1, "
+    "0.001, 'asked q-x', 's', NULL)",
+    "INSERT INTO plan_tasks VALUES ('pr000000000003', 't1', 1, 'io', 'failed', 'preflight', NULL, NULL, NULL, 0, 0, "
+    "'red test already passes', NULL, 'e')",
+)
+
+DDL = {3: (V3_PROPOSALS, *CHANGESETS, INDEX), 4: (V4_PROPOSALS, *CHANGESETS, INDEX),
+       5: (V4_PROPOSALS, *CHANGESETS, INDEX, *V5_PLAN_RUNS)}
+SAMPLE_ROWS = {5: SAMPLE_PLAN_ROWS}
 
 COLUMNS = ("id", "vault", "rel_path", "kind", "content", "base_sha256", "base_content", "source", "summary",
            "created_at", "updated_at", "status", "status_reason", "commit_sha", "target_path", "repo_path",
@@ -126,7 +187,7 @@ def build_queue(path: Path, version: int, *, proposals=None, changesets=None, ex
         sets, paths = sample_changesets() if changesets is None else changesets
         _insert(con, "changesets", sets)
         _insert(con, "changeset_paths", paths)
-        for sql in extra_sql:
+        for sql in (*SAMPLE_ROWS.get(version, ()), *extra_sql):
             con.execute(sql)
         con.execute(f"PRAGMA user_version = {version}")
         con.execute("COMMIT")

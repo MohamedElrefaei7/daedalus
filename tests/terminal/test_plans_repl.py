@@ -88,7 +88,7 @@ def test_approve_writes_nothing_without_an_explicit_y(gworld, fake, keyed, monke
     for answer in ("", "n", "yes", "yy", "N"):
         code, out = run_repl(gworld, fake, f"/approve {v1.id}", answer)
         assert f"not approved; {v1.id} stays pending. Nothing was written." in out, answer
-        assert "NEW: binding once approved → decisions/interface-python-m-scratch2-mathx-add-2-3.md" in out
+        assert "  decision 2 → decisions/interface-python-m-scratch2-mathx-add-2-3.md" in out
         after = gworld.snapshot()
         assert after["digests"] == before["digests"] and after["heads"] == before["heads"], answer
         assert queue.get(v1.id).status == "pending"

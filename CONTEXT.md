@@ -441,6 +441,28 @@
   - The pytest command meant for a shell was typed at the REPL prompt, so it went to DeepSeek ($0.0012, no harm); the step didn't say "in another shell".
   - `/approve`'s table cut the stems with "…" at an 80-column terminal; the approval line printed them whole.
 
+### 2026-11-28 — Commit 12b: honest baselines
+
+- **Why:** commit 12's live check ran both tasks against a `done_when` baseline of pytest exit 4 with 0 collected (each named a file the task creates), so the count and node-ID guards checked nothing, and the red-test preflight held because a missing file doesn't pass.
+- **A1, the whole suite:** every baseline (plan tasks and `/goal` runs; it's in the shared loop) stores the whole project's `pytest --collect-only -q` IDs and collection-error files; at done they're listed again and every one must still be there (the `suite` guard).
+- **A2, empty baselines:** paths `done_when` names that don't exist yet are left out; if nothing is left, or pytest runs nothing (exit 5, or exit 4 "not found"), the baseline is `{"empty": true, "reason": …}`, shown as such in `/runs`, `read_runs`, the report, and the agent's message. Any other exit 4 is a usage error and refused.
+- **A3, red for the right reason** (`goals.classify_run`): 0 stops (already passes); 1, 2, and an exit 4 that reports a collection error are red; 4 "not found" and 5 are absent, allowed only for a file this task or an earlier one lists (`created_by_task`).
+- **A4, the counterfactual:** when the red test was absent or changed, a temporary detached worktree at the task's start commit gets only the final red-test files (and changed `conftest.py`); the red test must be red there, or the iteration isn't done and the log says "your red test passes against the code before your change".
+- **A5, the final gate:** after the last task, `pytest -q` on the plan branch; a failure stops the run with `final_suite` (not resumable), its output kept for `read_runs`. Queue schema v6 rebuilds `plan_runs` for it (rows kept; tested from frozen v5 DDL, with a mid-rebuild failure).
+- **Config check-ins before done:** found while preparing the live check. `go()` declared done before the config check-in, so an iteration that edited `pyproject.toml` and passed finished without one, against the documented rule. Now the check-in comes first; resuming a done iteration held at a check-in, with nothing changed, finishes it as done.
+- **B:** `/approve` prints each note it will write whole, on its own line (never in a table cell; tested at 80 columns); stems drop trailing stop words (the two live choices now give `interface-cli-lives-in-src-scratch2-mathx-py` and `interface-cli-parses-each-operand-as-int`; existing notes keep their names); decisions take an optional `consequences`, and a decision note's Consequences is never blank (`Not stated in [[<slug>-v<N>]].`).
+- **Found while building it:** a red test named by node ID in a module that can't import exits **4**, not 2 (pytest reports "found no collectors" after the collection error); that's the usual red-test-first failure, and it's red. Checked with real sandboxed runs in scratch2; the classifier is tested on those outputs.
+- **Tests:** 1060 by default, 21 new (1039 before): baselines 19 (A1 ×2, A2 ×3, A3 ×3, A4 ×4, A5, check-ins ×2, B1, B2, B3, the classifier), the v5→v6 migration 2; the commit 12 resume test now also proves the stored baseline, suite IDs included, isn't re-collected. The scripted collector now honors the paths it's given. 14 live, all passing.
+- **Proved red seven ways** (each made, its test run, then restored):
+  1. No end-of-task suite collection: `test_a_task_cant_delete_tests_outside_done_when`, `('done', None) == ('failed', 'honest_done_refused')`.
+  2. Exit 4 stored as a normal baseline: `test_an_empty_baseline_is_recorded_as_empty`, `(False, None, …) == (True, 'all named paths are created by the task', None, None)`.
+  3. Exit 4 treated as red for a test no task creates: `test_an_absent_red_test_no_task_creates_is_a_preflight_stop`, `('done', None) == ('failed', 'preflight')`.
+  4. No counterfactual: `test_the_red_test_must_fail_without_the_change` (done in one iteration with `assert True`: `not enough values to unpack (expected 2, got 1)`).
+  5. The counterfactual copying the whole final tree: `test_the_counterfactual_runs_against_the_code_before_the_change`, "your red test passes against the code before your change … with only src/x.py, tests/test_new.py copied in: exit 0".
+  6. No final gate: `test_final_suite_gates_plan_done`, `('done', None) == ('failed', 'final_suite')`.
+  7. Note names back in the table: `test_approve_never_cuts_a_file_name_at_80_columns`, "the note's name was cut before the question".
+- **Live check:** Mohamed's, after this commit (Part D).
+
 ## Key decisions
 
 - ★ **No unapproved plan touches the vault.** Plans are validated in full and held in the queue (Op.WRITE_PLAN into `plans/`); the generic `apply` refuses them, so approval (`approve_plan`) always writes the plan and its new decisions together.
@@ -451,6 +473,10 @@
 - ★ **Each task's baseline is measured once, before its first iteration, and stored; a resume never re-measures it.**
 - ★ **A run stops at the first unfinished task.** question, checkin, daily_cap, and interrupted resume with `/run`; max_iterations, budget, honest_done_refused, and preflight are failures that Claude fixes with `revise_plan` after `read_runs`.
 - **A task whose red test already passes doesn't start:** it has no honest done-condition.
+- ★ **A baseline always measures something:** the whole suite's test IDs at every task start, and a `done_when` run that measured nothing is recorded as empty, never as zero tests.
+- ★ **A red test must be red for the right reason, and must fail without the change** (the counterfactual against the task's start commit with only the red-test files copied in).
+- ★ **A plan is done only when the whole suite passes on its branch.**
+- **A config change checks in before done is declared.**
 - **A running plan run holds an OS lock for its life;** a free lock on a `running` row means its process is gone, and a queue open reconciles it to interrupted.
 - **Text that reaches Claude names no slash command** except in a sentence addressed to Mohamed; stored stop texts name none, and the terminal adds the command to type.
 - ★ **`validate_plan` returns every error at once,** each naming its field and task id, so one round trip tells Claude everything to fix.
@@ -607,8 +633,6 @@ Commit 13: context sets.
 `--retry` for failed plan tasks.
 
 lint: warn on vault templates that drift from package templates.
-
-A plan task's baseline when `done_when` names a file the task creates: pytest runs nothing (exit 4, 0 collected), so the count and node-ID guards constrain nothing; measure the baseline over the named paths that exist too.
 
 validate_plan could check that a red_test names a test file (`/run`'s preflight does, at the task's start).
 

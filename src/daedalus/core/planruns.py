@@ -54,6 +54,7 @@ class PlanRun:
     started_at: str
     ended_at: str | None
     updated_at: str
+    final_output: str | None = None  # the full suite's output, when the final gate failed
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ class PlanTask:
 
 
 _RUN_COLS = ("id", "plan_change_id", "project", "slug", "version", "branch", "worktree_path", "wt_slug", "status",
-             "stop_reason", "stop_text", "started_at", "ended_at", "updated_at")
+             "stop_reason", "stop_text", "started_at", "ended_at", "updated_at", "final_output")
 _TASK_COLS = ("plan_run_id", "task_id", "idx", "summary", "status", "stop_reason", "run_id", "base", "baseline",
               "iterations", "cost_usd", "text", "started_at", "ended_at")
 
@@ -144,7 +145,7 @@ def create(*, plan_change_id: str, project: str, slug: str, version: int, branch
         try:
             con.execute(f"INSERT INTO plan_runs ({', '.join(_RUN_COLS)}) VALUES ({', '.join('?' * len(_RUN_COLS))})",
                         (run_id, plan_change_id, project, slug, version, branch, worktree_path, wt_slug, "pending",
-                         None, None, now, None, now))
+                         None, None, now, None, now, None))
             for i, (tid, summary) in enumerate(task_rows, 1):
                 con.execute("INSERT INTO plan_tasks (plan_run_id, task_id, idx, summary, status) VALUES "
                             "(?, ?, ?, ?, 'pending')", (run_id, tid, i, summary))
@@ -156,11 +157,12 @@ def create(*, plan_change_id: str, project: str, slug: str, version: int, branch
 
 
 def set_run(run_id: str, status: str, *, reason: str | None = None, text: str | None = None,
-            ended: bool = False) -> None:
+            ended: bool = False, final_output: str | None = None) -> None:
     now = queue._now()
     with queue.connect() as con:
         con.execute("UPDATE plan_runs SET status = ?, stop_reason = ?, stop_text = ?, updated_at = ?, "
-                    "ended_at = ? WHERE id = ?", (status, reason, text, now, now if ended else None, run_id))
+                    "ended_at = ?, final_output = ? WHERE id = ?",
+                    (status, reason, text, now, now if ended else None, final_output, run_id))
 
 
 def set_task(plan_run_id: str, task_id: str, **fields: Any) -> None:

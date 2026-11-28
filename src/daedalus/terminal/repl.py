@@ -820,16 +820,24 @@ class Repl:
             table.add_column(col)
         for i, d in enumerate(pv.decisions, 1):
             if d.is_new:
-                note = f" → decisions/{stems[i]}.md" if stems and i in stems else ""
-                table.add_row(Text(d.category), Text(d.choice), Text(f"NEW: binding once approved{note}"),
-                              style="bold yellow")
+                table.add_row(Text(d.category), Text(d.choice), Text("NEW: binding once approved"), style="bold yellow")
             else:
                 table.add_row(Text(d.category), Text(d.choice), Text(f"cited {d.basis}"))
         self.console.print(table)
+        # File names never go in a table cell, where they'd be cut: each prints whole, on its own line.
+        for i, d in enumerate(pv.decisions, 1):
+            if d.is_new and stems and i in stems:
+                self.say_path(f"  decision {i} → ", f"decisions/{stems[i]}.md", "yellow")
+            if d.consequences:
+                self.console.print(Text(f"  decision {i} consequences: {d.consequences}"))
         if new:
             self.console.print(Text(f"Approving this plan makes {new} new decision{'s' if new != 1 else ''} "
                                     "binding.", style="bold yellow"))
         return new
+
+    def say_path(self, prefix: str, path: str, style: str = "") -> None:
+        """A line naming a file: never wrapped or cut, so the name can be copied whole at any width."""
+        self.console.print(Text(prefix + path, style=style), soft_wrap=True)
 
     def approve_plan(self, change_id: str) -> None:
         """/approve on a plan: re-check it, show the decisions again, and write nothing without an explicit y."""
@@ -851,8 +859,9 @@ class Repl:
             self.console.print(f"not approved; {change_id} stays pending. Nothing was written.")
             return
         done = plans.approve_plan(self.session, change_id, session_cap_usd=self.cfg.session_cap_usd)
-        self.console.print(Text(f"approved plan {done.slug} v{done.version} in commit {done.commit_sha[:7]}: "
-                                f"{done.plan_ref}" + "".join(f", {r}" for r in done.decision_refs)))
+        self.console.print(Text(f"approved plan {done.slug} v{done.version} in commit {done.commit_sha[:7]}:"))
+        for ref in (done.plan_ref, *done.decision_refs):
+            self.say_path("  ", ref)
         if done.decision_refs:
             self.console.print(Text(f"{len(done.decision_refs)} new decision(s) are now precedent. /run "
                                     f"{done.slug} runs its tasks.", style="green"))

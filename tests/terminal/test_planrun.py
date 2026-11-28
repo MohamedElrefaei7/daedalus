@@ -92,7 +92,8 @@ def test_tasks_run_in_order_on_one_branch_and_t2_sees_t1s_work(proj, fake) -> No
                              ("write_code", {"rel_path": "tests/test_y2.py", "content": "def test_y2():\n    pass\n"}),
                              done="t2 done")]
     # t1: red test, baseline, check. t2: no red run (its test file is one it writes), baseline, check.
-    runner = Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2), pytest_out(passed=3))
+    runner = Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2), pytest_out(passed=3),
+                    pytest_out(passed=3))  # … and the final full-suite gate
     ui = UI()
     run = runner_for(proj, fake, ui, runner).run("mathx")
     assert run.status == "done" and run.branch == "agent/plan-mathx-v1"
@@ -106,7 +107,7 @@ def test_tasks_run_in_order_on_one_branch_and_t2_sees_t1s_work(proj, fake) -> No
     assert sorted(p.name for p in (proj.alpha / "logs").glob("plan-mathx-v1-*")) == \
         ["plan-mathx-v1-t1-01.md", "plan-mathx-v1-t2-01.md"]
     assert "t1 · task t1 · 0/2 iterations · $0.00 of $0.50" in ui.said
-    assert "every task is done" in ui.said[-1]
+    assert "every task is done and the full suite passes" in ui.said[-1]
     # Only Mohamed merges: nothing was merged, and dropping the unmerged branch still needs force.
     assert git(proj.alpha_repo, "branch", "--merged", "HEAD").count("plan-mathx-v1") == 0
     with pytest.raises(worktree.WorktreeError, match="not merged"):
@@ -156,7 +157,7 @@ def test_a_red_test_that_already_passes_stops_with_preflight(proj, fake) -> None
 
 @pytest.mark.parametrize("change, words", [
     ({"protected": ["tests/test_nope.py"]}, None),
-    ({"red_test": "tests/test_other.py::test_o fails"}, "doesn't list it in files"),
+    ({"red_test": "tests/test_other.py::test_o fails"}, "lists it in files"),
     ({"red_test": "the CLI prints 5"}, "names no test file"),
     ({"done_when": "ruff check"}, "rule 7"),
 ])
@@ -183,7 +184,7 @@ def test_a_task_too_big_for_todays_room_stops_with_daily_cap(proj, fake) -> None
     assert worktree.records("alpha")  # the branch exists; the task just didn't start
     # Resumable: with room again, /run starts it.
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"}))]
-    again = runner_for(proj, fake, UI(), Runner(RED, RED, pytest_out(passed=2))).run("mathx")
+    again = runner_for(proj, fake, UI(), Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2))).run("mathx")
     assert again.id == run.id and again.status == "done"
 
 
@@ -216,8 +217,12 @@ def test_resume_uses_the_stored_baseline(proj, fake) -> None:
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"}),
                              done="fixed test_x")]
     # One check; a second result is scripted so a resume that wrongly re-measures reaches the verdict.
-    again = runner_for(proj, fake, UI(), Runner(pytest_out(passed=1), pytest_out(passed=1))).run("mathx")
+    resumed = Runner(pytest_out(passed=1), pytest_out(passed=1))
+    again = runner_for(proj, fake, UI(), resumed).run("mathx")
     t1 = planruns.task(again.id, "t1")
+    # Only the check's own collections (done_when's, then the whole suite's at done): none for a new baseline.
+    assert resumed.collect_calls == [["pytest", "--collect-only", "-q"]] * 2
+    assert "tests/test_y.py::test_y" in stored["suite_node_ids"]
     assert (t1.status, t1.stop_reason) == ("failed", "honest_done_refused"), t1.text
     assert "tests/test_y.py::test_y" in t1.text and t1.baseline == stored
     state = loop.load_state(t1.run_id)
@@ -239,10 +244,10 @@ def test_a_question_stops_the_run_and_resumes_after_the_answer(proj, fake) -> No
     accept.answer_question(plain(proj), qid, "1")
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"})),
                        *turn(("write_code", {"rel_path": "tests/test_y2.py", "content": "def test_y2():\n    pass\n"}))]
-    runner = Runner(pytest_out(passed=2), pytest_out(passed=2), pytest_out(passed=3))
+    runner = Runner(pytest_out(passed=2), pytest_out(passed=2), pytest_out(passed=3), pytest_out(passed=3))
     done = runner_for(proj, fake, UI(), runner).run("mathx")
     assert done.status == "done" and statuses(run.id) == [("t1", "done", None), ("t2", "done", None)]
-    assert len(runner.calls) == 3, "t1 resumed without a new baseline or red run; t2 started fresh"
+    assert len(runner.calls) == 4, "t1 resumed without a new baseline or red run; t2 started fresh; the final gate"
 
 
 def test_done_tasks_are_never_rerun(proj, fake) -> None:
@@ -253,9 +258,9 @@ def test_done_tasks_are_never_rerun(proj, fake) -> None:
     assert statuses(run.id) == [("t1", "done", None), ("t2", "stopped", "question")]
     accept.answer_question(plain(proj), loop.load_state(planruns.task(run.id, "t2").run_id)["question"]["id"], "1")
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_y2.py", "content": "def test_y2():\n    pass\n"}))]
-    runner = Runner(pytest_out(passed=3))
+    runner = Runner(pytest_out(passed=3), pytest_out(passed=3))
     runner_for(proj, fake, UI(), runner).run("mathx")
-    assert statuses(run.id)[0] == ("t1", "done", None) and len(runner.calls) == 1, "t1 ran again"
+    assert statuses(run.id)[0] == ("t1", "done", None) and len(runner.calls) == 2, "t1 ran again"
 
 
 def test_a_running_row_with_no_live_process_is_reconciled(proj) -> None:
@@ -353,7 +358,7 @@ def test_run_and_runs_and_plans_in_the_repl(proj, fake) -> None:
     repl = Repl(load_session(proj.registry_path, state_file), Config(), fake.client(),
                 Console(file=buf, width=200, force_terminal=False, color_system=None),
                 registry_path=proj.registry_path, state_path=state_file)
-    repl.runner = Runner(RED, RED, pytest_out(passed=2))
+    repl.runner = Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2))
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"}),
                              done="made test_x pass")]
     lines = ["/plans", "/run mathx", "/runs", "/plans", "/runs nothing-here"]
@@ -361,7 +366,7 @@ def test_run_and_runs_and_plans_in_the_repl(proj, fake) -> None:
     text = buf.getvalue()
     assert "mathx v1  plans/mathx-v1.md  not run yet (/run mathx-v1)" in text
     assert "t1 · task t1 · 0/2 iterations · $0.00 of $0.50" in text
-    assert "── iteration 1 of 2 ──" in text and "every task is done on agent/plan-mathx-v1" in text
+    assert "── iteration 1 of 2 ──" in text and "every task is done and the full suite passes on agent/plan-mathx-v1" in text
     assert "plan mathx-v1 · run " in text and "t1 · task t1 · done · 1 iteration(s)" in text
     assert "mathx v1  plans/mathx-v1.md  run done · t1 done" in text
     assert "error: no plan 'nothing-here' in alpha" in text

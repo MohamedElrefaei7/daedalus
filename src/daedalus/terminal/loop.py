@@ -49,6 +49,8 @@ from daedalus.core.session import Session
 from daedalus.sandbox import runner as sandbox_runner
 from daedalus.sandbox import venv as venvs
 from daedalus.sandbox.config import load_config
+from daedalus.sandbox.errors import SandboxError
+from daedalus.core.policy import PolicyError
 
 from . import ledger
 from .agent import Agent, Events
@@ -197,6 +199,21 @@ def _counts_text(c: dict | None) -> str:
     return f"collected {k.collected}, skipped {k.skipped}, xfailed {k.xfailed}"
 
 
+def baseline_text(b: dict) -> str:
+    """The stored baseline in words: done_when's measurement (or that it's empty), and the whole suite's tests."""
+    if b.get("empty"):
+        head = f"done_when baseline: empty ({b.get('reason')})"
+    else:
+        head = (f"done_when baseline: {_counts_text(b['counts'])}, " if b.get("counts") else "done_when baseline: ") \
+            + f"exit {b.get('exit_code')}"
+    if b.get("dropped"):
+        head += f" (not yet there, so left out: {', '.join(b['dropped'])})"
+    if "suite_node_ids" in b:
+        head += ("; whole suite at the start: " + (f"{len(b['suite_node_ids'])} tests" if not b.get("suite_error")
+                                                   else f"not listed ({b['suite_error']})"))
+    return head
+
+
 def _resume(state: dict) -> str:
     """The command that resumes this run: /goal resume for a goal note, /run <plan> for a plan task."""
     return state.get("resume_hint") or "/goal resume"
@@ -217,6 +234,8 @@ class Loop:
         self.meter = meter or Meter()
         self.runner = runner or sandbox_runner.run
         self.proposals: list[str] = []  # made by the run's agents (questions), for /end's review
+        # Called with the state when every other guard held; returns one more Guard (or None). /run sets it.
+        self.after_check: Callable[[dict], goals.Guard | None] | None = None
 
     # Start ------------------------------------------------------------------------------
 
@@ -250,31 +269,61 @@ class Loop:
         }
 
     def measure_baseline(self, state: dict, goal: Goal) -> tuple[dict, str]:
-        """done_when, sandboxed, before any edit: (the baseline, the check's output). Raises GoalError if a pytest
-        check prints no summary line, since the honest-done guards couldn't be checked."""
+        """Before any edit: (the baseline, the done_when run's output). Two measurements:
+
+        ★ done_when, with any path it names that doesn't exist yet dropped. If nothing is left, or pytest runs
+        nothing (exit 4 or 5), the baseline is recorded as empty, never as a measurement of zero tests.
+        ★ The whole suite's test IDs (`pytest --collect-only -q`), whatever done_when names, so a test deleted
+        or renamed anywhere is caught at done.
+
+        Raises GoalError if a pytest check that ran prints no summary line."""
         wt = Path(state["wt_path"])
-        result = self.runner(self.run_session(state), list(goal.argv), wt)
-        counts = goals.parse_pytest(result.stdout_tail) if goal.is_pytest else None
-        if goal.is_pytest and counts is None:
-            raise GoalError(f"`{' '.join(goal.argv)}` printed no pytest summary line at the start (exit "
-                            f"{result.exit_code}), so the honest-done guards couldn't be checked:\n"
-                            f"{_tail_lines(result.stdout_tail + result.stderr_tail, 15)}")
-        baseline = {"exit_code": result.exit_code, "counts": counts.__dict__ if counts else None,
-                    "node_ids": [], "collection_errors": [], "test_files": []}
+        s = self.run_session(state)
+        argv, dropped = (goals.drop_missing_paths(goal.argv, wt) if goal.is_pytest else (list(goal.argv), []))
+        baseline: dict[str, Any] = {"exit_code": None, "counts": None, "node_ids": [], "collection_errors": [],
+                                    "test_files": [], "empty": False, "reason": None, "argv": argv,
+                                    "dropped": dropped}
+        output = ""
+        if goal.is_pytest and dropped and not goals.named_paths(argv):
+            baseline.update(empty=True, reason="all named paths are created by the task")
+        else:
+            result = self.runner(s, argv, wt)
+            output = result.stdout_tail
+            baseline["exit_code"] = result.exit_code
+            if goal.is_pytest and goals.classify_run(result.exit_code, result.stdout_tail,
+                                                     result.stderr_tail) == "absent":
+                what = "no such file or test" if result.exit_code == 4 else "no tests collected"
+                baseline.update(empty=True, reason=f"pytest ran nothing (exit {result.exit_code}: {what})")
+            elif goal.is_pytest:
+                counts = goals.parse_pytest(result.stdout_tail)
+                if counts is None:
+                    raise GoalError(f"`{' '.join(argv)}` printed no pytest summary line at the start (exit "
+                                    f"{result.exit_code}), so the honest-done guards couldn't be checked:\n"
+                                    f"{_tail_lines(result.stdout_tail + result.stderr_tail, 15)}")
+                listed = goals.parse_collect(self.runner(s, goals.collect_argv(argv), wt).stdout_tail)
+                baseline.update(counts=counts.__dict__, node_ids=list(listed.node_ids),
+                                collection_errors=list(listed.errors))
         if goal.is_pytest:
-            listed = goals.parse_collect(self.runner(self.run_session(state), goals.collect_argv(goal.argv),
-                                                     wt).stdout_tail)
-            baseline.update(node_ids=list(listed.node_ids), collection_errors=list(listed.errors),
-                            test_files=list(goals.base_test_files(wt, state["base"])))
-        return baseline, result.stdout_tail
+            baseline["test_files"] = list(goals.base_test_files(wt, state["base"]))
+        baseline.update(self.collect_suite(s, wt))
+        return baseline, output
+
+    def collect_suite(self, s: Session, wt: Path) -> dict[str, Any]:
+        """The whole suite's test IDs and the files that failed to collect, or why they couldn't be listed."""
+        try:
+            listed = self.runner(s, goals.collect_argv(("pytest",)), wt)
+        except (PolicyError, SandboxError) as e:
+            return {"suite_node_ids": [], "suite_collection_errors": [], "suite_error": str(e)}
+        parsed = goals.parse_collect(listed.stdout_tail)
+        return {"suite_node_ids": list(parsed.node_ids), "suite_collection_errors": list(parsed.errors),
+                "suite_error": None}
 
     def begin(self, state: dict, baseline: dict, output: str) -> dict:
         """Record the baseline, say it, and run the iterations."""
         state["baseline"] = baseline
         state["last_output"] = output[-MESSAGE_TAIL_CHARS:]
         save(state)
-        counts = _counts_text(baseline["counts"]) + ", " if baseline["counts"] else ""
-        self.ui.say(f"  baseline: {counts}exit {baseline['exit_code']}", "dim")
+        self.ui.say(f"  baseline: {baseline_text(baseline)}", "dim")
         return self.go(state)
 
     def start(self, ref: str) -> dict:
@@ -308,6 +357,14 @@ class Loop:
 
     def continue_run(self, state: dict, guidance: str | None = None) -> dict:
         """Resume a paused or stopped run from its saved state (its baseline is the one in ``state``)."""
+        last = state["iterations"][-1] if state["iterations"] else None
+        held_at_checkin = state.get("pause") == "checkin" or state.get("stop_reason") == "stopped at a check-in"
+        if held_at_checkin and last is not None and last["done"] and not guidance and self._unchanged_since(state, last):
+            # The check-in held back an iteration that was honestly done; resuming is Mohamed's go-ahead.
+            state["status"], state["pause"] = "running", None
+            self.ui.say(f"Resuming {state['run_id']}: iteration {last['n']} was done and held at a check-in; "
+                        "nothing has changed since, so it finishes as done.", "bold")
+            return self.finish(state, "done")
         if state["status"] == "stopped":  # another batch: the goal note's iterations and budget again
             state["limit_iterations"] = len(state["iterations"]) + state["max_iterations"]
             total = ledger.spent(run_id=state["run_id"])
@@ -328,6 +385,12 @@ class Loop:
         save(state)
         self.ui.say(f"Resuming {state['run_id']} at iteration {state['next']}.", "bold")
         return self.go(state)
+
+    def _unchanged_since(self, state: dict, last: dict) -> bool:
+        wt = state["wt_path"]
+        head = _git(wt, "rev-parse", "HEAD").strip()
+        expected = last.get("commit") or head
+        return head == expected and not worktree.uncommitted(self.run_session(state))
 
     def _commit_interrupted(self, state: dict) -> None:
         n = state["next"]
@@ -355,12 +418,22 @@ class Loop:
             if outcome in ("paused", "finished"):
                 return state
             last = state["iterations"][-1]
-            if last["done"]:
+            redirected = False
+            # ★ A config change checks in at once, before done is declared, so Mohamed sees every change to how
+            # tests are found or run while it happens, even in the iteration that finishes the goal.
+            if last["config"]:
+                choice = self.checkin(state, last)
+                if choice == "stop":
+                    return self.finish(state, "stopped at a check-in")
+                if choice == "paused":
+                    return state
+                redirected = choice == "redirect"
+            if last["done"] and not redirected:
                 return self.finish(state, "done")
             if len(state["iterations"]) >= state["limit_iterations"]:
                 return self.finish(state, "max_iterations")
             due = len(state["iterations"]) % state["checkin_every"] == 0
-            if last["config"] or due:
+            if due and not last["config"]:
                 choice = self.checkin(state, last)
                 if choice == "stop":
                     return self.finish(state, "stopped at a check-in")
@@ -370,7 +443,10 @@ class Loop:
     def message(self, state: dict, n: int) -> str:
         base = state["baseline"]
         counts = ""
-        if base["counts"]:
+        if base.get("empty"):
+            counts = (f", with no test skipped or xfailed (its baseline is empty: {base.get('reason')}), and every "
+                      "test in the whole suite at the start must still exist")
+        elif base["counts"]:
             c = Counts(**base["counts"])
             counts = (f" with at least {c.collected} tests collected and no more than {c.skipped} skipped and "
                       f"{c.xfailed} xfailed (the counts at the start)")
@@ -481,19 +557,26 @@ class Loop:
         state["last_output"] = out[-MESSAGE_TAIL_CHARS:]
         goal_like = Goal(state["goal_ref"], state["goal_slug"], None, "", tuple(state["argv"]), 0, 0.0, 1,
                          tuple(state["protected"]))
-        b = state["baseline"]
-        baseline = Baseline(b["exit_code"], Counts(**b["counts"]) if b["counts"] else None,
-                            tuple(b.get("node_ids", ())), tuple(b.get("collection_errors", ())),
-                            tuple(b.get("test_files", ())))
+        baseline = Baseline.from_dict(state["baseline"])
         changed = goals.protected_changes(state["wt_path"], state["base"], tuple(state["protected"]))
         now_ids = None
         if goal_like.is_pytest:
             listed = self.runner(s, goals.collect_argv(state["argv"]), Path(state["wt_path"]))
             now_ids = goals.parse_collect(listed.stdout_tail).node_ids
+        suite_now = None
+        if result.exit_code == 0 and baseline.suite_measured:  # at done: the whole suite, listed again
+            suite = self.collect_suite(s, Path(state["wt_path"]))
+            suite_now = None if suite["suite_error"] else tuple(suite["suite_node_ids"])
         verdict = goals.judge(goal_like, result.exit_code, result.stdout_tail, baseline, changed, now_ids,
-                              state["wt_path"])
+                              state["wt_path"], suite_now)
+        if verdict.done and self.after_check is not None:  # e.g. a plan task's counterfactual red test
+            extra = self.after_check(state)
+            if extra is not None:
+                verdict = goals.Verdict(verdict.done and extra.held, (*verdict.guards, extra))
         counts = goals.parse_pytest(result.stdout_tail) if goal_like.is_pytest else None
         missing = sorted(set(baseline.node_ids) - set(now_ids)) if now_ids is not None else None
+        if suite_now is not None:
+            missing = sorted(set(missing or ()) | (set(baseline.suite_node_ids) - set(suite_now)))
         record.update(exit_code=result.exit_code, counts=counts.__dict__ if counts else None,
                       guards=[g.__dict__ for g in verdict.guards], done=verdict.done, verdict=verdict.reason,
                       timed_out=result.timed_out, output_tail=_tail_lines(out, LOG_TAIL_LINES),
@@ -586,7 +669,7 @@ class Loop:
         lines = [f"Run {state['run_id']} ended: {state['stop_reason']}" +
                  (" — the goal is honestly done." if state["done"] else "."),
                  f"  iterations: {len(its)} of {state['limit_iterations']} · {_spend_text(state)}",
-                 f"  baseline: exit {b['exit_code']}" + (f", {_counts_text(b['counts'])}" if b["counts"] else "")]
+                 f"  {baseline_text(b)}"]
         if last is not None:
             lines.append(f"  last check: `{' '.join(state['argv'])}` exit {last['exit_code']}"
                          + (f", {_counts_text(last['counts'])}" if last["counts"] else ""))

@@ -193,11 +193,83 @@ def parse_pytest(output: str) -> Counts | None:
 
 @dataclass(frozen=True)
 class Baseline:
-    exit_code: int
+    exit_code: int | None  # None for an empty done_when baseline (nothing was run)
     counts: Counts | None  # pytest only
     node_ids: tuple[str, ...] = ()  # pytest only: what --collect-only listed at the start
     collection_errors: tuple[str, ...] = ()  # files pytest couldn't collect at the start
     test_files: tuple[str, ...] = ()  # test files in the base commit (the fallback when collection had errors)
+    # ★ commit 12b: a done_when run that measured nothing is recorded as empty, never as a measurement
+    empty: bool = False
+    reason: str | None = None
+    # ★ commit 12b: the whole suite's test IDs at the start, whatever done_when names
+    suite_node_ids: tuple[str, ...] = ()
+    suite_collection_errors: tuple[str, ...] = ()
+    suite_measured: bool = False  # False for runs that began before commit 12b, or when pytest can't run
+    suite_error: str | None = None
+
+    @classmethod
+    def from_dict(cls, b: dict) -> "Baseline":
+        return cls(b.get("exit_code"), Counts(**b["counts"]) if b.get("counts") else None,
+                   tuple(b.get("node_ids", ())), tuple(b.get("collection_errors", ())), tuple(b.get("test_files", ())),
+                   bool(b.get("empty")), b.get("reason"), tuple(b.get("suite_node_ids", ())),
+                   tuple(b.get("suite_collection_errors", ())), "suite_node_ids" in b and not b.get("suite_error"),
+                   b.get("suite_error"))
+
+
+# What a red-test run means -------------------------------------------------------------------
+
+_COLLECTION_ERROR = re.compile(r"found no collectors|^ERROR \S+\.py\b|\b\d+ errors? in [\d.]+s|error during collection",
+                               re.M)
+_ABSENT = re.compile(r"file or directory not found|not found:|no match in any of", re.I)
+
+
+def classify_run(exit_code: int, stdout: str, stderr: str = "") -> str:
+    """A pytest run of named tests, as "pass", "red", "absent", or "error".
+
+    0 passes. 1 (failures) and 2 (a collection or import error) are red. 4 is pytest's usage error: a named node
+    in a module that fails to import is reported as exit 4 with the collection error ("found no collectors"),
+    which is red for the right reason; "not found ... no match" with nothing run is absent, as is 5 (nothing
+    collected). Anything else is an error."""
+    said = f"{stdout}\n{stderr}"
+    if exit_code == 0:
+        return "pass"
+    if exit_code in (1, 2):
+        return "red"
+    if exit_code == 4 and _COLLECTION_ERROR.search(said):
+        return "red"
+    if exit_code == 5 or (exit_code == 4 and _ABSENT.search(said)):
+        return "absent"
+    return "error"
+
+
+# The paths done_when names -------------------------------------------------------------------
+
+# pytest options whose next argument is a value, never a path to collect.
+VALUE_OPTIONS = {"-k", "-m", "-p", "-c", "-o", "-W", "--rootdir", "--confcutdir", "--basetemp", "--deselect",
+                 "--ignore", "--ignore-glob", "--maxfail", "--tb", "--durations", "--junitxml", "--log-level",
+                 "--import-mode", "-n", "--timeout", "--override-ini", "--capture", "-r"}
+
+
+def named_paths(argv: tuple[str, ...] | list[str]) -> list[int]:
+    """Indexes of the arguments in a pytest argv that name files or folders to collect."""
+    out = []
+    for i, a in enumerate(argv[1:], 1):
+        if a.startswith("-") or argv[i - 1] in VALUE_OPTIONS:
+            continue
+        out.append(i)
+    return out
+
+
+def drop_missing_paths(argv: tuple[str, ...] | list[str], wt: Path | str) -> tuple[list[str], list[str]]:
+    """(argv without the paths that don't exist in ``wt`` yet, the dropped ones)."""
+    keep, dropped = [argv[0]], []
+    named = set(named_paths(argv))
+    for i, a in enumerate(argv[1:], 1):
+        if i in named and not os.path.lexists(Path(wt) / a.split("::", 1)[0]):
+            dropped.append(a)
+        else:
+            keep.append(a)
+    return keep, dropped
 
 
 # pytest --collect-only ----------------------------------------------------------------------
@@ -269,11 +341,16 @@ def _n(k: int, one: str, many: str) -> str:
 
 
 def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected_changed: list[str],
-          now_ids: tuple[str, ...] | None = None, wt: Path | str | None = None) -> Verdict:
+          now_ids: tuple[str, ...] | None = None, wt: Path | str | None = None,
+          suite_now: tuple[str, ...] | None = None) -> Verdict:
     guards = [Guard("exit", exit_code == 0, "the check exited 0" if exit_code == 0 else
                     f"the check failed (exit {exit_code})")]
     if goal.is_pytest:
         now, then = parse_pytest(output), baseline.counts
+        if baseline.empty:  # nothing was measured at the start: compare against zero, and say so
+            then = Counts()
+            guards.append(Guard("baseline", True, f"the done_when baseline is empty ({baseline.reason}), so its "
+                                                  "counts start from zero; the whole suite's tests are guarded"))
         if now is None or then is None:
             which = "now" if now is None else "at the start"
             for name in ("collected", "skipped", "xfailed"):
@@ -306,6 +383,25 @@ def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected
                                 f"all {len(baseline.test_files)} test files from the start still exist" if not missing
                                 else f"{_n(len(missing), 'test file from the start no longer exists', 'test files from the start no longer exist')}"
                                 f": {_listed(missing)} (the start had collection errors, so files are checked)"))
+    if exit_code == 0:  # ★ the whole suite's test IDs, whatever done_when names (checked at done)
+        if not baseline.suite_measured:
+            guards.append(Guard("suite", True, "the whole suite's tests weren't listed at the start ("
+                                + (baseline.suite_error or "the run began before they were") + ")"))
+        elif suite_now is None:
+            guards.append(Guard("suite", False, "the whole suite's tests couldn't be listed now (pytest "
+                                                "--collect-only), so the start's tests can't be checked"))
+        else:
+            gone = sorted(set(baseline.suite_node_ids) - set(suite_now))
+            missing_files = [f for f in baseline.suite_collection_errors
+                             if wt is not None and not f.startswith("(") and not (Path(wt) / f).exists()]
+            ok = not gone and not missing_files
+            detail = (f"all {len(baseline.suite_node_ids)} tests in the whole suite at the start still exist" if ok else
+                      "; ".join(x for x in (
+                          f"{_n(len(gone), 'test in the suite at the start no longer exists', 'tests in the suite at the start no longer exist')}: {_listed(gone)}" if gone else "",
+                          f"{_n(len(missing_files), 'file', 'files')} that failed to collect at the start no longer "
+                          f"{'exists' if len(missing_files) == 1 else 'exist'}: {_listed(missing_files)}"
+                          if missing_files else "") if x))
+            guards.append(Guard("suite", ok, detail))
     guards.append(Guard("protected", not protected_changed,
                         "no protected path changed" if not protected_changed else
                         f"protected {'path' if len(protected_changed) == 1 else 'paths'} changed: "

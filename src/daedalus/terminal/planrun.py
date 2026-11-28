@@ -35,6 +35,8 @@ import json
 import os
 import posixpath
 import re
+import secrets
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -53,6 +55,9 @@ from . import ledger
 from . import loop as goal_loop
 
 MAX_READ_RUNS_CHARS = 12_000
+FINAL_SUITE = ("pytest", "-q")
+FINAL_OUTPUT_CHARS = 4_000  # of the failing full suite's output, kept for read_runs
+COUNTERFACTUAL_PREFIX = "cf-"
 # Stop texts are stored in plan_tasks and sent to Claude by read_runs, so they name no slash command; the
 # terminal adds the command to type (_say_stop).
 STOP_TEXTS = {
@@ -60,7 +65,7 @@ STOP_TEXTS = {
                          "{tid}'s budget (${budget:.2f}); it can start after 00:00 UTC, or with a higher daily_cap_usd"),
     "daily_cap_during": "the daily cap stopped it mid-task; it can resume after 00:00 UTC",
     "session_cap": "the session cap stopped it; it resumes in a new terminal session",
-    "checkin_stop": "Mohamed stopped it at a check-in",
+    "checkin_stop": "Mohamed stopped it at",
 }
 # A test file a red test names: tests/test_x.py, optionally ::test_name (or a parametrized id).
 RED_REF = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*[\w.-]+\.py)((?:::[\w.\[\]-]+)*)")
@@ -75,6 +80,10 @@ def red_test_refs(red_test: str) -> list[tuple[str, str]]:
             seen.add(ref)
             out.append((m.group(1), ref))
     return out
+
+
+def _tail(text: str, n: int) -> str:
+    return "\n".join(text.rstrip().splitlines()[-n:])
 
 
 def _git(wt: str | Path, *args: str) -> str:
@@ -107,6 +116,7 @@ def _task_fields(session: Session, rec: queue.Proposal) -> list[dict[str, Any]]:
 class PlanRunner:
     def __init__(self, session: Session, ds, cfg, session_id: str, ui, meter=None, runner=None) -> None:
         self.loop = goal_loop.Loop(session, ds, cfg, session_id, ui, meter=meter, runner=runner)
+        self.loop.after_check = self.counterfactual  # A4: checked whenever every other guard held
         self.session, self.cfg, self.ui = session, cfg, ui
 
     @property
@@ -140,11 +150,13 @@ class PlanRunner:
         else:
             self.ui.say(f"Resuming plan run {run.id}: {slug} v{n} on {run.branch}.", "bold")
         with planruns.claim(self.session.active, run.id):
-            for goal, t, f in zip(tasks, planruns.tasks(run.id), fields):
+            for i, (goal, t, f) in enumerate(zip(tasks, planruns.tasks(run.id), fields)):
                 if t.status == "done":
                     continue  # done tasks never run again
+                earlier = {posixpath.normpath(x).casefold() for e in fields[:i] for x in e.get("files") or []
+                           if isinstance(x, str)}
                 try:
-                    status, reason, text = self.run_task(run, goal, t, f)
+                    status, reason, text = self.run_task(run, goal, t, f, earlier)
                 except RunError:  # refused before the task ran (e.g. its question is unanswered): as it was
                     planruns.set_run(run.id, "stopped", reason=run.stop_reason, text=run.stop_text, ended=True)
                     raise
@@ -158,10 +170,34 @@ class PlanRunner:
                     planruns.set_run(run.id, status, reason=reason, text=f"{t.task_id}: {text}", ended=True)
                     self._say_stop(run, t.task_id, status, reason, text)
                     return planruns.get(run.id)
+            # ★ A5: the plan is done only if the whole suite passes on its branch, after the last task.
+            failure = self.final_suite(run)
+            if failure is not None:
+                text, output = failure
+                planruns.set_run(run.id, "failed", reason="final_suite", text=text, ended=True, final_output=output)
+                self.ui.say(f"Plan {slug} v{n}: every task is done, but {text}. Not resumable: Claude reads it with "
+                            "read_runs and revises the plan.", "bold red")
+                self.ui.say(_tail(output, 30), "red")
+                return planruns.get(run.id)
             planruns.set_run(run.id, "done", ended=True)
-        self.ui.say(f"Plan {slug} v{n}: every task is done on {run.branch}. Review it with /wt diff {run.wt_slug}, "
-                    f"then /wt merge {run.wt_slug}.", "bold green")
+        self.ui.say(f"Plan {slug} v{n}: every task is done and the full suite passes on {run.branch}. Review it with "
+                    f"/wt diff {run.wt_slug}, then /wt merge {run.wt_slug}.", "bold green")
         return planruns.get(run.id)
+
+    def final_suite(self, run: PlanRun) -> tuple[str, str] | None:
+        """None if `pytest -q` passes on the plan branch; else (why, its output)."""
+        wt = Path(run.worktree_path)
+        self.ui.say(f"Final gate: the full suite (`pytest -q`) on {run.branch} …", "bold")
+        try:
+            result = self.loop.runner(replace(self.session, worktree=wt), list(FINAL_SUITE), wt)
+        except (PolicyError, SandboxError) as e:
+            return f"the full suite couldn't run on {run.branch}: {e}", ""
+        output = result.stdout_tail + (("\n" + result.stderr_tail) if result.stderr_tail.strip() else "")
+        if result.exit_code == 0:
+            return None
+        counts = goals.parse_pytest(result.stdout_tail)
+        what = f" ({counts.failed} failed, {counts.errors} errors)" if counts else ""
+        return f"the full suite failed on {run.branch} (exit {result.exit_code}{what})", output[-FINAL_OUTPUT_CHARS:]
 
     def _say_stop(self, run: PlanRun, tid: str, status: str, reason: str, text: str) -> None:
         ref = f"{run.slug}-v{run.version}"
@@ -178,23 +214,25 @@ class PlanRunner:
         self.ui.say(f"{t.task_id} · {t.summary} · {t.iterations}/{goal.max_iterations} iterations · "
                     f"${t.cost_usd:.2f} of ${goal.budget_usd:.2f}", "bold cyan")
 
-    def run_task(self, run: PlanRun, goal: Goal, t: PlanTask, f: dict) -> tuple[str, str | None, str | None]:
+    def run_task(self, run: PlanRun, goal: Goal, t: PlanTask, f: dict,
+                 earlier: set[str] = frozenset()) -> tuple[str, str | None, str | None]:
         if t.run_id is None:
-            return self._start_task(run, goal, t, f)
+            return self._start_task(run, goal, t, f, earlier)
         return self._resume_task(run, goal, t)
 
     def _stop(self, run: PlanRun, t: PlanTask, status: str, reason: str, text: str) -> tuple[str, str, str]:
         planruns.set_task(run.id, t.task_id, status=status, stop_reason=reason, text=text, ended_at=queue._now())
         return status, reason, text
 
-    def _start_task(self, run: PlanRun, goal: Goal, t: PlanTask, f: dict) -> tuple[str, str | None, str | None]:
+    def _start_task(self, run: PlanRun, goal: Goal, t: PlanTask, f: dict,
+                    earlier: set[str] = frozenset()) -> tuple[str, str | None, str | None]:
         now = ledger.utc_now()
         room = self.cfg.daily_cap_usd - ledger.spent(since_utc=ledger.start_of_day(now))
         if room < goal.budget_usd:
             return self._stop(run, t, "stopped", "daily_cap", STOP_TEXTS["daily_cap_before"].format(
                 room=max(room, 0), cap=self.cfg.daily_cap_usd, tid=t.task_id, budget=goal.budget_usd))
         self.header(goal, t, run)
-        problem = self.preflight(run, goal, f)
+        problem, red = self.preflight(run, goal, f, earlier)
         if problem:
             return self._stop(run, t, "failed", "preflight", problem)
         wt = Path(run.worktree_path)
@@ -203,11 +241,13 @@ class PlanRunner:
         state = self.loop.new_state(goal, rec, base=base)
         state.update(plan_run=run.id, task_id=t.task_id, goal_text=goal.text,
                      goal_link=f"[[plans/{run.slug}-v{run.version}]] task {t.task_id}",
-                     resume_hint=f"/run {run.slug}-v{run.version}")
+                     resume_hint=f"/run {run.slug}-v{run.version}", red=red)
         try:
             baseline, output = self.loop.measure_baseline(state, goal)
         except GoalError as e:
             return self._stop(run, t, "failed", "preflight", str(e))
+        baseline["red_test"] = red["status"]  # A3's record, stored with the baseline
+        baseline["red_exit"] = red["exit_code"]
         # ★ Stored before the first iteration; set_task refuses a second baseline for the same task.
         planruns.set_task(run.id, t.task_id, status="running", run_id=state["run_id"], base=base, baseline=baseline,
                           started_at=queue._now())
@@ -242,43 +282,119 @@ class PlanRunner:
 
     # Preflight ------------------------------------------------------------------------
 
-    def preflight(self, run: PlanRun, goal: Goal, f: dict) -> str | None:
-        """None if the task can start; else why not (a preflight stop)."""
+    def preflight(self, run: PlanRun, goal: Goal, f: dict,
+                  earlier: set[str] = frozenset()) -> tuple[str | None, dict[str, Any]]:
+        """(None, the red-test record) if the task can start; else (why not, …): a preflight stop.
+
+        ★ A3, red for the right reason. The red test's named tests that exist run sandboxed: exit 0 means it
+        already passes (stop); 1 or 2 (failures, or a collection or import error) is genuinely red; 4 or 5 (no
+        such file or test, nothing collected) is absent, which is allowed only if this task or an earlier one
+        lists the file in files (recorded as created_by_task); anything else stops."""
         wt = Path(run.worktree_path)
+        refs = red_test_refs(str(f.get("red_test", "")))
+        red: dict[str, Any] = {"status": None, "exit_code": None, "refs": [ref for _, ref in refs],
+                               "files": sorted({file for file, _ in refs})}
         missing = [p for p in goal.protected if not os.path.lexists(wt / p.rstrip("/"))]
         if missing:
             return (f"protected {', '.join(missing)} doesn't exist on {run.branch}, and a protected path must "
-                    "already be there when the task starts")
-        own = {posixpath.normpath(x).casefold() for x in f.get("files") or [] if isinstance(x, str)}
-        refs = red_test_refs(str(f.get("red_test", "")))
+                    "already be there when the task starts"), red
         if not refs:
             return ("red_test names no test file (path/test_x.py or path/test_x.py::test_name), so the red test "
-                    "can't be run before the task starts")
+                    "can't be run before the task starts"), red
+        creators = {posixpath.normpath(x).casefold() for x in f.get("files") or [] if isinstance(x, str)} | set(earlier)
+        created = lambda file: posixpath.normpath(file).casefold() in creators  # noqa: E731
         absent = [file for file, _ in refs if not (wt / file).is_file()]
-        stray = [file for file in absent if posixpath.normpath(file).casefold() not in own]
+        stray = [file for file in absent if not created(file)]
         if stray:
-            return (f"the red test's {', '.join(stray)} doesn't exist on {run.branch}, and this task doesn't list it "
-                    "in files, so nothing will write it")
+            return (f"the red test's {', '.join(stray)} doesn't exist on {run.branch}, and neither this task nor an "
+                    "earlier one lists it in files, so nothing will write it"), red
         try:
             config = load_config(self.session.active_repo)
             goals.check_argv_only(goal, config)
             venv = venvs.ensure_venv(self.session.active, self.session.active_repo, goal_loop.sandbox_runner.spawn)
             goals.authorize_check(goal, config, venv)  # rule 7 with the venv pin, which commit 11 couldn't check
         except (GoalError, SandboxError) as e:
-            return str(e)
+            return str(e), red
         present = [ref for file, ref in refs if file not in absent]
-        if present:
-            argv = ["pytest", "-q", *present]
-            try:
-                check_argv(argv, config)
-            except PolicyError as e:
-                return f"the red test can't run sandboxed: rule {e.rule}: {e.reason}"
-            s = replace(self.session, worktree=wt, protected=goal.protected)
-            result = self.loop.runner(s, argv, wt)
-            if result.exit_code == 0 and not absent:
-                return (f"red test already passes (`{' '.join(argv)}` exited 0 before the task started), so the task "
-                        "has no honest done-condition")
-        return None
+        if not present:
+            red.update(status="created_by_task")
+            return None, red
+        argv = ["pytest", "-q", *present]
+        try:
+            check_argv(argv, config)
+        except PolicyError as e:
+            return f"the red test can't run sandboxed: rule {e.rule}: {e.reason}", red
+        result = self.loop.runner(replace(self.session, worktree=wt, protected=goal.protected), argv, wt)
+        red["exit_code"] = result.exit_code
+        kind = goals.classify_run(result.exit_code, result.stdout_tail, result.stderr_tail)
+        if kind == "pass":
+            return (f"red test already passes (`{' '.join(argv)}` exited 0 before the task started), so the task "
+                    "has no honest done-condition"), red
+        if kind == "red":
+            red.update(status="red")
+            return None, red
+        if kind == "absent":
+            not_created = [file for file, _ in refs if not created(file)]
+            if not_created:
+                what = "no such file or test" if result.exit_code == 4 else "no tests collected"
+                return (f"the red test isn't red, it's absent (`{' '.join(argv)}` exited {result.exit_code}: {what}), "
+                        f"and neither this task nor an earlier one lists {', '.join(not_created)} in files"), red
+            red.update(status="created_by_task")
+            return None, red
+        return f"the red test couldn't run (`{' '.join(argv)}` exited {result.exit_code})", red
+
+    # A4: the counterfactual -------------------------------------------------------------
+
+    def counterfactual(self, state: dict) -> goals.Guard | None:
+        """★ The red test must fail without the task's change. Run when the red test was absent at preflight, or
+        when the task changed it: a temporary detached worktree at the task's start commit gets only the final
+        red-test files (and any conftest.py the task added or changed), and the red test must exit 1 or 2 there."""
+        red = state.get("red")
+        if not red:
+            return None  # not a plan task, or a run from before commit 12b
+        wt, base = Path(state["wt_path"]), state["base"]
+        files = list(red["files"])
+        changed = {p for p in _git(wt, "diff", "--name-only", "--no-renames", base, "--", *files).splitlines() if p}
+        changed |= {p for p in _git(wt, "ls-files", "--others", "--exclude-standard", "--", *files).splitlines() if p}
+        if red["status"] != "created_by_task" and not changed:
+            return goals.Guard("counterfactual", True, "not needed: the red test was red at the start, and the task "
+                                                       "didn't change it")
+        gone = [f for f in files if not (wt / f).is_file()]
+        if gone:
+            return goals.Guard("counterfactual", False, f"the red test's {', '.join(gone)} doesn't exist at the end, "
+                                                        "so it can't be checked against the code before your change")
+        touched = _git(wt, "diff", "--name-only", "--no-renames", base).splitlines() + \
+            _git(wt, "ls-files", "--others", "--exclude-standard").splitlines()
+        conftests = sorted({p for p in touched if posixpath.basename(p) == "conftest.py" and (wt / p).is_file()})
+        copied = [*files, *[c for c in conftests if c not in files]]
+        root = Path(os.path.realpath(worktree.WORKTREE_ROOT)) / self.session.active
+        root.mkdir(parents=True, exist_ok=True)
+        tmp = root / f"{COUNTERFACTUAL_PREFIX}{secrets.token_hex(4)}"
+        repo = self.session.active_repo
+        argv = ["pytest", "-q", *red["refs"]]
+        try:
+            _git(repo, "worktree", "add", "-q", "--detach", str(tmp), base)
+            for rel in copied:
+                (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(wt / rel, tmp / rel)
+            result = self.loop.runner(replace(self.session, worktree=tmp), argv, tmp)
+        except (PolicyError, SandboxError, subprocess.CalledProcessError) as e:
+            return goals.Guard("counterfactual", False, f"the red test couldn't be run against the code before your "
+                                                        f"change: {e}")
+        finally:
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(tmp)], capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+        where = f"`{' '.join(argv)}` at {base[:7]} with only {', '.join(copied)} copied in"
+        kind = goals.classify_run(result.exit_code, result.stdout_tail, result.stderr_tail)
+        if kind == "red":
+            return goals.Guard("counterfactual", True, f"the red test fails against the code before your change "
+                                                       f"({where}: exit {result.exit_code}), as it must")
+        if kind == "pass":
+            return goals.Guard("counterfactual", False, f"your red test passes against the code before your change "
+                                                        f"({where}: exit 0), so it proves nothing")
+        return goals.Guard("counterfactual", False, f"your red test didn't fail against the code before your change, "
+                                                    f"it didn't run ({where}: exit {result.exit_code})")
 
 
 def outcome(state: dict) -> tuple[str, str | None, str | None]:
@@ -290,8 +406,7 @@ def outcome(state: dict) -> tuple[str, str | None, str | None]:
             title = _question_title(q.get("id"))
             return "stopped", "question", f"asked {q.get('id')}: {title}"
         if pause == "checkin":
-            last = state["iterations"][-1]["summary"] if state["iterations"] else ""
-            return "stopped", "checkin", f"paused at a check-in after iteration {len(state['iterations'])}: {last}"
+            return "stopped", "checkin", "paused at " + _checkin_text(state)
         return "stopped", "interrupted", f"interrupted in iteration {state['next']}"
     if state.get("done"):
         return "done", None, None
@@ -299,7 +414,7 @@ def outcome(state: dict) -> tuple[str, str | None, str | None]:
     checked = [i for i in state["iterations"] if i.get("guards")]
     last = checked[-1] if checked else None
     if reason == "stopped at a check-in":
-        return "stopped", "checkin", STOP_TEXTS["checkin_stop"]
+        return "stopped", "checkin", f"{STOP_TEXTS['checkin_stop']}: " + _checkin_text(state)
     if reason == "the daily cap":
         return "stopped", "daily_cap", STOP_TEXTS["daily_cap_during"]
     if reason == "the session cap":
@@ -310,6 +425,14 @@ def outcome(state: dict) -> tuple[str, str | None, str | None]:
         return "failed", "budget", f"the task's budget ran out after {len(state['iterations'])} iteration(s)"
     return "failed", "max_iterations", (f"{len(state['iterations'])} iteration(s) and not done"
                                         + (f": {last['verdict']}" if last else ""))
+
+
+def _checkin_text(state: dict) -> str:
+    last = state["iterations"][-1] if state["iterations"] else {}
+    why = f"config changed: {', '.join(last['config'])}" if last.get("config") else "scheduled"
+    done = "; that iteration was otherwise done" if last.get("done") else ""
+    return (f"the check-in after iteration {len(state['iterations'])} ({why}{done}): "
+            f"{last.get('summary', '')}").rstrip(": ")
 
 
 def _question_title(change_id: str | None) -> str:
@@ -362,8 +485,14 @@ def task_summary(session: Session, t: PlanTask) -> dict[str, Any]:
     except GoalError:
         return out
     out["iterations"] = len(state["iterations"])
+    b = t.baseline or {}
+    out["baseline"] = {"text": goal_loop.baseline_text(b), "empty": bool(b.get("empty")), "reason": b.get("reason"),
+                       "exit_code": b.get("exit_code"), "left_out": b.get("dropped") or [],
+                       "suite_tests": len(b.get("suite_node_ids") or []) if "suite_node_ids" in b else None,
+                       "red_test": b.get("red_test"), "red_test_exit_code": b.get("red_exit")}
     checked = [i for i in state["iterations"] if i.get("guards")]
     last = checked[-1] if checked else None
+    guard = lambda name: next((g["detail"] for g in last["guards"] if g["name"] == name), None) if last else None  # noqa: E731
     out["honest_done"] = {
         "baseline": _counts((t.baseline or {}).get("counts")),
         "baseline_exit_code": (t.baseline or {}).get("exit_code"),
@@ -371,6 +500,8 @@ def task_summary(session: Session, t: PlanTask) -> dict[str, Any]:
         "missing_node_ids": None if last is None else last.get("missing_node_ids"),
         "protected_changed": None if last is None else last.get("protected_changed"),
         "verdict": None if last is None else last.get("verdict"),
+        "whole_suite": guard("suite"),
+        "counterfactual": guard("counterfactual"),
     }
     if state["iterations"]:
         it = state["iterations"][-1]
@@ -406,6 +537,10 @@ def read_runs(session: Session, plan_ref: str | None = None) -> dict[str, Any]:
         "started_at": run.started_at, "ended_at": run.ended_at,
         "tasks": [task_summary(session, t) for t in planruns.tasks(run.id)],
     }
+    if run.final_output is not None or run.stop_reason == "final_suite":
+        out["final_suite"] = {"passed": False, "output": run.final_output or ""}
+    elif run.status == "done":
+        out["final_suite"] = {"passed": True}
     return cap_output(out)
 
 
@@ -421,6 +556,9 @@ def cap_output(out: dict[str, Any], limit: int = MAX_READ_RUNS_CHARS) -> dict[st
             dropped += 1
             out["trimmed"] = (f"left out the {dropped} oldest iteration summaries to stay under {limit:,} characters; "
                               "each task's last_iteration and log link are kept")
+    if size() > limit and out.get("final_suite", {}).get("output"):
+        out["final_suite"]["output"] = "[… cut]\n" + out["final_suite"]["output"][-2000:]
+        out["trimmed"] = (out.get("trimmed", "") + "; the final suite's output was cut to its end").lstrip("; ")
     if size() > limit:
         out["diffstat_against_main"] = out["diffstat_against_main"][:1000] + "\n[… cut]"
         out["trimmed"] = (out.get("trimmed", "") + "; the diffstat was cut").lstrip("; ")
@@ -436,6 +574,10 @@ def format_runs(summary: dict[str, Any]) -> str:
         lines.append(f"  {t['id']} · {t['summary']} · {t['status']}"
                      + (f" ({t['stop_reason']})" if t.get("stop_reason") else "")
                      + f" · {t['iterations']} iteration(s) · ${t['cost_usd']:.4f} · ↑ {t['tokens_in']:,} ↓ {t['tokens_out']:,}")
+        if t.get("baseline"):
+            bl = t["baseline"]
+            red = f"; red test: {bl['red_test']}" if bl.get("red_test") else ""
+            lines.append(f"      {bl['text']}{red}")
         hd = t.get("honest_done")
         if hd and hd.get("last_check"):
             b, c = hd.get("baseline") or {}, hd["last_check"]
@@ -446,11 +588,18 @@ def format_runs(summary: dict[str, Any]) -> str:
                             if hd.get("protected_changed") else ""))
             if hd.get("verdict"):
                 lines.append(f"      {hd['verdict']}")
+            if hd.get("counterfactual"):
+                lines.append(f"      counterfactual: {hd['counterfactual']}")
         for key in ("question", "checkin", "note"):
             if t.get(key):
                 lines.append(f"      {key}: {t[key]}")
         if t.get("last_iteration"):
             lines.append(f"      last: {t['last_iteration']}  {t.get('log', '')}")
+    fs = summary.get("final_suite")
+    if fs:
+        lines.append("  final suite: " + ("passed" if fs["passed"] else "FAILED"))
+        if not fs["passed"] and fs.get("output"):
+            lines += ["    " + ln for ln in fs["output"].rstrip().splitlines()[-20:]]
     lines.append("  diff --stat against your checkout:")
     lines += ["    " + ln for ln in summary["diffstat_against_main"].splitlines()]
     if summary.get("trimmed"):
