@@ -131,8 +131,11 @@ class PlanRunner:
         tasks = [goals.load(self.session, f"plan:{rec.id}#{t.get('id')}") for t in fields]  # the launch rule
         run = planruns.for_plan(self.session.active, rec.id)
         if run is not None and run.status == "done":
-            raise RunError(f"plan {slug} v{n} already ran to done on {run.branch}; /wt diff {run.wt_slug}, then "
-                           f"/wt merge {run.wt_slug}")
+            if run.wt_slug in worktree.records(self.session.active):
+                raise RunError(f"plan {slug} v{n} already ran to done on {run.branch}; /wt diff {run.wt_slug}, then "
+                               f"/wt merge {run.wt_slug}")
+            raise RunError(f"plan {slug} v{n} already ran to done, and its worktree is gone (merged or dropped); "
+                           "there's nothing more to run. /plans lists plans waiting for approval")
         if run is not None and run.status == "failed":
             raise RunError(f"plan {slug} v{n}'s run stopped with a failure ({run.stop_reason}: {run.stop_text}), which "
                            "isn't resumable. Ask Claude to read the run (read_runs) and revise the plan (revise_plan); "

@@ -366,7 +366,7 @@ class Repl:
                 self.console.print(f"promoted {done.source_ref} → {done.target_ref} (status: accepted, source kept) "
                                    f"in commit {done.commit_sha[:7]}")
             elif name == "/help":
-                self.console.print(HELP)
+                self.console.print(Text(HELP))  # [dir], [text], [plan] aren't rich markup
             elif name == "/cost":
                 self.cost()
             elif name == "/pending":

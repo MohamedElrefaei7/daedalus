@@ -112,7 +112,10 @@ def test_tasks_run_in_order_on_one_branch_and_t2_sees_t1s_work(proj, fake) -> No
     assert git(proj.alpha_repo, "branch", "--merged", "HEAD").count("plan-mathx-v1") == 0
     with pytest.raises(worktree.WorktreeError, match="not merged"):
         worktree.drop(proj.registry, "alpha", run.wt_slug)
-    with pytest.raises(RunError, match="already ran to done"):
+    with pytest.raises(RunError, match="already ran to done on agent/plan-mathx-v1; /wt diff"):
+        runner_for(proj, fake, UI(), Runner()).run("mathx")
+    worktree.drop(proj.registry, "alpha", run.wt_slug, force=True)
+    with pytest.raises(RunError, match="its worktree is gone .* nothing more to run"):
         runner_for(proj, fake, UI(), Runner()).run("mathx")
 
 

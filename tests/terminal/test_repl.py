@@ -186,6 +186,8 @@ def test_pending_diff_approve_reject(gworld, fake, keyed) -> None:
     assert "usage: /reject <id> <reason>" in out
     assert "no pending proposals" in out
     assert "unknown command /bogus" in out
+    # /help prints its bracketed arguments, which rich would otherwise eat as markup
+    assert "/promote <note> [dir]" in out and "/goal resume [text]" in out and "/runs [plan]" in out
     assert queue.get(a.id).status == "applied" and queue.get(b.id).status == "rejected"
     assert (gworld.alpha / "inbox" / "a.md").read_text() == "# A\n"
     assert fake.requests == []

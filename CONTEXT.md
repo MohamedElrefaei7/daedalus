@@ -462,6 +462,7 @@
   6. No final gate: `test_final_suite_gates_plan_done`, `('done', None) == ('failed', 'final_suite')`.
   7. Note names back in the table: `test_approve_never_cuts_a_file_name_at_80_columns`, "the note's name was cut before the question".
 - **Live check:** Mohamed's, after this commit (Part D).
+- **Fix, found starting the live check:** `/help` printed through rich markup, so `[dir]`, `[text]`, and `[plan]` vanished from its lines (`/promote`'s and `/goal resume`'s since they were added); it's printed as plain text now, with a test that failed before. `/run` on a finished plan whose worktree is gone no longer tells you to diff and merge it.
 
 ## Key decisions
 
