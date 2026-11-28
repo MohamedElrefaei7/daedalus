@@ -53,6 +53,12 @@ from .meter import Interrupted, Reading, render
 
 log = logging.getLogger("daedalus.terminal")
 
+# Every slash command the REPL handles. Commands are Mohamed's: text sent to Claude names one only in a
+# sentence addressed to him (tests/mcp/test_client_text.py).
+COMMANDS = ("/new", "/vaults", "/vault", "/pull", "/drop", "/end", "/open", "/here", "/add", "/answer", "/promote",
+            "/wt", "/code", "/goal", "/review", "/cost", "/pending", "/plans", "/diff", "/approve", "/reject", "/help",
+            "/quit", "/exit")
+
 HELP = """\
 /new <name> --repo <path>  create <path>/vault/ from the template, commit it, register the project
 /vaults                list registered projects (* active, + pulled)

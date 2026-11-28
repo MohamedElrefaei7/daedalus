@@ -264,18 +264,52 @@ def test_real_pytest_passes_and_fails(live) -> None:
     assert "deliberate failure for the sandbox check" in bad.stdout_tail and "1 failed, 1 passed" in bad.stdout_tail
 
 
-def test_real_pytest_in_a_checkout_under_home() -> None:
-    """The throwaway worktrees live outside home; this one is scratch2's own checkout, so pytest's
-    upward config search really walks through home. The checkout is read-only to the run."""
+# The last scratch2 commit whose suite was green (the parent of 4968e32, which added Mohamed's red
+# tests/test_cli.py). Pinned so this sandbox test never depends on what's on scratch2's main.
+PINNED_SHA = "b50b5aeb7b8052eae2aeb52dd08d949ed0958e19"
+CHECKOUT_ROOT = Path.home() / ".cache" / "daedalus" / "test-checkouts"
+
+
+def pinned_checkout(repo: Path, ref: str, root: Path = CHECKOUT_ROOT) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    target = Path(os.path.realpath(root)) / uuid.uuid4().hex[:12]
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(target), ref],
+                   check=True, capture_output=True, text=True)
+    return target
+
+
+def remove_checkout(repo: Path, target: Path) -> None:
+    subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(target)],
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True, text=True)
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def test_real_pytest_in_a_checkout_under_home(tmp_path_factory) -> None:
+    """The throwaway worktrees live outside home; this one is a detached git worktree of scratch2 at
+    PINNED_SHA, under ~/.cache, so pytest's upward config search really walks through home. It's
+    read-only to the run."""
     registry = load_registry()
-    session = Session(registry, PROJECT)
-    repo = session.active_repo
-    assert HOME in repo.parents
-    before = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
-    result = runner.run(session, ["pytest", "-q"], repo)
-    assert result.exit_code == 0 and re.search(r"\b\d+ passed\b", result.stdout_tail), result  # however many
-    after = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
-    assert after == before
+    repo = registry.repos[PROJECT]
+    checkout = pinned_checkout(repo, PINNED_SHA)
+    try:
+        # Preconditions: the point of this test is the under-home read rule, so a checkout that drifts
+        # out of home (or into pytest's tmp folder, which is outside home) must fail loudly.
+        assert HOME in checkout.parents, f"{checkout} isn't under the home folder"
+        tmp_root = Path(os.path.realpath(tmp_path_factory.getbasetemp()))
+        assert tmp_root not in checkout.parents and Path(os.path.realpath("/tmp")) not in checkout.parents, \
+            f"{checkout} is under a temp folder, not home"
+        # No network: the venv is the one already built for this lock.
+        assert venv.lock_hash(checkout) == venv.lock_hash(repo), \
+            "PINNED_SHA's uv.lock isn't the one scratch2's venv is built from; pick a newer green commit"
+        session = Session(registry, PROJECT, worktree=checkout)
+        before = subprocess.run(["git", "status", "--porcelain"], cwd=checkout, capture_output=True, text=True).stdout
+        result = runner.run(session, ["pytest", "-q"], checkout)
+        assert result.exit_code == 0 and re.search(r"\b\d+ passed\b", result.stdout_tail), result
+        after = subprocess.run(["git", "status", "--porcelain"], cwd=checkout, capture_output=True, text=True).stdout
+        assert after == before
+    finally:
+        remove_checkout(repo, checkout)
 
 
 def test_the_child_sees_only_the_allowlisted_environment(live, monkeypatch) -> None:

@@ -230,6 +230,7 @@ def _task_errors(session: Session, tasks: Any, cap: float) -> list[str]:
     errors: list[str] = []
     seen: dict[str, int] = {}
     commands = _Commands(session)
+    earlier_files: set[str] = set()  # files listed by tasks with a lower index (A2: they may be protected later)
     for i, t in enumerate(tasks, 1):
         if not isinstance(t, dict):
             errors.append(f"tasks[#{i}]: must be a mapping with {', '.join(TASK_REQUIRED)}, not {type(t).__name__}")
@@ -271,11 +272,24 @@ def _task_errors(session: Session, tasks: Any, cap: float) -> list[str]:
                 errors.append(f"{where}.budget_usd: {b!r} is above the session cap (${cap:.2f}); a task can't "
                               "budget more than one session may spend")
         if "protected" in t:
-            errors += _protected_errors(session, where, t["protected"])
+            errors += _protected_errors(session, where, t["protected"], earlier_files)
+        earlier_files |= _norm_files(t.get("files"))
     return errors
 
 
-def _protected_errors(session: Session, where: str, raw: Any) -> list[str]:
+def _norm_files(files: Any) -> set[str]:
+    if not isinstance(files, list):
+        return set()
+    return {posixpath.normpath(f.strip()).casefold() for f in files if isinstance(f, str) and f.strip()}
+
+
+def _created_earlier(path: str, earlier_files: set[str]) -> bool:
+    """A protected path an earlier task creates: the file itself, or (for a folder) a file inside it."""
+    norm = posixpath.normpath(path.rstrip("/")).casefold()
+    return norm in earlier_files or any(f.startswith(norm + "/") for f in earlier_files)
+
+
+def _protected_errors(session: Session, where: str, raw: Any, earlier_files: set[str] = frozenset()) -> list[str]:
     if not isinstance(raw, list):
         what = f"a string ({raw!r})" if isinstance(raw, str) else type(raw).__name__
         return [f"{where}.protected: must be a list of repo-relative paths, not {what}"]
@@ -283,9 +297,11 @@ def _protected_errors(session: Session, where: str, raw: Any) -> list[str]:
         protected = normalize_protected(raw)
     except SessionError as e:
         return [f"{where}.protected: {e}"]
-    return [f"{where}.protected: {p!r} doesn't exist in {session.active_repo}; a protected path must name a file "
-            "or folder that's already there (add each path as its own list item)"
-            for p in protected if not os.path.lexists(session.active_repo / p.rstrip("/"))]
+    return [f"{where}.protected: {p!r} doesn't exist in {session.active_repo} and no earlier task lists it in "
+            "files; a protected path must name a file or folder that's already there, or one an earlier task "
+            "creates (add each path as its own list item)"
+            for p in protected
+            if not os.path.lexists(session.active_repo / p.rstrip("/")) and not _created_earlier(p, earlier_files)]
 
 
 def _body_errors(body: str) -> list[str]:

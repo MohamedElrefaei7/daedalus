@@ -357,7 +357,8 @@ def _propose(session: Session, vault: str, rel_path: str, content: str, source: 
     base_sha256 = base_content = None
     exists = os.path.lexists(auth.path)
     if kind == "create" and exists:
-        raise ProposalError(f"{auth.vault}:{auth.rel} already exists; that's an edit, so use propose_edit")
+        raise ProposalError(f"{auth.vault}:{auth.rel} already exists, and propose_note only creates new notes; "
+                            "pick another path")
     if kind == "edit":
         if not exists or not auth.path.is_file():
             raise ProposalError(f"{auth.vault}:{auth.rel} doesn't exist; that's a create, so use propose_note")

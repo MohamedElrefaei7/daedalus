@@ -182,6 +182,27 @@ def test_a_protected_path_that_doesnt_exist(pw) -> None:
     assert e.startswith("tasks[t2].protected:") and "doesn't exist" in e
 
 
+def test_a_later_task_may_protect_a_file_an_earlier_task_lists(pw) -> None:
+    """t1 creates tests/test_multiply.py, so t2 may protect it though it isn't on main yet (A2)."""
+    def change(fm):
+        fm["tasks"][0]["files"].append("tests/test_multiply.py")
+        fm["tasks"][1].update(protected=["tests/test_mathx.py", "tests/test_multiply.py"])
+    plans.submit(pw.session, "claude", "mathx", edit(change), BODY, session_cap_usd=CAP)
+
+
+def test_an_earlier_task_may_not_protect_a_file_a_later_task_lists(pw) -> None:
+    def change(fm):
+        fm["tasks"][1]["files"].append("tests/test_cli.py")
+        fm["tasks"][0].update(protected=["tests/test_cli.py"])
+    e = only_error(pw, edit(change))
+    assert e.startswith("tasks[t1].protected:") and "doesn't exist" in e and "no earlier task lists it in files" in e
+
+
+def test_a_protected_file_no_task_lists_is_refused(pw) -> None:
+    e = only_error(pw, edit(lambda fm: fm["tasks"][1].update(protected=["tests/test_nobody.py"])))
+    assert e.startswith("tasks[t2].protected:") and "no earlier task lists it in files" in e
+
+
 def test_protected_typed_into_one_item_is_refused(pw) -> None:
     e = only_error(pw, edit(lambda fm: fm["tasks"][1].update(protected=['["tests/test_mathx.py"]'])))
     assert e.startswith("tasks[t2].protected:")

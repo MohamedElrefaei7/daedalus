@@ -81,7 +81,7 @@ def test_size_cap(gworld) -> None:
 
 
 def test_propose_note_refuses_existing_target(gworld) -> None:
-    with pytest.raises(ProposalError, match="already exists; that's an edit"):
+    with pytest.raises(ProposalError, match="already exists, and propose_note only creates new notes"):
         propose_note(gworld.session, "alpha", "CONTEXT.md", "# CONTEXT\n", "claude", "s")
 
 

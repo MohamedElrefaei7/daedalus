@@ -72,7 +72,7 @@ class GateRefused(ProposalError):
 
 def _valid_basis_hint() -> str:
     return ("Cite an accepted note in this project's decisions/ or an accepted shared practice "
-            "(shared:practices/), or use basis 'new' to ask the human with ask_user")
+            "(shared:practices/), or use basis 'new' if nothing does, so Mohamed decides")
 
 
 def check_basis(session: Session, category: str, choice: str, basis: str) -> Verdict:
@@ -99,7 +99,7 @@ def check_basis(session: Session, category: str, choice: str, basis: str) -> Ver
     if match.vault in session.pulled:
         return REFUSED(f"{ref} is a decision of the pulled project {match.vault!r}, and another project's "
                        f"decisions don't bind {session.active!r}. If it should apply here too, promote it into a "
-                       "shared practice (shared:practices/) and cite that, or use basis 'new' to ask.")
+                       "shared practice (shared:practices/) and cite that, or use basis 'new', so Mohamed decides.")
     folder = PRECEDENT_FOLDERS["active" if match.vault == session.active else SHARED_NAME]
     if not match.rel_path.startswith(folder):
         where = "this project's decisions/" if folder == "decisions/" else "the shared practices/"
@@ -113,8 +113,8 @@ def check_basis(session: Session, category: str, choice: str, basis: str) -> Ver
     status = note.frontmatter.get("status")
     if status != "accepted":
         how = ("cite the note that superseded it" if status == "superseded" else
-               "it becomes precedent only once accepted (by /answer or /promote)")
-        return REFUSED(f"{ref} is {status!r}, not accepted: {how}. Or use basis 'new' to ask the human.")
+               "it becomes precedent only once Mohamed accepts it (with /answer or /promote)")
+        return REFUSED(f"{ref} is {status!r}, not accepted: {how}. Or use basis 'new', so Mohamed decides.")
     return OK(note, ref)
 
 

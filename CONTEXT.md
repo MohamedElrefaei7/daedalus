@@ -401,6 +401,15 @@
   - `find_precedent` told Claude "ask with ask_user and stop", a tool it doesn't have. Claude submitted anyway and said why. Fixed: daedalus-mcp's note now says to give the decision basis `"new"` in a plan, or ask in chat; the agent's note is unchanged (one test).
   - The live sandbox test `test_real_pytest_in_a_checkout_under_home` now fails (exit 2), because scratch2's checkout holds your red `tests/test_cli.py` (`ImportError: cannot import name 'main'`). It's not a regression: the other 6 tests pass sandboxed, and it goes green when the CLI task lands.
 
+### 2026-11-27 — Commit 11 follow-ups: pinned sandbox checkout, protected paths, client text, v3→v4 migration test
+
+- **A1, the live sandbox test:** `test_real_pytest_in_a_checkout_under_home` now runs in `git worktree add --detach` of scratch2 at `PINNED_SHA` = `b50b5ae` (the parent of `4968e32`, scratch2's last green commit; its `uv.lock` is the one the cached venv `scratch2-490d1d46bfd8` was built from, so no network), under `~/.cache/daedalus/test-checkouts/<random>`, removed with `worktree remove --force` and `prune` in a `finally`. Preconditions: the checkout is under home, and under neither pytest's tmp folder nor `/tmp`. Bites: pointed at `main`, it failed (`exit_code=2 … 1 error during collection`); moved under `/tmp`, the precondition failed (`/private/tmp/daedalus-test-checkouts/… isn't under the home folder`).
+- **A2, protected paths an earlier task creates:** a `protected` path that doesn't exist is allowed only if a lower-index task lists it in `files`; the error now says "doesn't exist … and no earlier task lists it in files". `red_test` had no existence check, so it was left alone (`/run`'s preflight will check it). 3 tests; bite (every task's files counted) failed `test_an_earlier_task_may_not_protect_a_file_a_later_task_lists` ("DID NOT RAISE PlanInvalid").
+- **A3, clients only hear about tools they have:** `tests/mcp/test_client_text.py` (5 tests). It found three more leaks besides `find_precedent`'s, all fixed: the gate's refusal hint told plan submitters to "use basis 'new' to ask the human with ask_user" (twice); a proposed basis said it becomes precedent "once accepted (by /answer or /promote)", with no mention of Mohamed; and `propose_note` on an existing note said "use propose_edit". New `repl.COMMANDS`. Bite: Claude's note back to "ask with ask_user and stop" failed `test_claude_hears_only_about_its_own_tools` ("claude is told about ask_user, which it doesn't have").
+- **A4, the v3→v4 migration:** `tests/core/queue_fixtures.py` builds queue files from frozen v3 and v4 DDL (for commit 12's v5 too): a row in every v3 status with every column filled, a three-path and a one-path change set with BLOBs, plus ledger rows. Opening it keeps every column of every row, `foreign_key_check` is empty, `integrity_check` is ok, and the ledger is untouched; a failure injected after the copy, before the old table is dropped, leaves the file at v3 with every row. Bite: copying one column fewer failed `test_v3_to_v4_keeps_every_row_and_column`.
+- **A5, the plan template:** both scratch vaults' `templates/plan.md` were byte-identical to the old package template, so they were replaced: scratch `b28bf95`, scratch2 `3718a70` (`templates: plan.md v2 format`). The shared vault has no `plan.md`.
+- **Tests:** 986 by default (+11), 14 live, all passing.
+
 ## Key decisions
 
 - ★ **No unapproved plan touches the vault.** Plans are validated in full and held in the queue (Op.WRITE_PLAN into `plans/`); the generic `apply` refuses them, so approval (commit 12) always writes the plan and its new decisions together.
@@ -410,7 +419,10 @@
 - ★ **Plans are Claude's job:** the four plan tools are only in daedalus-mcp (thirteen tools); neither DeepSeek profile has them.
 - ★ **Every version is kept.** A revision is `<slug>-v<N+1>` with `supersedes: "[[<slug>-v<N>]]"`; a still-pending v<N> is marked superseded in the same transaction, and a rejected one stays rejected.
 - **`done_when` in a plan is checked against rule 7's allow list from the checkout's `daedalus.toml`, not the venv pin,** since pinning would mean building a venv (network) from a validation call.
-- **Protected paths in a plan must already exist,** as in goal notes, so a test the human will write has to be committed before a plan can protect it.
+- **A plan's protected path must already exist, or be in an earlier task's `files`,** so a test the human will write has to be committed first, but a later task can protect what an earlier task creates. `/run` re-checks at each task's start.
+- ★ **Clients only hear about tools they have:** text shared between DeepSeek and daedalus-mcp is worded for any client, and a test fails if a client is told about a tool it lacks, or Claude about a slash command outside a sentence addressed to Mohamed.
+- **Migration tests start from frozen old DDL** (`tests/core/queue_fixtures.py`), never from the current code, so a change to `queue.py` can't change the file a migration starts from.
+- **The under-home live sandbox test runs in a detached worktree of scratch2 at a pinned green commit,** never scratch2's main, so what's on Mohamed's branch can't make a sandbox test pass or fail.
 
 - **Obsidian's property types are pinned in each vault's `.obsidian/types.json`** (the seven string-list keys as List, `created` as Date), and `/new` writes them, since the templates hold no `.obsidian/`.
 - ★ **List-valued keys must be YAML lists,** never strings or a list typed into one item; the error points at Obsidian's List property type.
