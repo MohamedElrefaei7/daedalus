@@ -430,7 +430,16 @@
   9. Skipping the red-test preflight failed `test_a_red_test_that_already_passes_stops_with_preflight` (`('t1', 'done', None) != ('t1', 'failed', 'preflight')`).
   10. Letting a pending plan's provenance launch failed `test_a_pending_plans_provenance_is_refused` ("DID NOT RAISE GoalError").
   Breaks 7–9 first went red only through the scripted fakes ("an unscripted check ran"); the tests now script enough that a break reaches the real assertion.
-- **Live check:** Mohamed's, after this commit (Part F).
+- **Live check** (scratch2, off-peak; after the desktop app was restarted for `read_runs`):
+  1. `/plans` showed `mathx-cli` v2 pending with v1 rejected under it. `/approve 1m8eyfq3f6az2t` showed both NEW decisions with the notes they'd become, asked `Accept 2 new decisions as precedent? [y/N]`, and on `y` made one commit, `571b9b5 agent(claude): approve plan mathx-cli-v2` (trailer `Daedalus-Change: 1m8eyfq3f6az2t`): `plans/mathx-cli-v2.md` (accepted, each decision with its `note`, both stems in `related`) and `decisions/interface-cli-lives-in-src-scratch2-mathx-py-as.md`, `decisions/interface-cli-parses-each-operand-as-int-when-it.md` (accepted, source claude, related the plan and the spec). 3 files, 89 insertions.
+  2. Claude asked "Is there precedent for how mathx parses CLI arguments?": `find_precedent` returned both new decisions, and Claude summarized them. Approval made real precedent.
+  3. `/run mathx-cli` made plan run `1m8fym1jcsry88` on `agent/plan-mathx-cli-v2`. t1 (multiply): baseline exit 4, collected 0; one iteration (red by ImportError, a deliberate wrong multiply, then green); check exit 0, collected 3, every guard held; $0.0021; `b2fe1a9`. t2 (the CLI) started from t1's commit, cited both new decisions, broke `main` on purpose (red), then went green; check exit 0, collected 3; $0.0021; `0773f9a`. Run done, no stops, about 40 s, $0.0042 in all. No check-ins or stops were exercised (one iteration each), so the next live check should force one.
+  4. "How did the mathx-cli run go?": Claude called `read_runs` and reported both tasks done in one iteration, the guards, the cost, the branch and its 73-line diffstat, and noted (correctly) that each check counted its own files.
+  5. `/wt diff`, then `/wt merge plan-mathx-cli-v2` made `baa9049` (`--no-ff`). On main, scratch2's full suite, sandboxed: 12 passed, including `tests/test_cli.py`. The live sandbox test stays pinned, so it doesn't depend on this.
+- **Found in the live check:**
+  - Both tasks' baselines were exit 4 with 0 collected, because `done_when` names a test file the task creates, and pytest runs nothing when a named path is missing. The count and node-ID guards therefore constrained nothing; only exit 0 and the protected paths did (t2's real bar was Mohamed's protected `tests/test_cli.py`). Up Next.
+  - The pytest command meant for a shell was typed at the REPL prompt, so it went to DeepSeek ($0.0012, no harm); the step didn't say "in another shell".
+  - `/approve`'s table cut the stems with "…" at an 80-column terminal; the approval line printed them whole.
 
 ## Key decisions
 
@@ -598,6 +607,8 @@ Commit 13: context sets.
 `--retry` for failed plan tasks.
 
 lint: warn on vault templates that drift from package templates.
+
+A plan task's baseline when `done_when` names a file the task creates: pytest runs nothing (exit 4, 0 collected), so the count and node-ID guards constrain nothing; measure the baseline over the named paths that exist too.
 
 validate_plan could check that a red_test names a test file (`/run`'s preflight does, at the task's start).
 
