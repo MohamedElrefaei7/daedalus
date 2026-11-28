@@ -42,10 +42,10 @@ def good() -> dict:
         ],
         "tasks": [
             {"id": "t1", "summary": "add multiply(a, b)", "files": ["src/mathx.py", "tests/test_mathx.py"],
-             "red_test": "tests/test_mathx.py::test_multiply fails with ImportError, then passes",
+             "red_test": ["tests/test_mathx.py::test_multiply"],
              "done_when": "pytest -q tests/test_mathx.py", "max_iterations": 3, "budget_usd": 0.25},
-            {"id": "t2", "summary": "a tiny CLI", "files": ["src/__main__.py"],
-             "red_test": "tests/test_cli.py::test_add_prints_5 fails, then passes",
+            {"id": "t2", "summary": "a tiny CLI", "files": ["src/__main__.py", "tests/test_cli.py"],
+             "red_test": ["tests/test_cli.py::test_add_prints_5"],
              "done_when": "pytest -q", "max_iterations": 4, "budget_usd": 0.30, "protected": ["tests/test_mathx.py"]},
         ],
     }
@@ -229,7 +229,7 @@ def test_task_shape_errors_name_the_task(pw) -> None:
 
     errors = submit_errors(pw, edit(change))
     assert "tasks[t1].colour: unknown key; a task has id, summary, files, red_test, done_when, max_iterations, " \
-           "budget_usd, and optionally protected" in errors
+           "budget_usd, and optionally protected and red_test_note" in errors
     assert "tasks[t1].red_test: missing" in errors
     assert "tasks[t1].summary: must be one line" in errors
     assert any(e.startswith("tasks[t1].files: must be a non-empty list") for e in errors)
@@ -383,3 +383,34 @@ def test_migrates_a_version_3_queue_keeping_rows(state_root) -> None:
     with queue.connect() as c:
         assert c.execute("PRAGMA user_version").fetchone()[0] == queue.SCHEMA_VERSION
         assert c.execute("SELECT 1 FROM sqlite_master WHERE name = 'proposals_by_status'").fetchone()
+
+
+# Structured red tests (commit 12c) ------------------------------------------------------------------
+
+def test_a_text_red_test_gets_its_own_error(pw) -> None:
+    e = only_error(pw, edit(lambda fm: fm["tasks"][0].update(red_test="tests/test_mathx.py::test_multiply fails")))
+    assert e.startswith("tasks[t1].red_test: is text, and it must now be a list of the red tests")
+    assert "red_test_note" in e
+
+
+@pytest.mark.parametrize("entry, words", [
+    ("tests/test_mathx.py::", "no test name after it"),
+    ("/abs/tests/test_x.py", "relative to the repo root"),
+    ("tests/test_mathx.txt", "must name a .py test file"),
+    ("tests/../tests/test_mathx.py", "no '..' or './'"),
+    (".git/hooks/test_x.py", "under .git"),
+    ("tests/test_nobody.py::test_x", "neither this task nor an earlier one lists it in files"),
+])
+def test_red_test_entries_are_checked(pw, entry, words) -> None:
+    e = only_error(pw, edit(lambda fm: fm["tasks"][0].update(red_test=[entry])))
+    assert e.startswith("tasks[t1].red_test:") and words in e, e
+
+
+def test_a_red_test_an_earlier_task_creates_is_allowed_and_a_note_is_prose(pw) -> None:
+    def change(fm):
+        fm["tasks"][0]["files"].append("tests/test_multiply.py")
+        fm["tasks"][1].update(red_test=["tests/test_multiply.py::test_big"],
+                              red_test_note="reads [tool.pytest.ini_options] and nothing.py")
+    e = only_error(pw, edit(lambda fm: fm["tasks"][0].update(red_test_note="  ")))
+    assert e == "tasks[t1].red_test_note: must be non-empty text, or left out"
+    plans.submit(pw.session, "claude", "mathx", edit(change), BODY, session_cap_usd=CAP)

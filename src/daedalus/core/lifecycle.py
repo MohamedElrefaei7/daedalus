@@ -32,7 +32,7 @@ from typing import Callable
 
 from . import registry as registry_mod
 from .registry import PROJECT_NAME, SHARED_NAME, RegistryError, load_registry, obsidian_mistake
-from .vaultio import CommitFailed, commit_path, git, head_or_none, write_lock
+from .vaultio import CommitFailed, commit_path, commit_paths, git, head_or_none, write_lock
 
 TEMPLATES = Path(__file__).resolve().parents[3] / "templates"  # the daedalus repo (editable install)
 # Obsidian's property types for a new vault: "multitext" is Obsidian's List type. The list keys that hold strings
@@ -42,6 +42,9 @@ OBSIDIAN_TYPES = {"created": "date", **{key: "multitext" for key in (
 OBSIDIAN_TYPES_FILE = ".obsidian/types.json"
 INIT_MESSAGE = "init: daedalus vault from template"
 VAULT_DIR = "vault"
+GITIGNORE = ".gitignore"
+# Caches a project's test runs leave in its repo (commit 12c): /new makes sure the repo ignores them.
+CACHE_IGNORES = ("__pycache__/", ".pytest_cache/")
 _SKIP = shutil.ignore_patterns(".DS_Store")
 
 
@@ -141,9 +144,29 @@ def write_obsidian_types(vault: Path) -> Path:
     return path
 
 
-def commit_vault(repo: Path) -> str:
-    """Commit exactly vault/ in ``repo``: git add -- vault, then git commit --only -- vault."""
-    return commit_path(repo, VAULT_DIR, [INIT_MESSAGE], add=True)
+def cache_ignores(repo: Path) -> tuple[str | None, str] | None:
+    """(the repo .gitignore's text now, or None if there's none; its text with the cache lines added), or None if
+    nothing needs adding. A .gitignore with uncommitted changes, or one git doesn't track, is yours: left alone."""
+    path = repo / GITIGNORE
+    if path.exists():
+        if git(repo, "status", "--porcelain", "--", GITIGNORE).strip():
+            return None
+        old = path.read_text(encoding="utf-8")
+    else:
+        old = None
+    have = {line.strip() for line in (old or "").splitlines()}
+    missing = [line for line in CACHE_IGNORES if line not in have and line.rstrip("/") not in have]
+    if not missing:
+        return None
+    head = old if not old or old.endswith("\n") else old + "\n"
+    return old, (head or "") + "# test caches (added by daedalus /new)\n" + "".join(f"{m}\n" for m in missing)
+
+
+def commit_vault(repo: Path, extra: tuple[str, ...] = ()) -> str:
+    """Commit exactly vault/ (and ``extra``: the .gitignore lines /new added) in ``repo``, path-limited."""
+    if not extra:
+        return commit_path(repo, VAULT_DIR, [INIT_MESSAGE], add=True)
+    return commit_paths(repo, [VAULT_DIR, *extra], [INIT_MESSAGE], add=[VAULT_DIR, *extra])
 
 
 def _commit_files(repo: Path, sha: str) -> list[str]:
@@ -162,13 +185,14 @@ def _undo_commit(repo: Path, parent: str | None) -> str | None:
         return None
     if git(repo, "log", "-1", "--format=%s", sha).strip() != INIT_MESSAGE:
         return f"HEAD ({sha[:7]}) is no longer the init commit, so it was left in place"
-    if any(not p.startswith(VAULT_DIR + "/") for p in _commit_files(repo, sha)):
+    if any(not p.startswith(VAULT_DIR + "/") and p != GITIGNORE for p in _commit_files(repo, sha)):
         return f"the init commit {sha[:7]} touches files outside {VAULT_DIR}/, so it was left in place"
     if parent is None:
         git(repo, "update-ref", "-d", "HEAD")  # it was the repo's first commit: back to an unborn branch
     else:
         git(repo, "reset", "-q", "--soft", parent)  # moves HEAD only; the index keeps your staged work
     git(repo, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", VAULT_DIR)  # drop only vault/ from the index
+    git(repo, "reset", "-q", "--", GITIGNORE)  # the .gitignore lines, if committed, go back to unstaged
     return None
 
 
@@ -202,10 +226,22 @@ def new_project(name: str, repo_arg: str | os.PathLike[str], registry_path=None,
             undo.append(("remove the copied vault/", remove_copy))
             copy_template(vault, templates)  # 4
             write_obsidian_types(vault)
+            ignores = cache_ignores(repo)  # the repo ignores test caches (__pycache__/, .pytest_cache/)
+            if ignores is not None:
+                old_ignore, new_ignore = ignores
+
+                def restore_ignore() -> None:
+                    if old_ignore is None:
+                        (repo / GITIGNORE).unlink(missing_ok=True)
+                    else:
+                        (repo / GITIGNORE).write_text(old_ignore, encoding="utf-8")
+
+                undo.append(("restore .gitignore", restore_ignore))
+                (repo / GITIGNORE).write_text(new_ignore, encoding="utf-8")
 
             parent = head_or_none(repo)
             undo.append(("undo the init commit", lambda: _undo_commit(repo, parent)))
-            sha = commit_vault(repo)  # 5
+            sha = commit_vault(repo, () if ignores is None else (GITIGNORE,))  # 5
 
             undo.append(("unregister", lambda: _unregister_if_present(name, registry_path, state_path)))
             registry_mod.register_project(name, vault, registry_path)  # 6

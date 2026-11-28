@@ -342,7 +342,7 @@ def _n(k: int, one: str, many: str) -> str:
 
 def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected_changed: list[str],
           now_ids: tuple[str, ...] | None = None, wt: Path | str | None = None,
-          suite_now: tuple[str, ...] | None = None) -> Verdict:
+          suite_now: tuple[str, ...] | None = None, suite_errors_now: tuple[str, ...] = ()) -> Verdict:
     guards = [Guard("exit", exit_code == 0, "the check exited 0" if exit_code == 0 else
                     f"the check failed (exit {exit_code})")]
     if goal.is_pytest:
@@ -394,13 +394,18 @@ def judge(goal: Goal, exit_code: int, output: str, baseline: Baseline, protected
             gone = sorted(set(baseline.suite_node_ids) - set(suite_now))
             missing_files = [f for f in baseline.suite_collection_errors
                              if wt is not None and not f.startswith("(") and not (Path(wt) / f).exists()]
-            ok = not gone and not missing_files
+            # ★ E1: fails closed. A collection error now in a file that collected cleanly at the start is a miss,
+            # even if every test ID from the start is still listed.
+            new_errors = sorted(set(suite_errors_now) - set(baseline.suite_collection_errors))
+            ok = not gone and not missing_files and not new_errors
             detail = (f"all {len(baseline.suite_node_ids)} tests in the whole suite at the start still exist" if ok else
                       "; ".join(x for x in (
                           f"{_n(len(gone), 'test in the suite at the start no longer exists', 'tests in the suite at the start no longer exist')}: {_listed(gone)}" if gone else "",
                           f"{_n(len(missing_files), 'file', 'files')} that failed to collect at the start no longer "
                           f"{'exists' if len(missing_files) == 1 else 'exist'}: {_listed(missing_files)}"
-                          if missing_files else "") if x))
+                          if missing_files else "",
+                          f"the whole suite now has collection errors that it didn't have at the start: "
+                          f"{_listed(new_errors)}" if new_errors else "") if x))
             guards.append(Guard("suite", ok, detail))
     guards.append(Guard("protected", not protected_changed,
                         "no protected path changed" if not protected_changed else
@@ -502,7 +507,8 @@ def task_text(slug: str, n: int, fm: dict, t: dict, body: str) -> str:
     lines = [f"# Task {t['id']} of plan {slug} v{n}: {t['summary']}", "",
              f"Plan: [[plans/{slug}-v{n}]] (approved). Spec: {fm.get('spec')} (read it with read_note).", "",
              f"- Files to start from: {', '.join(t.get('files') or [])}",
-             f"- Red test (fails before the change, passes after): {t['red_test']}",
+             f"- Red test (fails before the change, passes after): {', '.join(t['red_test'])}"
+             + (f" ({t['red_test_note']})" if t.get("red_test_note") else ""),
              f"- Done when: `{t['done_when']}`",
              f"- At most {t['max_iterations']} iterations and ${float(t['budget_usd']):.2f}"]
     if t.get("protected"):
@@ -513,5 +519,7 @@ def task_text(slug: str, n: int, fm: dict, t: dict, body: str) -> str:
         for d in decisions:
             cite = d.get("note") if str(d.get("basis")).strip() == "new" else d.get("basis")
             lines.append(f"- {d.get('category')}: {d.get('choice')} ({cite})")
-    lines += ["", "## The plan's context", "", body.strip()]
+    lines += ["", "If you find this goal already holds at the commit the task started from (the red test passes there "
+              "with no change), call report_already_satisfied with your evidence instead of changing code. Never fake "
+              "a red test.", "", "## The plan's context", "", body.strip()]
     return "\n".join(lines) + "\n"

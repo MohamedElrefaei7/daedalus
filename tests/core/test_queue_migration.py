@@ -160,9 +160,11 @@ def test_v5_to_v6_rebuilds_plan_runs_keeping_every_row(v5) -> None:
         assert con.execute("PRAGMA foreign_key_check").fetchall() == []
         assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     runs_after, tasks_after = _plan_rows(v5)
-    assert dump(v5)["user_version"] == 6
-    assert [r[:-1] for r in runs_after] == runs_before and all(r[-1] is None for r in runs_after)  # + final_output
-    assert tasks_after == tasks_before and table_sql(v5, "plan_tasks") == tasks_sql
+    assert dump(v5)["user_version"] == queue.SCHEMA_VERSION
+    # + final_output (v6) and merged_sha (v7); plan_tasks + batches and satisfied_sha (v7)
+    assert [r[:-2] for r in runs_after] == runs_before and all(r[-2:] == (None, None) for r in runs_after)
+    assert [r[:-2] for r in tasks_after] == tasks_before and all(r[-2:] == (None, None) for r in tasks_after)
+    assert "satisfied_at_base" in table_sql(v5, "plan_tasks") and tasks_sql != table_sql(v5, "plan_tasks")
     assert {k: v for k, v in dump(v5).items() if k != "user_version"} == \
         {k: v for k, v in before.items() if k != "user_version"}
     assert "final_suite" in table_sql(v5, "plan_runs") and table_sql(v5, "plan_runs_by_plan")
@@ -187,3 +189,48 @@ def test_a_failed_v6_migration_leaves_the_file_at_v5(v5, monkeypatch) -> None:
         queue.connect()
     monkeypatch.setattr(queue.sqlite3, "connect", real_connect)
     assert dump(v5) == before and _plan_rows(v5) == rows and table_sql(v5, "plan_runs_new") is None
+
+
+# v6 → v7 (commit 12c): plan_runs gains merged_sha; plan_tasks gains satisfied_at_base, batches, satisfied_sha. ---
+
+@pytest.fixture
+def v6(state_root, monkeypatch):
+    monkeypatch.setattr(queue, "_reconciling", True)
+    build_queue(queue.queue_path(), 6, proposals=sample_proposals((*V3_STATUSES, "superseded")))
+    return queue.queue_path()
+
+
+def test_v6_to_v7_keeps_every_plan_row(v6) -> None:
+    before, (runs_before, tasks_before) = dump(v6), _plan_rows(v6)
+    assert "merged_sha" not in table_sql(v6, "plan_runs") and runs_before[0][-1] == "3 passed"  # final_output kept
+    with queue.connect() as con:
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    runs_after, tasks_after = _plan_rows(v6)
+    assert dump(v6)["user_version"] == 7
+    assert [r[:-1] for r in runs_after] == runs_before and all(r[-1] is None for r in runs_after)
+    assert [r[:-2] for r in tasks_after] == tasks_before
+    assert {k: v for k, v in dump(v6).items() if k != "user_version"} == \
+        {k: v for k, v in before.items() if k != "user_version"}
+    from daedalus.core import planruns
+
+    planruns.close("pr000000000001", "abc1234")
+    planruns.set_task("pr000000000003", "t1", status="satisfied_at_base", satisfied_sha="f" * 40)
+    assert planruns.get("pr000000000001").closed and planruns.task("pr000000000003", "t1").finished
+
+
+def test_a_failed_v7_migration_leaves_the_file_at_v6(v6, monkeypatch) -> None:
+    before, rows = dump(v6), _plan_rows(v6)
+    real_connect = sqlite3.connect
+
+    class _Fails(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.strip() == "DROP TABLE plan_runs":
+                raise sqlite3.OperationalError("injected: disk I/O error")
+            return super().execute(sql, *args)
+
+    monkeypatch.setattr(queue.sqlite3, "connect", lambda *a, **k: real_connect(*a, factory=_Fails, **k))
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        queue.connect()
+    monkeypatch.setattr(queue.sqlite3, "connect", real_connect)
+    assert dump(v6) == before and _plan_rows(v6) == rows and table_sql(v6, "plan_tasks_new") is None

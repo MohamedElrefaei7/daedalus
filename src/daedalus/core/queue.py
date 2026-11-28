@@ -43,7 +43,7 @@ from .errors import (  # re-exported: callers import these from daedalus.core.qu
 
 STATE_ROOT = Path("~/.local/state/daedalus").expanduser()
 MAX_CONTENT_BYTES = 256 * 1024
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 KINDS = ("create", "edit")
 STATUSES = ("pending", "applying", "applied", "rejected", "stale", "failed", "superseded")
@@ -96,6 +96,9 @@ _CHANGESETS = (
 )
 # Plan runs (v5, commit 12): run state lives here, never in the vault; the plan note isn't edited after approval.
 RUN_STATUSES = ("pending", "running", "done", "stopped", "failed")
+# A task can also end satisfied_at_base (v7, commit 12c): its goal already held, verified and accepted.
+TASK_STATUSES = RUN_STATUSES + ("satisfied_at_base",)
+FINISHED_TASK = ("done", "satisfied_at_base")
 STOP_REASONS = ("question", "checkin", "daily_cap", "interrupted", "preflight", "max_iterations", "budget",
                 "honest_done_refused")
 RESUMABLE = ("question", "checkin", "daily_cap", "interrupted")
@@ -117,31 +120,39 @@ _PLAN_RUNS_TABLE = f"""CREATE TABLE {{name}} (
         started_at     TEXT NOT NULL,
         ended_at       TEXT,
         updated_at     TEXT NOT NULL,
-        final_output   TEXT    -- v6: the full suite's output when the final gate failed
+        final_output   TEXT,   -- v6: the full suite's output when the final gate failed
+        merged_sha     TEXT    -- v7: the merge that took the branch into your checkout; set means closed
     )"""
 _PLAN_RUNS_V5_COLUMNS = ("id", "plan_change_id", "project", "slug", "version", "branch", "worktree_path", "wt_slug",
                          "status", "stop_reason", "stop_text", "started_at", "ended_at", "updated_at")
+_PLAN_TASKS_TABLE = f"""CREATE TABLE {{name}} (
+        plan_run_id   TEXT NOT NULL REFERENCES plan_runs (id),
+        task_id       TEXT NOT NULL,
+        idx           INTEGER NOT NULL,
+        summary       TEXT NOT NULL,
+        status        TEXT NOT NULL CHECK (status IN ({_IN(TASK_STATUSES)})),
+        stop_reason   TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_IN(STOP_REASONS)})),
+        run_id        TEXT,           -- the coding loop's run id: its ledger rows and its logs
+        base          TEXT,           -- the branch's commit when the task started
+        baseline      TEXT,           -- JSON, measured once before the first iteration and never again
+        iterations    INTEGER NOT NULL DEFAULT 0,  -- ★ over every batch, updated after every iteration
+        cost_usd      REAL NOT NULL DEFAULT 0,     -- ★ over every batch (the ledger's rows for run_id)
+        text          TEXT,           -- the question, check-in, stop message, or satisfied evidence
+        started_at    TEXT,
+        ended_at      TEXT,
+        batches       TEXT,           -- v7: JSON, one entry per /run of the task: start, iterations, cost, stop
+        satisfied_sha TEXT,           -- v7: the start commit a satisfied_at_base goal already held at
+        PRIMARY KEY (plan_run_id, task_id)
+    )"""
 _PLAN_RUNS = (
     _PLAN_RUNS_TABLE.format(name="plan_runs").replace("CREATE TABLE plan_runs", "CREATE TABLE IF NOT EXISTS plan_runs"),
     "CREATE INDEX IF NOT EXISTS plan_runs_by_plan ON plan_runs (project, plan_change_id)",
-    f"""CREATE TABLE IF NOT EXISTS plan_tasks (
-        plan_run_id  TEXT NOT NULL REFERENCES plan_runs (id),
-        task_id      TEXT NOT NULL,
-        idx          INTEGER NOT NULL,
-        summary      TEXT NOT NULL,
-        status       TEXT NOT NULL CHECK (status IN ({_IN(RUN_STATUSES)})),
-        stop_reason  TEXT CHECK (stop_reason IS NULL OR stop_reason IN ({_IN(STOP_REASONS)})),
-        run_id       TEXT,           -- the coding loop's run id: its ledger rows and its logs
-        base         TEXT,           -- the branch's commit when the task started
-        baseline     TEXT,           -- JSON, measured once before the first iteration and never again
-        iterations   INTEGER NOT NULL DEFAULT 0,
-        cost_usd     REAL NOT NULL DEFAULT 0,
-        text         TEXT,           -- the question, check-in, or stop message
-        started_at   TEXT,
-        ended_at     TEXT,
-        PRIMARY KEY (plan_run_id, task_id)
-    )""",
+    _PLAN_TASKS_TABLE.format(name="plan_tasks").replace("CREATE TABLE plan_tasks",
+                                                         "CREATE TABLE IF NOT EXISTS plan_tasks"),
 )
+_PLAN_RUNS_V6_COLUMNS = _PLAN_RUNS_V5_COLUMNS + ("final_output",)
+_PLAN_TASKS_V5_COLUMNS = ("plan_run_id", "task_id", "idx", "summary", "status", "stop_reason", "run_id", "base",
+                          "baseline", "iterations", "cost_usd", "text", "started_at", "ended_at")
 
 _V1_COLUMNS = (
     "id", "vault", "rel_path", "kind", "content", "base_sha256", "base_content", "source", "summary",
@@ -250,7 +261,8 @@ def reconcile_plan_runs(con: sqlite3.Connection) -> list[str]:
 def _ensure_schema(con: sqlite3.Connection) -> None:
     """Create the tables, or migrate in place: v1 had no 'applying' status, v2 no change sets, v3 no
     'superseded' status, v4 no plan runs, v5 no final_suite stop reason. A CHECK can't be altered in SQLite, so
-    v1 and v3 rebuild the proposals table and v5 rebuilds plan_runs, rows kept; v4 → v5 only adds tables."""
+    v1 and v3 rebuild the proposals table and v5/v6 rebuild the plan-run tables, rows kept; v4 → v5 only adds
+    tables. v6 had no merged_sha or satisfied_at_base."""
     if con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
         return
     con.execute("BEGIN IMMEDIATE")
@@ -273,15 +285,21 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         if version < 5:
             for ddl in _PLAN_RUNS:
                 con.execute(ddl)
-        elif version == 5:
-            # v6: plan_runs gains the final_suite stop reason (a CHECK, so the table is rebuilt, rows kept) and
-            # final_output. plan_tasks is untouched.
-            con.execute("DROP TABLE IF EXISTS plan_runs_new")
-            con.execute(_PLAN_RUNS_TABLE.format(name="plan_runs_new"))
-            cols = ", ".join(_PLAN_RUNS_V5_COLUMNS)
-            con.execute(f"INSERT INTO plan_runs_new ({cols}) SELECT {cols} FROM plan_runs")
-            con.execute("DROP TABLE plan_runs")
+        elif version in (5, 6):
+            # v6 added plan_runs' final_suite stop reason and final_output; v7 adds merged_sha, and plan_tasks'
+            # satisfied_at_base status, batches, and satisfied_sha. CHECKs can't be altered in SQLite, so both
+            # tables are rebuilt into the current definitions, rows kept.
+            run_cols = ", ".join(_PLAN_RUNS_V5_COLUMNS if version == 5 else _PLAN_RUNS_V6_COLUMNS)
+            task_cols = ", ".join(_PLAN_TASKS_V5_COLUMNS)
+            for table, cols in (("plan_runs", run_cols), ("plan_tasks", task_cols)):
+                con.execute(f"DROP TABLE IF EXISTS {table}_new")
+                ddl = _PLAN_RUNS_TABLE if table == "plan_runs" else _PLAN_TASKS_TABLE
+                con.execute(ddl.format(name=f"{table}_new"))
+                con.execute(f"INSERT INTO {table}_new ({cols}) SELECT {cols} FROM {table}")
+            for table in ("plan_tasks", "plan_runs"):
+                con.execute(f"DROP TABLE {table}")
             con.execute("ALTER TABLE plan_runs_new RENAME TO plan_runs")
+            con.execute("ALTER TABLE plan_tasks_new RENAME TO plan_tasks")
             con.execute("CREATE INDEX IF NOT EXISTS plan_runs_by_plan ON plan_runs (project, plan_change_id)")
         if version < SCHEMA_VERSION:
             con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

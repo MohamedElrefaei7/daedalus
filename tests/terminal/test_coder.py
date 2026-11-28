@@ -25,7 +25,7 @@ from daedalus.terminal.config import Config
 from daedalus.terminal.repl import Repl
 
 CODER = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
-         "edit_code", "write_code", "delete_code", "run", "find_precedent", "ask_user")
+         "edit_code", "write_code", "delete_code", "run", "find_precedent", "ask_user", "report_already_satisfied")
 CHAT = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",
         "find_precedent", "propose_edit", "propose_lesson", "ask_user")
 MCP = ("get_scope", "list_notes", "read_note", "search", "backlinks", "list_files", "read_code", "propose_note",

@@ -55,6 +55,11 @@ class PlanRun:
     ended_at: str | None
     updated_at: str
     final_output: str | None = None  # the full suite's output, when the final gate failed
+    merged_sha: str | None = None  # the merge that took the branch into the checkout: set means closed
+
+    @property
+    def closed(self) -> bool:
+        return self.merged_sha is not None
 
 
 @dataclass(frozen=True)
@@ -73,16 +78,23 @@ class PlanTask:
     text: str | None
     started_at: str | None
     ended_at: str | None
+    batches: list[dict[str, Any]] | None = None  # one per /run of the task: started, iterations, cost, stop
+    satisfied_sha: str | None = None
 
     @property
     def resumable(self) -> bool:
         return self.status == "stopped" and self.stop_reason in queue.RESUMABLE
 
+    @property
+    def finished(self) -> bool:
+        """done, or satisfied_at_base: either counts for the final gate and for merging."""
+        return self.status in queue.FINISHED_TASK
+
 
 _RUN_COLS = ("id", "plan_change_id", "project", "slug", "version", "branch", "worktree_path", "wt_slug", "status",
-             "stop_reason", "stop_text", "started_at", "ended_at", "updated_at", "final_output")
+             "stop_reason", "stop_text", "started_at", "ended_at", "updated_at", "final_output", "merged_sha")
 _TASK_COLS = ("plan_run_id", "task_id", "idx", "summary", "status", "stop_reason", "run_id", "base", "baseline",
-              "iterations", "cost_usd", "text", "started_at", "ended_at")
+              "iterations", "cost_usd", "text", "started_at", "ended_at", "batches", "satisfied_sha")
 
 
 def _run(row) -> PlanRun:
@@ -92,6 +104,7 @@ def _run(row) -> PlanRun:
 def _task(row) -> PlanTask:
     d = dict(zip(_TASK_COLS, row))
     d["baseline"] = json.loads(d["baseline"]) if d["baseline"] else None
+    d["batches"] = json.loads(d["batches"]) if d["batches"] else []
     return PlanTask(**d)
 
 
@@ -145,7 +158,7 @@ def create(*, plan_change_id: str, project: str, slug: str, version: int, branch
         try:
             con.execute(f"INSERT INTO plan_runs ({', '.join(_RUN_COLS)}) VALUES ({', '.join('?' * len(_RUN_COLS))})",
                         (run_id, plan_change_id, project, slug, version, branch, worktree_path, wt_slug, "pending",
-                         None, None, now, None, now, None))
+                         None, None, now, None, now, None, None))
             for i, (tid, summary) in enumerate(task_rows, 1):
                 con.execute("INSERT INTO plan_tasks (plan_run_id, task_id, idx, summary, status) VALUES "
                             "(?, ?, ?, ?, 'pending')", (run_id, tid, i, summary))
@@ -169,6 +182,8 @@ def set_task(plan_run_id: str, task_id: str, **fields: Any) -> None:
     """Update a task row. ``baseline`` is stored once: a task that already has one keeps it."""
     if not fields:
         return
+    if "batches" in fields:
+        fields["batches"] = json.dumps(fields["batches"], sort_keys=True)
     if "baseline" in fields:
         current = task(plan_run_id, task_id).baseline
         if current is not None:
@@ -181,6 +196,19 @@ def set_task(plan_run_id: str, task_id: str, **fields: Any) -> None:
     with queue.connect() as con:
         con.execute(f"UPDATE plan_tasks SET {cols} WHERE plan_run_id = ? AND task_id = ?",
                     (*fields.values(), plan_run_id, task_id))
+
+
+def close(run_id: str, merged_sha: str) -> None:
+    """The branch was merged: the run is closed, and /run refuses it from now on."""
+    with queue.connect() as con:
+        con.execute("UPDATE plan_runs SET merged_sha = ?, updated_at = ? WHERE id = ? AND merged_sha IS NULL",
+                    (merged_sha, queue._now(), run_id))
+
+
+def for_worktree(project: str, wt_slug: str) -> PlanRun | None:
+    """The plan run that owns the worktree ``wt_slug`` (agent/plan-<slug>-v<N>), if any."""
+    found = [r for r in runs(project) if r.wt_slug == wt_slug]
+    return found[-1] if found else None
 
 
 @contextmanager
@@ -217,4 +245,5 @@ def summary_for(project: str, plan_change_id: str | None) -> dict[str, Any] | No
     if run is None:
         return None
     return {"run_id": run.id, "status": run.status, "stop_reason": run.stop_reason, "branch": run.branch,
+            "merged_sha": run.merged_sha,
             "tasks": [{"id": t.task_id, "status": t.status, "stop_reason": t.stop_reason} for t in tasks(run.id)]}

@@ -111,6 +111,9 @@ PARAMETERS: dict[str, dict[str, Any]] = {
         "argv": {"type": "array", "items": _STR, "minItems": 1,
                  "description": "the command as a list, e.g. [\"pytest\", \"-q\"]"},
     }, "required": ["argv"]},
+    "report_already_satisfied": {"type": "object", "properties": {
+        "evidence": {**_STR, "description": "what you read and ran that shows the goal already holds, one paragraph"},
+    }, "required": ["evidence"]},
     "propose_lesson": {"type": "object", "properties": {
         "rel_path": {**_STR, "description": "file name in the shared inbox/, e.g. 'git-hooks-path.md'"},
         "content": {**_STR, "description": "the whole lesson note"},
@@ -136,13 +139,16 @@ def tools_for(profile: str) -> list[dict[str, Any]]:
 TOOLSETS: dict[str, list[dict[str, Any]]] = {profile: tools_for(profile) for profile in PROFILES}
 TOOLS = TOOLSETS["chat"]
 PROPOSING = ("propose_note", "propose_edit", "propose_lesson", "ask_user")
-ENDS_TURN = "ask_user"
+ENDS_TURN = ("ask_user", "report_already_satisfied")
 NOT_RUN = "Not run: ask_user ended this turn. Wait for Mohamed's answer."
+NOT_RUN_CLAIM = "Not run: report_already_satisfied ended this turn. The loop verifies the claim now."
 
 
 def call_tool(session: Session, name: str, args: dict[str, Any],
-              edit_log: tools.EditLog | None = None) -> dict[str, Any]:
+              edit_log: tools.EditLog | None = None, claims: bool = False) -> dict[str, Any]:
     """Run one tool. source is fixed here; the model can't pass it (the schemas refuse extras)."""
+    if name == "report_already_satisfied":
+        return toolset.report_already_satisfied(session, args["evidence"], allowed=claims)
     if name in ("edit_code", "write_code", "delete_code"):
         return getattr(toolset, name)(session, **args, edit_log=edit_log)
     if name in ("propose_note", "propose_edit"):
@@ -176,7 +182,7 @@ class ToolOutcome:
 
 
 def run_tool(session: Session, name: str, raw_args: str, profile: str = "chat",
-             edit_log: tools.EditLog | None = None) -> ToolOutcome:
+             edit_log: tools.EditLog | None = None, claims: bool = False) -> ToolOutcome:
     """Execute one model tool call; every failure becomes a tool result, never an exception."""
     names = PROFILES[profile]
     if name not in names:
@@ -199,7 +205,7 @@ def run_tool(session: Session, name: str, raw_args: str, profile: str = "chat",
             parts.append(f"missing {', '.join(missing)}")
         return ToolOutcome(name, args, False, f"{name}: {'; '.join(parts)}. Allowed: {', '.join(sorted(allowed))}.")
     try:
-        result = call_tool(session, name, args, edit_log)
+        result = call_tool(session, name, args, edit_log, claims)
     except Exception as e:
         text = toolset.error_text(e)
         if text is None:
@@ -246,6 +252,7 @@ class TurnResult:
     rounds: int  # tool rounds run
     stopped: bool  # hit MAX_TOOL_ROUNDS
     asked: dict[str, Any] | None = None  # ask_user's result, when it ended the turn
+    claimed: dict[str, Any] | None = None  # report_already_satisfied's result, when it ended the turn
 
 
 class Agent:
@@ -253,7 +260,7 @@ class Agent:
 
     def __init__(self, session: Session, ds: DeepSeek, cfg: Config, session_id: str,
                  meter: Meter | None = None, profile: str = "chat", run_id: str | None = None,
-                 run_cap: float | None = None) -> None:
+                 run_cap: float | None = None, claims: bool = False) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown agent profile {profile!r}")
         if profile == "coder" and session.worktree is None:
@@ -265,6 +272,7 @@ class Agent:
         self.meter = meter or Meter()
         self.profile = profile
         self.run_id, self.run_cap = run_id, run_cap  # a goal run's tag and budget, checked before every call
+        self.claims = claims  # report_already_satisfied works only in a plan task's run
         self.tools = TOOLSETS[profile]
         self.system = system_prompt(session, profile)
         self.history: list[dict[str, Any]] = []
@@ -313,11 +321,14 @@ class Agent:
                 if not calls:
                     return TurnResult(reply.content, rounds, False)
                 asked: dict[str, Any] | None = None
+                claimed: dict[str, Any] | None = None
                 for call in calls:
-                    if asked is not None:  # ask_user ended the turn; every call still needs a tool result
-                        self.history.append({"role": "tool", "tool_call_id": call.id, "content": NOT_RUN})
+                    if asked is not None or claimed is not None:  # the turn ended; every call still needs a result
+                        self.history.append({"role": "tool", "tool_call_id": call.id,
+                                             "content": NOT_RUN if asked is not None else NOT_RUN_CLAIM})
                         continue
-                    outcome = run_tool(self.session, call.name, call.arguments, self.profile, self.edit_log)
+                    outcome = run_tool(self.session, call.name, call.arguments, self.profile, self.edit_log,
+                                       self.claims)
                     if outcome.ok and outcome.name == "run" and outcome.result:
                         self.runs.append({k: outcome.result[k] for k in ("exit_code", "duration_s", "timed_out")}
                                          | {"argv": outcome.args.get("argv")})
@@ -330,12 +341,16 @@ class Agent:
                     if outcome.schema_errors:
                         ev.schema_errors(str(outcome.args.get("ref", "")), outcome.schema_errors)
                     self.history.append({"role": "tool", "tool_call_id": call.id, "content": outcome.text})
-                    if outcome.ok and outcome.name == ENDS_TURN:
+                    if outcome.ok and outcome.name == "ask_user":
                         asked = outcome.result
+                    elif outcome.ok and outcome.name == "report_already_satisfied":
+                        claimed = outcome.result
                 rounds += 1
                 if asked is not None:  # no further model call this turn
                     ev.asked(asked)
                     return TurnResult(reply.content, rounds, False, asked)
+                if claimed is not None:
+                    return TurnResult(reply.content, rounds, False, None, claimed)
                 if rounds >= MAX_TOOL_ROUNDS:
                     message = (f"Stopped after {MAX_TOOL_ROUNDS} tool rounds without an answer. Ask again more "
                                "narrowly, or say what to look at.")

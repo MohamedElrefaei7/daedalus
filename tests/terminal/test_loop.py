@@ -83,6 +83,8 @@ class UI:
         self.said: list[str] = []
         self.checkins: list[loop.CheckIn] = []
         self.choices = list(choices)
+        self.satisfied_checkins: list = []
+        self.satisfied_choices: list = []
 
     def say(self, text: str, style: str | None = None) -> None:
         self.said.append(text)
@@ -90,6 +92,10 @@ class UI:
     def checkin(self, info):
         self.checkins.append(info)
         return self.choices.pop(0) if self.choices else ("continue", None)
+
+    def satisfied(self, info):
+        self.satisfied_checkins.append(info)
+        return self.satisfied_choices.pop(0) if self.satisfied_choices else "accept"
 
 
 # The scripted model -------------------------------------------------------------------------
@@ -487,7 +493,7 @@ def test_goal_through_the_repl_then_review_lessons(proj, fake) -> None:
     lines = ["/goal hello", "c", "/goal list", "/review lessons", "a"]
     repl.run(lambda prompt="": lines.pop(0) if lines else (_ for _ in ()).throw(EOFError))
     text = buf.getvalue()
-    assert "── iteration 1 of 3 ──" in text and "── check-in (scheduled) ── iteration 1 of 3" in text
+    assert "── iteration 1 of 3 · $0.0000 of $" in text and "── check-in (scheduled) ── iteration 1 of 3" in text
     assert "ended: done — the goal is honestly done." in text
     assert "→ proposed lesson" in text and "/review lessons walks them." in text
     assert "1 iteration(s)" not in text and "2 iteration(s)  stopped: done" in text

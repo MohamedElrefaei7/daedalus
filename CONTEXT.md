@@ -477,6 +477,28 @@
   - `uv run pytest -q` run directly in scratch2 left `__pycache__/` untracked there: its `.gitignore` doesn't ignore it.
 - **Fix, found starting the live check:** `/help` printed through rich markup, so `[dir]`, `[text]`, and `[plan]` vanished from its lines (`/promote`'s and `/goal resume`'s since they were added); it's printed as plain text now, with a test that failed before. `/run` on a finished plan whose worktree is gone no longer tells you to diff and merge it.
 
+### 2026-11-28 — Commit 12c: run integrity across resumes, merges, and already-true goals
+
+- **A, cumulative limits:** a plan task's `max_iterations` and `budget_usd` are totals over every batch. A resume continues the numbering, pins the loop's limits to the totals, and fails at once (launching nothing) when none are left; the counts are stored in `plan_tasks` after every iteration (an interrupted one included) by a new loop hook, so a crash refunds nothing. The budget pre-check takes the larger of the stored cost and the ledger. Header and loop show the same numbers.
+- **B, merges:** `/wt merge` on an unfinished plan run shows its tasks and the final gate, and asks `Merge an unfinished plan run? [y/N]`; every merge of a plan branch records `merged_sha` and closes the run, and `/run` refuses a closed one. Startup reconciliation closes any run whose branch head is in HEAD, with the merge that took it there (a dropped branch is found through its tasks' last commit).
+- **C, `satisfied_at_base`:** the coder profile's `report_already_satisfied(evidence)` (fifteen tools), only in a plan task's run; it ends the turn, and the loop verifies the four checks itself (the red test exists; it passes at the start commit with only the red-test files copied in; the net diff touches only those files and `conftest.py`; every other guard holds), then asks `[a]ccept as satisfied / [s]top`. Accepted counts as finished for the final gate and for merging. `submit_plan` now tells Claude to read every existing file a task's `files` names.
+- **D, structured `red_test`:** a non-empty list of `path.py` / `path.py::node`, validated (relative, in the repo after realpath, `.py`, no `..` or `.git`, existing or created by this or an earlier task); prose goes in `red_test_note`, which nothing parses. The regex is gone. `/run` refuses an approved plan with a text `red_test`. **No pending plan in the live queue used the old format** (none was pending); the two approved ones keep it as history.
+- **E1:** the whole-suite listing at done now also refuses a collection error in a file that collected cleanly at the start. "Couldn't run at done" was already refused in 12b; both have breaks. **E2:** `read_runs` and `/runs` show iterations and cost against the limits, resumes and each run's stop, `satisfied_at_base`, and `merged_sha`. **E3:** `/new` adds `__pycache__/` and `.pytest_cache/` to the repo's `.gitignore` in the init commit; scratch `580bdfc` and scratch2 `bc12b95` (`gitignore: test caches`), and scratch2's two stray `__pycache__/` folders were deleted.
+- **Queue schema v7:** both plan-run tables rebuilt, rows kept (tested from frozen v6 DDL, with a mid-rebuild failure). The live v6 queue was backed up first.
+- **Tests:** 1091 by default, 29 new (1062 before): run integrity 16 (limits across resumes ×3, merges ×4, already-satisfied ×6 with the REPL check-in, collection at done ×2, a claim outside a plan), structured red tests 8 in validation and 2 in `/run` (notes never become paths, an old-format plan refused), `/new`'s `.gitignore` 4, the v6→v7 migration 2; minus the dotted-name regex test and two preflight cases that validation now catches. 14 live, all passing.
+- **Proved red nine ways** (each made, its test run, then restored):
+  1. A resume granting a fresh iteration count: `test_iterations_are_counted_across_resumes`, `('failed', 'max_iterations', 3) == ('failed', 'max_iterations', 2)`.
+  2. A resume resetting the spend: `test_budget_is_counted_across_resumes`, `('failed', 'max_iterations') == ('failed', 'budget')`.
+  3. A crash refunding the interrupted iteration: `test_a_crash_refunds_nothing`, "the killed iteration was counted, so nothing more was launched" (`4 == 3` model calls).
+  4. `/wt merge` not asking: `test_merging_an_unfinished_plan_run_asks_first` (it merged at once; the run summary never printed).
+  5. No reconciliation: `test_a_merged_plan_branch_closes_its_run` (no "closed plan run …" at startup; /run didn't refuse).
+  6. The claim skipping step 2, a goal not true at base: `test_an_unverified_satisfied_claim_is_refused`, `assert (True is False)` (the claim verified).
+  7. The claim skipping step 3, with `src/` changed: `test_a_satisfied_claim_with_code_changes_is_refused` (a satisfied check-in was asked).
+  8. Regex extraction back for `red_test_note`: `test_notes_never_become_paths`, "the red test's tool.py, tests/test_other.py doesn't exist …".
+  9. A collection error at done let through: `test_a_new_collection_error_at_done_is_refused`, `assert not True` (done). The 12b behavior, couldn't-run refused, broke the same way: `test_a_collection_that_cant_run_at_done_is_refused`.
+  Breaks 2, 4, and 7 first went red only through the scripted fakes; the tests now script enough to reach the real assertion.
+- **Live check:** Mohamed's, after this commit (Part G).
+
 ## Key decisions
 
 - ★ **No unapproved plan touches the vault.** Plans are validated in full and held in the queue (Op.WRITE_PLAN into `plans/`); the generic `apply` refuses them, so approval (`approve_plan`) always writes the plan and its new decisions together.
@@ -491,6 +513,10 @@
 - ★ **A red test must be red for the right reason, and must fail without the change** (the counterfactual against the task's start commit with only the red-test files copied in).
 - ★ **A plan is done only when the whole suite passes on its branch.**
 - **A config change checks in before done is declared.**
+- ★ **A plan task's limits are totals across every resume,** stored after every iteration; a crash refunds nothing.
+- ★ **Merging a plan branch closes its run;** an unfinished one merges only on an explicit y, and any merge (by hand too) is found at startup.
+- ★ **"The goal already holds" is verified, never trusted:** the red test must pass at the start commit with only the test copied in, and the task may have changed nothing else.
+- ★ **`red_test` is structured; nothing parses paths out of prose.**
 - **A running plan run holds an OS lock for its life;** a free lock on a `running` row means its process is gone, and a queue open reconciles it to interrupted.
 - **Text that reaches Claude names no slash command** except in a sentence addressed to Mohamed; stored stop texts name none, and the terminal adds the command to type.
 - ★ **`validate_plan` returns every error at once,** each naming its field and task id, so one round trip tells Claude everything to fix.
@@ -644,9 +670,9 @@
 
 Commit 13: context sets.
 
-Claude's plan instructions: read every file a task changes before submitting (the pytest-testpaths plan's premise was false).
+Claude reads every file a task changes before submitting (`submit_plan` now says so; commit 13's `context_used` is where it gets a real check).
 
-`/run` should notice a plan branch that's already merged, and the task header should count a resumed batch's iterations.
+Let Mohamed grant extra iterations at a check-in.
 
 `--retry` for failed plan tasks.
 

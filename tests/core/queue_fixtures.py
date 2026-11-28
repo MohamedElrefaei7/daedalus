@@ -117,9 +117,23 @@ SAMPLE_PLAN_ROWS = (
     "'red test already passes', NULL, 'e')",
 )
 
+_REASONS_V6 = _REASONS + ", 'final_suite'"
+V6_PLAN_RUNS = (
+    V5_PLAN_RUNS[0].replace(f"IN ({_REASONS})", f"IN ({_REASONS_V6})").replace(
+        "updated_at     TEXT NOT NULL\n    )", "updated_at     TEXT NOT NULL,\n        final_output   TEXT\n    )"),
+    *V5_PLAN_RUNS[1:],
+)
+assert "final_output" in V6_PLAN_RUNS[0] and "final_suite" in V6_PLAN_RUNS[0]
+SAMPLE_PLAN_ROWS_V6 = tuple(
+    sql.replace("'2026-11-27T02:00:00+00:00')", "'2026-11-27T02:00:00+00:00', '3 passed')", 1)
+    .replace("'2026-11-27T03:30:00+00:00')", "'2026-11-27T03:30:00+00:00', NULL)", 1)
+    .replace("'2026-11-27T04:01:00+00:00', '2026-11-27T04:01:00+00:00')",
+             "'2026-11-27T04:01:00+00:00', '2026-11-27T04:01:00+00:00', NULL)", 1)
+    if sql.startswith("INSERT INTO plan_runs") else sql for sql in SAMPLE_PLAN_ROWS)
+
 DDL = {3: (V3_PROPOSALS, *CHANGESETS, INDEX), 4: (V4_PROPOSALS, *CHANGESETS, INDEX),
-       5: (V4_PROPOSALS, *CHANGESETS, INDEX, *V5_PLAN_RUNS)}
-SAMPLE_ROWS = {5: SAMPLE_PLAN_ROWS}
+       5: (V4_PROPOSALS, *CHANGESETS, INDEX, *V5_PLAN_RUNS), 6: (V4_PROPOSALS, *CHANGESETS, INDEX, *V6_PLAN_RUNS)}
+SAMPLE_ROWS = {5: SAMPLE_PLAN_ROWS, 6: SAMPLE_PLAN_ROWS_V6}
 
 COLUMNS = ("id", "vault", "rel_path", "kind", "content", "base_sha256", "base_content", "source", "summary",
            "created_at", "updated_at", "status", "status_reason", "commit_sha", "target_path", "repo_path",

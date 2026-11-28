@@ -44,6 +44,8 @@ from daedalus.sandbox.errors import SandboxError
 from . import ledger, obsidian
 from daedalus.toolset import refusal
 
+from daedalus.core import planruns
+
 from . import loop as goal_loop
 from . import planrun
 from .agent import Agent, Events, ToolOutcome, tool_label
@@ -473,8 +475,24 @@ class Repl:
             if worktree.changes(project, args[0]):
                 self.console.print(Text("  (the worktree also has uncommitted changes, not shown)", style="dim"))
         elif sub == "merge" and len(args) == 1:
+            run = planruns.for_worktree(project, args[0])
+            if run is not None and not run.closed and run.status != "done":
+                # ★ An unfinished plan run merges only on an explicit y, after showing what isn't finished.
+                for line in planrun.merge_summary(run):
+                    self.console.print(Text(line), soft_wrap=True)
+                try:
+                    answer = self.read_line("Merge an unfinished plan run? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer != "y":
+                    self.console.print(f"not merged; agent/{args[0]} and the run are as they were.")
+                    return
             sha = worktree.merge(registry, project, args[0])
             self.console.print(f"merged agent/{args[0]} into {self.session.active_repo} as {sha[:7]} (--no-ff)")
+            if run is not None:
+                planruns.close(run.id, sha)
+                self.console.print(Text(f"  plan run {run.id} is closed: /run {run.slug}-v{run.version} now refuses; "
+                                        "revise the plan for further work.", style="dim"))
             self.console.print(Text(f"  /wt drop {args[0]} removes the worktree and its branch.", style="dim"))
         elif sub == "drop" and len(args) in (1, 2) and (len(args) == 1 or args[1] == "--force"):
             if self.coding is not None and self.coding.slug == args[0]:
@@ -590,6 +608,17 @@ class Repl:
         if state["status"] == "stopped":
             self.coded.append(f"Goal run {state['run_id']} ({state['goal_ref']}, {state['branch']}): "
                               f"{state['stop_reason']} after {len(state['iterations'])} iteration(s).")
+
+    def reconcile_plan_runs(self) -> None:
+        """At startup: close every plan run whose branch is already merged into your checkout."""
+        try:
+            closed = planrun.reconcile_merged(self.session)
+        except Exception as e:  # never block startup on it; /run and /runs reconcile again
+            log.warning("plan run reconciliation failed: %s", e)
+            return
+        for run, sha in closed:
+            self.console.print(Text(f"closed plan run {run.id} ({run.slug} v{run.version}): its branch {run.branch} "
+                                    f"was merged at {sha[:7]}", style="dim"))
 
     def run_plan(self, plan_ref: str) -> None:
         if self.coding is not None:
@@ -799,7 +828,9 @@ class Repl:
         for t in pv.tasks:
             self.console.print(Text(f"{t.id}  {t.summary}", style="bold"))
             say(f"    files:      {', '.join(t.files)}")
-            say(f"    red test:   {t.red_test}")
+            say(f"    red test:   {', '.join(t.red_test)}")
+            if t.red_test_note:
+                say(f"    red note:   {t.red_test_note}")
             say(f"    done when:  {t.done_when}")
             budget = f"${t.budget_usd:.2f}" if isinstance(t.budget_usd, (int, float)) else str(t.budget_usd)
             say(f"    caps:       {t.max_iterations} iterations, {budget}")
@@ -896,6 +927,19 @@ class LoopView:
     def say(self, text: str, style: str | None = None) -> None:
         self.repl.view.end()
         self.repl.console.print(Text(text, style=style or ""))
+
+    def satisfied(self, info: goal_loop.Satisfied) -> str:
+        out = self.repl.console
+        self.repl.view.end()
+        out.print(Text(f"\n── check-in ── {info.task} says the goal already holds at {info.sha12}: {info.evidence} "
+                       "The red test passes there.", style="bold magenta"))
+        out.print(Text(info.diff_stat, style="dim"))
+        while True:
+            choice = self.repl.read_line("[a]ccept as satisfied / [s]top? ").strip().lower()
+            if choice in ("a", "accept"):
+                return "accept"
+            if choice in ("s", "stop"):
+                return "stop"
 
     def checkin(self, info: goal_loop.CheckIn) -> tuple[str, str | None]:
         out = self.repl.console
@@ -996,6 +1040,7 @@ def main(argv: list[str] | None = None, *, transport=None, read_line: Callable[.
     ds = DeepSeek(key, transport=transport)
     try:
         repl = Repl(session, cfg, ds, out, registry_path=args.registry, state_path=args.state)
+        repl.reconcile_plan_runs()
         log.info("session %s started: project %s, model %s", repl.session_id, session.active, cfg.model)
         code = repl.run(read_line or _prompt_reader())
         log.info("session %s ended", repl.session_id)

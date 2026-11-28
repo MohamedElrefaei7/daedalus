@@ -72,6 +72,7 @@ class LoopUI(Protocol):
 
     def say(self, text: str, style: str | None = None) -> None: ...
     def checkin(self, info: "CheckIn") -> tuple[str, str | None]: ...  # ("continue" | "redirect" | "stop", text)
+    def satisfied(self, info: "Satisfied") -> str: ...  # "accept" | "stop"
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,17 @@ class CheckIn:
 MAX_TESTS_DIFF_CHARS = 6_000
 
 
+@dataclass(frozen=True)
+class Satisfied:
+    """A verified report_already_satisfied, put to Mohamed: accept as satisfied, or stop."""
+
+    task: str
+    sha12: str
+    evidence: str
+    iteration: int
+    diff_stat: str
+
+
 def spend(state: dict) -> tuple[float, float, int]:
     """(this batch's spend, the run's total across every resume, the number of batches)."""
     total = ledger.spent(run_id=state["run_id"])
@@ -102,6 +114,8 @@ def spend(state: dict) -> tuple[float, float, int]:
 
 def _spend_text(state: dict) -> str:
     batch, total, n = spend(state)
+    if state.get("cumulative"):  # a plan task: its budget is a total over every run of it
+        return f"spent ${total:.4f} of ${state['budget_usd']:.2f}" + (f" across {n} runs" if n > 1 else "")
     text = f"spent ${batch:.4f} of ${state['budget_usd']:.2f}"
     return text + (f" this batch; ${total:.4f} in total across {n} batches" if n > 1 else "")
 
@@ -236,6 +250,10 @@ class Loop:
         self.proposals: list[str] = []  # made by the run's agents (questions), for /end's review
         # Called with the state when every other guard held; returns one more Guard (or None). /run sets it.
         self.after_check: Callable[[dict], goals.Guard | None] | None = None
+        # Called after every recorded iteration (an interrupted one included). /run stores the task's totals.
+        self.after_iteration: Callable[[dict], None] | None = None
+        # A plan task's report_already_satisfied: the guards that verify the claim. /run sets it.
+        self.verify_satisfied: Callable[[dict], list[goals.Guard]] | None = None
 
     # Start ------------------------------------------------------------------------------
 
@@ -365,7 +383,12 @@ class Loop:
             self.ui.say(f"Resuming {state['run_id']}: iteration {last['n']} was done and held at a check-in; "
                         "nothing has changed since, so it finishes as done.", "bold")
             return self.finish(state, "done")
-        if state["status"] == "stopped":  # another batch: the goal note's iterations and budget again
+        if state["status"] == "stopped" and state.get("cumulative"):
+            # A plan task: its limits are totals over every batch, already set by /run; nothing is granted.
+            state.setdefault("batches", [{"started": state["started"], "spent_before": 0.0}]).append(
+                {"started": _now(), "spent_before": ledger.spent(run_id=state["run_id"])})
+            state["stop_reason"] = None
+        elif state["status"] == "stopped":  # another batch: the goal note's iterations and budget again
             state["limit_iterations"] = len(state["iterations"]) + state["max_iterations"]
             total = ledger.spent(run_id=state["run_id"])
             state["limit_budget"] = round(total + state["budget_usd"], 6)
@@ -407,6 +430,9 @@ class Loop:
                                     "edits": [c[3:] for c in changes], "commit": sha, "exit_code": None,
                                     "counts": None, "guards": [], "done": False, "config": [], "interrupted": True})
         state["next"] = n + 1
+        save(state)
+        if self.after_iteration is not None:  # the interrupted iteration counts: a crash refunds nothing
+            self.after_iteration(state)
 
     # The iterations ---------------------------------------------------------------------
 
@@ -428,6 +454,13 @@ class Loop:
                 if choice == "paused":
                     return state
                 redirected = choice == "redirect"
+            if last.get("satisfied") and not redirected:
+                choice = self.satisfied_checkin(state, last)
+                if choice == "accept":
+                    return self.finish(state, "satisfied_at_base")
+                if choice == "paused":
+                    return state
+                return self.finish(state, "stopped at a check-in")
             if last["done"] and not redirected:
                 return self.finish(state, "done")
             if len(state["iterations"]) >= state["limit_iterations"]:
@@ -484,9 +517,11 @@ class Loop:
         n = state["next"]
         nn = state["log_offset"] + n
         s = self.run_session(state)
-        self.ui.say(f"\n── iteration {n} of {state['limit_iterations']} ── {state['run_id']}", "bold cyan")
+        self.ui.say(f"\n── iteration {n} of {state['limit_iterations']} · ${ledger.spent(run_id=state['run_id']):.4f} "
+                    f"of ${state['limit_budget']:.2f} ── {state['run_id']}", "bold cyan")
         agent = Agent(s, self.ds, self.cfg, self.session_id, meter=self.meter, profile="coder",
-                      run_id=state["run_id"], run_cap=state["limit_budget"])
+                      run_id=state["run_id"], run_cap=state["limit_budget"],
+                      claims=self.verify_satisfied is not None and bool(state.get("red")))
         text = self.message(state, n)
         state["redirect"] = None
         save(state)
@@ -527,6 +562,9 @@ class Loop:
             a = turn.asked
             record["asked"] = a["id"]
             state["question"] = {"id": a["id"], "vault": a["vault"], "rel_path": a["rel_path"], "delivered": False}
+        elif turn is not None and turn.claimed:  # the goal already holds, says the agent: verified, not trusted
+            record["claim"] = turn.claimed["evidence"]
+            self._check(state, record, claim=True)
         else:
             self._check(state, record)
         record["summary"] = record["summary"] or _one_line(", ".join(edits) or "no changes", 60)
@@ -538,6 +576,8 @@ class Loop:
         state["config_changed"] = sorted(set(state["config_changed"]) | set(config))
         state["next"] = n + 1
         save(state)
+        if self.after_iteration is not None:
+            self.after_iteration(state)
         self._say_iteration(record)
         if record["asked"]:
             state["status"], state["pause"] = "paused", "ask_user"
@@ -550,7 +590,7 @@ class Loop:
             return self._finish_capped(state, capped)
         return "ok"
 
-    def _check(self, state: dict, record: dict) -> None:
+    def _check(self, state: dict, record: dict, claim: bool = False) -> None:
         s = self.run_session(state)
         result = self.runner(s, list(state["argv"]), Path(state["wt_path"]))
         out = result.stdout_tail + (("\n" + result.stderr_tail) if result.stderr_tail.strip() else "")
@@ -563,22 +603,37 @@ class Loop:
         if goal_like.is_pytest:
             listed = self.runner(s, goals.collect_argv(state["argv"]), Path(state["wt_path"]))
             now_ids = goals.parse_collect(listed.stdout_tail).node_ids
-        suite_now = None
+        suite_now, suite_errors_now = None, ()
         if result.exit_code == 0 and baseline.suite_measured:  # at done: the whole suite, listed again
             suite = self.collect_suite(s, Path(state["wt_path"]))
-            suite_now = None if suite["suite_error"] else tuple(suite["suite_node_ids"])
+            suite_now = None if suite["suite_error"] else tuple(suite["suite_node_ids"])  # couldn't run: refused
+            suite_errors_now = tuple(suite["suite_collection_errors"])
         verdict = goals.judge(goal_like, result.exit_code, result.stdout_tail, baseline, changed, now_ids,
-                              state["wt_path"], suite_now)
-        if verdict.done and self.after_check is not None:  # e.g. a plan task's counterfactual red test
-            extra = self.after_check(state)
-            if extra is not None:
-                verdict = goals.Verdict(verdict.done and extra.held, (*verdict.guards, extra))
+                              state["wt_path"], suite_now, suite_errors_now)
+        if claim:
+            # ★ satisfied_at_base: the four checks are the claim's, and the counterfactual is replaced by its
+            # opposite (the red test must PASS at the start commit). A claim is never "done": Mohamed accepts it.
+            extra = tuple(self.verify_satisfied(state)) if self.verify_satisfied is not None else ()
+            guards = (*verdict.guards, *extra)
+            held = all(g.held for g in guards)
+            record["satisfied"] = held
+            failed = [g.detail for g in guards if not g.held]
+            reason = (f"the goal already holds at {state['base'][:12]}: verified" if held else
+                      "the claim that the goal already holds didn't verify: " + "; and ".join(failed))
+            verdict = goals.Verdict(False, guards)
+            verdict_reason = reason
+        else:
+            verdict_reason = None
+            if verdict.done and self.after_check is not None:  # e.g. a plan task's counterfactual red test
+                extra = self.after_check(state)
+                if extra is not None:
+                    verdict = goals.Verdict(verdict.done and extra.held, (*verdict.guards, extra))
         counts = goals.parse_pytest(result.stdout_tail) if goal_like.is_pytest else None
         missing = sorted(set(baseline.node_ids) - set(now_ids)) if now_ids is not None else None
         if suite_now is not None:
             missing = sorted(set(missing or ()) | (set(baseline.suite_node_ids) - set(suite_now)))
         record.update(exit_code=result.exit_code, counts=counts.__dict__ if counts else None,
-                      guards=[g.__dict__ for g in verdict.guards], done=verdict.done, verdict=verdict.reason,
+                      guards=[g.__dict__ for g in verdict.guards], done=verdict.done, verdict=verdict_reason or verdict.reason,
                       timed_out=result.timed_out, output_tail=_tail_lines(out, LOG_TAIL_LINES),
                       missing_node_ids=missing, protected_changed=changed)
 
@@ -642,6 +697,8 @@ class Loop:
             note = f"{restored} {note}" if note else restored
         modified, tests_diff = goals.tests_modified(wt, state["base"], state["baseline"].get("test_files", []))
         batch, total, n = spend(state)
+        if state.get("cumulative"):  # a plan task's spend and budget are totals over every run
+            batch, n = total, 1
         info = CheckIn(len(state["iterations"]), state["limit_iterations"], batch, state["budget_usd"], last["summary"],
                        goals.diff_stat(wt, state["base"]), last["config"], config_diff, note, modified,
                        _capped(tests_diff, MAX_TESTS_DIFF_CHARS), total, n)
@@ -656,6 +713,18 @@ class Loop:
             state["redirect"] = text
             save(state)
         return choice
+
+    def satisfied_checkin(self, state: dict, last: dict) -> str:
+        """"t1 says the goal already holds at <sha12>: <evidence>. The red test passes there." Accept or stop."""
+        info = Satisfied(state.get("task_id") or state["goal_slug"], state["base"][:12], last.get("claim", ""),
+                         len(state["iterations"]), goals.diff_stat(state["wt_path"], state["base"]))
+        try:
+            return self.ui.satisfied(info)
+        except (EOFError, KeyboardInterrupt):
+            state["status"], state["pause"] = "paused", "checkin"
+            save(state)
+            self.ui.say(f"Paused {state['run_id']} at a check-in; {_resume(state)} continues.", "yellow")
+            return "paused"
 
     # The end ----------------------------------------------------------------------------
 

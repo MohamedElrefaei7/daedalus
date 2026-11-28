@@ -25,7 +25,7 @@ NOT_FOUND = RunResult(4, "\nno tests ran in 0.01s\n", "ERROR: file or directory 
                       0.2, False)
 IMPORT_ERROR = RunResult(2, "E   ImportError: cannot import name 'X'\n1 error in 0.01s\n", "", 0.1, False)
 FIX_X = ("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"})
-NEW_TASK = dict(files=["src/x.py", "tests/test_new.py"], red_test="tests/test_new.py::test_new fails first",
+NEW_TASK = dict(files=["src/x.py", "tests/test_new.py"], red_test=["tests/test_new.py::test_new"],
                 done_when="pytest -q tests/test_new.py", max_iterations=1)
 
 
@@ -112,7 +112,7 @@ def test_a_path_that_exists_stays_and_a_missing_one_is_left_out(proj, fake) -> N
 
 def test_an_absent_red_test_no_task_creates_is_a_preflight_stop(proj, fake) -> None:
     """Break 3 target: exit 4 for a test no task creates is absent, not red."""
-    make_plan(proj, task("t1", files=["src/x.py"], red_test="tests/test_y.py::test_nope fails first"))
+    make_plan(proj, task("t1", files=["src/x.py"], red_test=["tests/test_y.py::test_nope"]))
     fake.responses += [*turn(IMPL)]  # scripted so a wrongly passed preflight reaches the assertions
     runner = Runner(RunResult(4, "\nno tests ran in 0.01s\n", "ERROR: not found: tests/test_y.py::test_nope\n", 0.1,
                               False), pytest_out(passed=1, failed=1), pytest_out(passed=2), pytest_out(passed=2))
@@ -172,7 +172,7 @@ def test_the_counterfactual_runs_against_the_code_before_the_change(proj, fake) 
 
 
 def test_an_unchanged_red_test_that_was_red_needs_no_counterfactual(proj, fake) -> None:
-    make_plan(proj, task("t1", files=["src/x.py"], red_test="tests/test_x.py::test_x fails first"))
+    make_plan(proj, task("t1", files=["src/x.py"], red_test=["tests/test_x.py::test_x"]))
     fake.responses += [*turn(IMPL)]
     runner = Runner(pytest_out(failed=1), pytest_out(passed=1, failed=1), pytest_out(passed=2), pytest_out(passed=2))
     run = runner_for(proj, fake, UI(), runner).run("mathx")
@@ -185,7 +185,7 @@ def test_an_unchanged_red_test_that_was_red_needs_no_counterfactual(proj, fake) 
 def test_final_suite_gates_plan_done(proj, fake) -> None:
     """Break 6 target: every task done, but the whole suite fails on the branch: the plan isn't done."""
     make_plan(proj, task("t1", **{**NEW_TASK, "done_when": "pytest -q tests/test_new.py"}),
-              task("t2", files=["src/x.py"], red_test="tests/test_x.py::test_x fails first",
+              task("t2", files=["src/x.py"], red_test=["tests/test_x.py::test_x"],
                    done_when="pytest -q tests/test_x.py"))
     fake.responses += [*turn(real_test(), IMPL), *turn(("write_code", {"rel_path": "src/x.py", "content": "X = 2\n"}))]
     failing = RunResult(1, "..F.\nFAILED tests/test_new.py::test_new - assert 2 == 1\n1 failed, 3 passed in 0.02s\n",
@@ -318,7 +318,7 @@ def test_classify_run_tells_an_import_error_from_an_absent_test() -> None:
 
 def test_a_red_test_that_fails_to_import_is_red_at_preflight(proj, fake) -> None:
     """commit 12's t2 shape: a protected test, named by node ID, that can't import what the task will write."""
-    make_plan(proj, task("t1", files=["src/x.py"], red_test="tests/test_x.py::test_x fails first"))
+    make_plan(proj, task("t1", files=["src/x.py"], red_test=["tests/test_x.py::test_x"]))
     fake.responses += [*turn(IMPL)]
     runner = Runner(IMPORT_ERROR_4, pytest_out(passed=1, failed=1), pytest_out(passed=2), pytest_out(passed=2))
     run = runner_for(proj, fake, UI(), runner).run("mathx")

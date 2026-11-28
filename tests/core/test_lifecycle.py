@@ -97,7 +97,7 @@ def test_success_commits_exactly_the_template_and_leaves_your_work_alone(proj) -
     base = head(repo)
     made = new_project("delta", repo, proj.registry_path)
 
-    want = sorted([*(f"vault/{f}" for f in template_files()), "vault/.obsidian/types.json"])
+    want = sorted([*(f"vault/{f}" for f in template_files()), "vault/.obsidian/types.json", ".gitignore"])
     assert list(made.files) == want
     assert git(repo, "show", "--name-only", "--format=", "HEAD").split() == want
     assert git(repo, "log", "-1", "--format=%s").strip() == INIT_MESSAGE
@@ -205,8 +205,8 @@ def subprocess_ok(repo) -> bool:
 def test_rollback_keeps_a_commit_that_is_no_longer_head(proj, monkeypatch) -> None:
     repo = proj.extra["repo"]
 
-    def commit_then_someone_commits(r):
-        sha = lifecycle.commit_path(r, "vault", [INIT_MESSAGE], add=True)
+    def commit_then_someone_commits(r, extra=()):
+        sha = lifecycle.commit_paths(r, ["vault", *extra], [INIT_MESSAGE], add=["vault", *extra])
         write_raw(repo, "other.txt", "x\n")
         git(repo, "add", "other.txt")
         git(repo, "commit", "-q", "-m", "someone else", "--", "other.txt")
@@ -218,3 +218,41 @@ def test_rollback_keeps_a_commit_that_is_no_longer_head(proj, monkeypatch) -> No
         new_project("delta", repo, proj.registry_path)
     assert "no longer the init commit" in str(exc.value)
     assert git(repo, "log", "-1", "--format=%s").strip() == "someone else"
+
+
+# The repo ignores test caches (commit 12c) -------------------------------------------------
+
+def test_new_adds_the_cache_ignores_in_the_init_commit(proj) -> None:
+    repo = proj.extra["repo"]
+    made = new_project("delta", repo, proj.registry_path)
+    assert ".gitignore" in made.files
+    text = (repo / ".gitignore").read_text()
+    assert "__pycache__/\n" in text and ".pytest_cache/\n" in text
+    assert git(repo, "show", "HEAD:.gitignore") == text and ".gitignore" not in status(repo)
+
+
+def test_an_existing_gitignore_gains_only_the_missing_lines(proj) -> None:
+    repo = proj.extra["repo"]
+    write_raw(repo, ".gitignore", "*.log\n__pycache__\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore logs")
+    new_project("delta", repo, proj.registry_path)
+    assert (repo / ".gitignore").read_text() == "*.log\n__pycache__\n# test caches (added by daedalus /new)\n.pytest_cache/\n"
+
+
+def test_a_gitignore_with_uncommitted_changes_is_left_alone(proj) -> None:
+    repo = proj.extra["repo"]
+    write_raw(repo, ".gitignore", "*.tmp\n")
+    made = new_project("delta", repo, proj.registry_path)
+    assert ".gitignore" not in made.files and (repo / ".gitignore").read_text() == "*.tmp\n"
+
+
+def test_a_failed_new_restores_the_gitignore(proj, monkeypatch) -> None:
+    import daedalus.core.lifecycle as lifecycle
+
+    repo = proj.extra["repo"]
+    monkeypatch.setattr(lifecycle.registry_mod, "register_project",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected")))
+    with pytest.raises(LifecycleError, match="injected"):
+        new_project("delta", repo, proj.registry_path)
+    assert not (repo / ".gitignore").exists() and ".gitignore" not in git(repo, "ls-files")

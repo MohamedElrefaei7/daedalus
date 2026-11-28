@@ -59,7 +59,7 @@ MAX_SLUG = 64
 MAX_ITERATIONS = 10
 
 TASK_REQUIRED = ("id", "summary", "files", "red_test", "done_when", "max_iterations", "budget_usd")
-TASK_OPTIONAL = ("protected",)
+TASK_OPTIONAL = ("protected", "red_test_note")
 DECISION_KEYS = ("category", "choice", "basis")
 DECISION_OPTIONAL = ("consequences",)  # commit 12b: what follows from the choice; written into the note
 DECISION_SERVER_KEYS = ("note",)  # approval links each new decision to the note it wrote
@@ -258,7 +258,7 @@ def _task_errors(session: Session, tasks: Any, cap: float) -> list[str]:
             seen[tid] = i
         for key in sorted(set(t) - set(TASK_REQUIRED) - set(TASK_OPTIONAL), key=str):
             errors.append(f"{where}.{key}: unknown key; a task has {', '.join(TASK_REQUIRED)}, and optionally "
-                          "protected")
+                          "protected and red_test_note")
         for key in TASK_REQUIRED:
             if key not in t:
                 errors.append(f"{where}.{key}: missing")
@@ -266,9 +266,10 @@ def _task_errors(session: Session, tasks: Any, cap: float) -> list[str]:
             errors.append(f"{where}.summary: must be one line")
         if "files" in t:
             errors += _file_errors(session, where, t["files"])
-        if "red_test" in t and not _one_line(t["red_test"]):
-            errors.append(f"{where}.red_test: must be one line naming the test that fails before the change and "
-                          "passes after it")
+        if "red_test" in t:
+            errors += _red_test_errors(session, where, t["red_test"], _norm_files(t.get("files")) | earlier_files)
+        if "red_test_note" in t and (not isinstance(t["red_test_note"], str) or not t["red_test_note"].strip()):
+            errors.append(f"{where}.red_test_note: must be non-empty text, or left out")
         if "done_when" in t:
             errors += _done_when_errors(where, t["done_when"], commands)
         if "max_iterations" in t:
@@ -285,6 +286,47 @@ def _task_errors(session: Session, tasks: Any, cap: float) -> list[str]:
         if "protected" in t:
             errors += _protected_errors(session, where, t["protected"], earlier_files)
         earlier_files |= _norm_files(t.get("files"))
+    return errors
+
+
+RED_TEST_EXAMPLE = '["tests/test_x.py::test_name"]'
+
+
+def _red_test_errors(session: Session, where: str, raw: Any, creators: set[str]) -> list[str]:
+    """★ red_test is a non-empty list of `path.py` or `path.py::node` (commit 12c): nothing parses paths out of
+    prose any more, so `[tool.pytest.ini_options]` in a sentence can never become a file."""
+    if isinstance(raw, str):
+        return [f"{where}.red_test: is text, and it must now be a list of the red tests, each path.py or "
+                f"path.py::test_name, e.g. {RED_TEST_EXAMPLE}; put any explanation in red_test_note"]
+    if not isinstance(raw, list) or not raw:
+        return [f"{where}.red_test: must be a non-empty list of the red tests, each path.py or path.py::test_name, "
+                f"e.g. {RED_TEST_EXAMPLE}"]
+    repo = os.path.realpath(session.active_repo)
+    errors: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip() or "\n" in item:
+            errors.append(f"{where}.red_test: {item!r} must be one path.py or path.py::test_name")
+            continue
+        path, sep, node = item.strip().partition("::")
+        norm = posixpath.normpath(path)
+        parts = norm.split("/")
+        if sep and not node.strip():
+            errors.append(f"{where}.red_test: {item!r} has '::' but no test name after it")
+        elif os.path.isabs(path) or path.startswith("~"):
+            errors.append(f"{where}.red_test: {item!r} must be relative to the repo root")
+        elif not path.endswith(".py"):
+            errors.append(f"{where}.red_test: {item!r} must name a .py test file (path.py or path.py::test_name)")
+        elif norm != path or parts[0] == ".." or ".." in parts:
+            errors.append(f"{where}.red_test: {item!r} must be a plain repo-relative path, with no '..' or './'")
+        elif any(p.casefold() == ".git" for p in parts):
+            errors.append(f"{where}.red_test: {item!r} is under .git")
+        else:
+            real = os.path.realpath(os.path.join(repo, norm))
+            if real != repo and not real.startswith(repo + os.sep):
+                errors.append(f"{where}.red_test: {item!r} escapes the repo (it resolves to {real})")
+            elif not os.path.lexists(os.path.join(repo, norm)) and norm.casefold() not in creators:
+                errors.append(f"{where}.red_test: {path!r} doesn't exist, and neither this task nor an earlier one "
+                              "lists it in files")
     return errors
 
 
@@ -585,11 +627,12 @@ class TaskView:
     id: str
     summary: str
     files: tuple[str, ...]
-    red_test: str
+    red_test: tuple[str, ...]
     done_when: str
     max_iterations: Any
     budget_usd: Any
     protected: tuple[str, ...]
+    red_test_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -616,8 +659,9 @@ def view(text: str, rel_path: str) -> PlanView:
                                    d["consequences"].strip() if isinstance(d.get("consequences"), str) else None)
                       for d in fm.get("decisions") or [] if isinstance(d, dict))
     tasks = tuple(TaskView(str(t.get("id", "?")), str(t.get("summary", "")), _strs(t.get("files")),
-                           str(t.get("red_test", "")), str(t.get("done_when", "")), t.get("max_iterations"),
-                           t.get("budget_usd"), _strs(t.get("protected")))
+                           _strs(t.get("red_test")), str(t.get("done_when", "")), t.get("max_iterations"),
+                           t.get("budget_usd"), _strs(t.get("protected")),
+                           t["red_test_note"] if isinstance(t.get("red_test_note"), str) else None)
                   for t in fm.get("tasks") or [] if isinstance(t, dict))
     lines = body.strip().splitlines()
     if lines and lines[0].startswith("# "):

@@ -23,7 +23,7 @@ from daedalus.terminal.config import Config
 
 def task(tid="t1", **kw) -> dict:
     base = {"id": tid, "summary": f"task {tid}", "files": ["src/x.py", "tests/test_x.py"],
-            "red_test": "tests/test_x.py::test_x fails, then passes", "done_when": "pytest -q",
+            "red_test": ["tests/test_x.py::test_x"], "done_when": "pytest -q",
             "max_iterations": 2, "budget_usd": 0.5}
     return {**base, **kw}
 
@@ -84,7 +84,7 @@ def test_run_refuses_a_plan_that_isnt_approved(proj, fake) -> None:
 
 def test_tasks_run_in_order_on_one_branch_and_t2_sees_t1s_work(proj, fake) -> None:
     make_plan(proj, task("t1"), task("t2", files=["src/y.py", "tests/test_y2.py"],
-                                     red_test="tests/test_y2.py::test_y2 fails first"))
+                                     red_test=["tests/test_y2.py::test_y2"]))
     fake.responses += [*turn(("write_code", {"rel_path": "src/x.py", "content": "X = 1\n"}),
                              ("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"}),
                              done="t1 done"),
@@ -106,7 +106,7 @@ def test_tasks_run_in_order_on_one_branch_and_t2_sees_t1s_work(proj, fake) -> No
     assert any("X = 1" in c for c in t2_tools), "t2 read t1's file on the shared branch"
     assert sorted(p.name for p in (proj.alpha / "logs").glob("plan-mathx-v1-*")) == \
         ["plan-mathx-v1-t1-01.md", "plan-mathx-v1-t2-01.md"]
-    assert "t1 · task t1 · 0/2 iterations · $0.00 of $0.50" in ui.said
+    assert "t1 · task t1 · 0 of 2 iterations used · $0.0000 of $0.50" in ui.said
     assert "every task is done and the full suite passes" in ui.said[-1]
     # Only Mohamed merges: nothing was merged, and dropping the unmerged branch still needs force.
     assert git(proj.alpha_repo, "branch", "--merged", "HEAD").count("plan-mathx-v1") == 0
@@ -121,7 +121,7 @@ def test_tasks_run_in_order_on_one_branch_and_t2_sees_t1s_work(proj, fake) -> No
 
 def test_stops_at_the_first_unfinished_task(proj, fake) -> None:
     """Break 8 target: /run must not go on to t2 after t1 fails."""
-    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test="tests/test_y2.py fails"))
+    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test=["tests/test_y2.py"]))
     fake.responses += [*turn(done="try one"), *turn(done="try two"), *turn(done="t2 one"), *turn(done="t2 two")]
     # red test, baseline, two failing checks for t1; then (scripted, so a run that wrongly goes on reaches the
     # assertions) a baseline and two checks t2 must never use
@@ -147,7 +147,7 @@ def test_a_check_that_passes_dishonestly_is_honest_done_refused(proj, fake) -> N
 
 def test_a_red_test_that_already_passes_stops_with_preflight(proj, fake) -> None:
     """Break 9 target: a task whose red test is green before it starts has no honest done-condition."""
-    make_plan(proj, task("t1", red_test="tests/test_y.py::test_y fails first"))
+    make_plan(proj, task("t1", red_test=["tests/test_y.py::test_y"]))
     fake.responses += [*turn(done="nothing to do")]  # scripted so a skipped preflight reaches the assertions
     runner = Runner(pytest_out(passed=1), pytest_out(passed=1), pytest_out(passed=2))
     run = runner_for(proj, fake, UI(), runner).run("mathx")
@@ -160,8 +160,6 @@ def test_a_red_test_that_already_passes_stops_with_preflight(proj, fake) -> None
 
 @pytest.mark.parametrize("change, words", [
     ({"protected": ["tests/test_nope.py"]}, None),
-    ({"red_test": "tests/test_other.py::test_o fails"}, "lists it in files"),
-    ({"red_test": "the CLI prints 5"}, "names no test file"),
     ({"done_when": "ruff check"}, "rule 7"),
 ])
 def test_preflight_stops(proj, fake, change, words) -> None:
@@ -233,7 +231,7 @@ def test_resume_uses_the_stored_baseline(proj, fake) -> None:
 
 
 def test_a_question_stops_the_run_and_resumes_after_the_answer(proj, fake) -> None:
-    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test="tests/test_y2.py fails"))
+    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test=["tests/test_y2.py"]))
     fake.responses += [reply_chunks(tool_calls=[{"name": "ask_user", "args": ASK, "id": "q1"}])]
     run = runner_for(proj, fake, UI(), Runner(RED, RED)).run("mathx")
     t1 = planruns.task(run.id, "t1")
@@ -254,7 +252,7 @@ def test_a_question_stops_the_run_and_resumes_after_the_answer(proj, fake) -> No
 
 
 def test_done_tasks_are_never_rerun(proj, fake) -> None:
-    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test="tests/test_y2.py fails"))
+    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test=["tests/test_y2.py"]))
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"})),
                        reply_chunks(tool_calls=[{"name": "ask_user", "args": ASK, "id": "q1"}])]
     run = runner_for(proj, fake, UI(), Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2))).run("mathx")
@@ -295,7 +293,7 @@ def test_a_baseline_is_stored_once(proj) -> None:
 # read_runs and /runs --------------------------------------------------------------------------
 
 def test_read_runs_reports_every_task(proj, fake) -> None:
-    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test="tests/test_y2.py fails"))
+    make_plan(proj, task("t1"), task("t2", files=["tests/test_y2.py"], red_test=["tests/test_y2.py"]))
     fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"}),
                              done="made test_x pass"), *turn(done="nope"), *turn(done="still no")]
     runner = Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2), pytest_out(passed=2, failed=1),
@@ -319,7 +317,7 @@ def test_read_runs_reports_every_task(proj, fake) -> None:
     assert status["run"]["status"] == "failed" and status["run"]["tasks"][1] == \
         {"id": "t2", "status": "failed", "stop_reason": "max_iterations"}
     text = planrun.format_runs(out)
-    assert "t2 · task t2 · failed (max_iterations) · 2 iteration(s)" in text
+    assert "t2 · task t2 · failed (max_iterations) · 2 of 2 iterations · $" in text and "of $0.50" in text
 
 
 def test_read_runs_is_capped_trimming_the_oldest_iterations_first() -> None:
@@ -337,10 +335,8 @@ def test_read_runs_is_capped_trimming_the_oldest_iterations_first() -> None:
 
 
 def test_red_test_refs() -> None:
-    refs = planrun.red_test_refs("Your tests/test_cli.py::test_add_prints_the_result (protected) fails; "
-                                 "tests/test_cli_module.py::test_module_invocation_prints_sum runs 'python -m x'")
-    assert refs == [("tests/test_cli.py", "tests/test_cli.py::test_add_prints_the_result"),
-                    ("tests/test_cli_module.py", "tests/test_cli_module.py::test_module_invocation_prints_sum")]
+    assert planrun.red_test_refs(["tests/test_cli.py::test_add", "tests/test_cli_module.py", "tests/test_cli.py::test_add"]) \
+        == [("tests/test_cli.py", "tests/test_cli.py::test_add"), ("tests/test_cli_module.py", "tests/test_cli_module.py")]
 
 
 # The REPL -------------------------------------------------------------------------------------
@@ -368,18 +364,34 @@ def test_run_and_runs_and_plans_in_the_repl(proj, fake) -> None:
     repl.run(lambda prompt="": lines.pop(0) if lines else (_ for _ in ()).throw(EOFError))
     text = buf.getvalue()
     assert "mathx v1  plans/mathx-v1.md  not run yet (/run mathx-v1)" in text
-    assert "t1 · task t1 · 0/2 iterations · $0.00 of $0.50" in text
-    assert "── iteration 1 of 2 ──" in text and "every task is done and the full suite passes on agent/plan-mathx-v1" in text
-    assert "plan mathx-v1 · run " in text and "t1 · task t1 · done · 1 iteration(s)" in text
+    assert "t1 · task t1 · 0 of 2 iterations used · $0.0000 of $0.50" in text
+    assert "── iteration 1 of 2 · $" in text and "every task is done and the full suite passes on agent/plan-mathx-v1" in text
+    assert "plan mathx-v1 · run " in text and "t1 · task t1 · done · 1 of 2 iterations" in text
     assert "mathx v1  plans/mathx-v1.md  run done · t1 done" in text
     assert "error: no plan 'nothing-here' in alpha" in text
 
 
-def test_red_test_refs_ignore_dotted_names_that_arent_files() -> None:
-    """The live check's red test (commit 12b): `[tool.pytest.ini_options]` once yielded a file `tool.py`."""
-    refs = planrun.red_test_refs("tests/test_pyproject_config.py::test_pytest_testpaths_is_tests reads pyproject.toml "
-                                 "and asserts [tool.pytest.ini_options].testpaths == [\"tests\"]; fails before the "
-                                 "change, passes after")
-    assert refs == [("tests/test_pyproject_config.py",
-                     "tests/test_pyproject_config.py::test_pytest_testpaths_is_tests")]
-    assert planrun.red_test_refs("see tests/test_x.py.") == [("tests/test_x.py", "tests/test_x.py")]
+def test_notes_never_become_paths(proj, fake) -> None:
+    """Break 8 target: the live check's `[tool.pytest.ini_options]` once became a file tool.py. Only red_test's own
+    entries are paths; red_test_note is prose."""
+    make_plan(proj, task("t1", red_test=["tests/test_x.py::test_x"],
+                         red_test_note="reads [tool.pytest.ini_options].testpaths, like tests/test_other.py would"))
+    fake.responses += [*turn(("write_code", {"rel_path": "tests/test_x.py", "content": "def test_x():\n    pass\n"}))]
+    runner = Runner(RED, RED, pytest_out(passed=2), pytest_out(passed=2))
+    run = runner_for(proj, fake, UI(), runner).run("mathx")
+    t1 = planruns.task(run.id, "t1")
+    assert (t1.status, run.status) == ("done", "done"), t1.text
+    assert runner.calls[0][0] == ["pytest", "-q", "tests/test_x.py::test_x"]
+
+
+def test_an_approved_plan_with_a_text_red_test_is_refused(proj, fake) -> None:
+    p = make_plan(proj)
+    note = proj.alpha / "plans" / "mathx-v1.md"
+    import re
+
+    text, n = re.subn(r"red_test: \[[^\]]*\]", "red_test: tests/test_x.py fails, then passes", note.read_text())
+    assert n == 1
+    note.write_text(text)
+    with pytest.raises(RunError, match="t1 has a text red_test: submitted before structured red tests; revise it"):
+        runner_for(proj, fake, UI(), Runner()).run("mathx")
+    assert planruns.for_plan("alpha", p.id) is None

@@ -36,7 +36,8 @@ MCP_NAMES = NAMES + PLAN_TOOLS
 AGENT_NAMES = NAMES + ("propose_edit", "propose_lesson", "ask_user")
 # Coder mode (/code <slug>): the eight read and propose tools, the code tools, and the gate's two. Claude
 # never writes code, so daedalus-mcp has none of these.
-CODER_NAMES = NAMES[:8] + ("edit_code", "write_code", "delete_code", "run", "find_precedent", "ask_user")
+CODER_NAMES = NAMES[:8] + ("edit_code", "write_code", "delete_code", "run", "find_precedent", "ask_user",
+                           "report_already_satisfied")
 CODE_TOOLS = ("edit_code", "write_code", "delete_code", "run")
 
 RUN_STDOUT_CHARS = 20_000  # what the model sees of a run: the end, where pytest puts its summary
@@ -234,6 +235,27 @@ def read_runs(s: Session, plan_ref: str | None = None) -> dict[str, Any]:
     return planrun.read_runs(s, plan_ref or None)
 
 
+MAX_EVIDENCE = 2000
+
+
+def report_already_satisfied(s: Session, evidence: str, allowed: bool = False) -> dict[str, Any]:
+    """A plan task's claim that its goal already held at its start commit. The loop verifies it, not the agent."""
+    if not allowed:
+        raise queue.ProposalError("report_already_satisfied works only while running a plan's task: it claims the "
+                                  "task's goal already held at the commit the task started from")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise queue.ProposalError("report_already_satisfied needs evidence: what you read and ran that shows the "
+                                  "goal already holds")
+    evidence = " ".join(evidence.split())
+    if len(evidence) > MAX_EVIDENCE:
+        raise queue.ProposalError(f"evidence is {len(evidence):,} characters; keep it under {MAX_EVIDENCE:,}")
+    return {"status": "recorded", "evidence": evidence,
+            "message": ("Recorded. Your turn ends now. The loop verifies the claim itself: the red test must exist, "
+                        "pass at the task's start commit with only the red-test files copied in, the task's net change "
+                        "must touch only those files (and conftest.py), and every other guard must hold. If it doesn't "
+                        "verify, the next iteration starts with why.")}
+
+
 def _edit(e: tools.Edit) -> dict[str, Any]:
     return {"op": e.op, "rel_path": e.rel_path, "bytes_before": e.bytes_before, "bytes_after": e.bytes_after,
             "message": f"{e.op} {e.rel_path}: done, in the worktree (committed later, not by you)."}
@@ -381,19 +403,22 @@ DESCRIPTIONS = {
         "none. Proposed, draft, superseded, ambiguous, missing, and pulled-project notes are refused. Every 'new' "
         "decision becomes binding when he approves the plan, so he sees them first. "
         "tasks: a non-empty list of {id, summary, files, red_test, done_when, max_iterations, budget_usd, "
-        "protected?}: id t1, t2, ... unique; summary one line; files a non-empty list of repo-relative paths (never "
-        "under vault/ or .git, never escaping the repo); red_test one line naming the test that fails before the "
-        "change and passes after; done_when the command that proves it (split like a shell, e.g. \"pytest -q "
+        "protected?, red_test_note?}: id t1, t2, ... unique; summary one line; files a non-empty list of "
+        "repo-relative paths (never under vault/ or .git, never escaping the repo); red_test a LIST of the tests that "
+        "fail before the change and pass after, each \"path.py\" or \"path.py::test_name\" (e.g. "
+        "[\"tests/test_x.py::test_add\"]), each existing already or listed in this task's or an earlier task's "
+        "files; red_test_note (optional) any prose about them; done_when the command that proves it (split like a shell, e.g. \"pytest -q "
         "tests/test_x.py\"; its program must be in the project's daedalus.toml allow list); max_iterations 1 to "
         "10; budget_usd above 0 and at most the session cap; protected (optional) a list of repo paths that already "
         "exist and the task may not change. related, shared_refs, project_refs are optional lists of quoted "
-        "wikilinks; the spec is added to related for you."
+        "wikilinks; the spec is added to related for you. Before submitting, read every existing file a task's "
+        "files names: a task whose goal already holds can at best end as satisfied_at_base."
     ),
     "revise_plan": (
         "Submits the next version of a plan, usually after Mohamed rejected it (plan_status gives his reason). "
         "plan_ref is the plan's slug, its proposal id, or <slug>-v<N>, and must be the latest version. Takes the "
-        "same complete frontmatter and body as submit_plan (the whole plan, not a diff) and validates it the same "
-        "way. It's queued as plans/<slug>-v<N+1>.md with supersedes: [[<slug>-v<N>]]; if v<N> is still pending it's "
+        "same complete frontmatter and body as submit_plan (the whole plan, not a diff; red_test is a list of "
+        "path.py or path.py::test_name) and validates it the same way. It's queued as plans/<slug>-v<N+1>.md with supersedes: [[<slug>-v<N>]]; if v<N> is still pending it's "
         "marked superseded. No version is ever deleted."
     ),
     "plan_status": (
@@ -414,6 +439,14 @@ DESCRIPTIONS = {
     "list_plans": (
         "Read-only. The active project's plans: pending ones (id, slug, version, task count, each decision marked "
         "cited or NEW, and the version chain), approved ones, and rejected ones not yet revised (with the reason)."
+    ),
+    "report_already_satisfied": (
+        "Only while running a plan's task. Call it INSTEAD of changing code when you find the task's goal already "
+        "holds at the commit the task started from: the red test passes there with no change. evidence says what "
+        "you read and ran that shows it (one paragraph). Your turn ends; the loop then verifies the claim itself "
+        "(the red test exists, passes at the start commit with only the red-test files copied in, your net change "
+        "touches only those files and conftest.py, and every other guard holds) and asks Mohamed to accept it. "
+        "Never fake a red test to get past a goal that already holds."
     ),
     "propose_lesson": (
         "Creates a pending lesson in the shared vault's inbox/ (rel_path is relative to inbox/, e.g. "
